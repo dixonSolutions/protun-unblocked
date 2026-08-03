@@ -148,7 +148,11 @@ ensure_tor() {
 # Download URL to file. Tries direct first; falls back to Tor.
 # Sets USE_TOR=1 if Tor was required for this (or earlier) download.
 USE_TOR=0
-fetch() {
+# Download, returning non-zero instead of aborting. For a file that may
+# legitimately not exist - a package index for an architecture Proton does
+# not publish, say - where the caller has something more useful to say than
+# "download failed".
+fetch_optional() {
     local url="$1" out="$2"
     if [[ "$USE_TOR" -eq 0 ]] && curl -fsSL --max-time 60 -o "$out" "$url"; then
         return 0
@@ -157,8 +161,12 @@ fetch() {
     USE_TOR=1
     note "Fetching via Tor: $url"
     # Discard torsocks multiarch warning on stderr so sha checks stay clean.
-    if ! torsocks curl -fsSL --max-time 180 -o "$out" "$url" 2>/dev/null; then
-        bad "Download failed even through Tor: $url"
+    torsocks curl -fsSL --max-time 180 -o "$out" "$url" 2>/dev/null
+}
+
+fetch() {
+    if ! fetch_optional "$@"; then
+        bad "Download failed even through Tor: $1"
         exit 1
     fi
 }
@@ -255,6 +263,15 @@ install_proton_apt() {
 
 # Install NM protun plugin (proton-vpn-linux) + lib if missing.
 # Stable apt often lacks proton-vpn-linux; fetch latest from unstable via Tor/direct.
+# The pool path of a package in an apt Packages index, relative to the repo
+# root. Empty when the index does not carry that package.
+deb_filename() {
+    awk -v want="$1" '
+        $1 == "Package:"  { match_ = ($2 == want) }
+        match_ && $1 == "Filename:" { print $2; exit }
+    ' "$2"
+}
+
 ensure_stealth_backend_apt() {
     local -a opts=("$@")
     if /usr/bin/python3 - <<'PY' 2>/dev/null
@@ -273,19 +290,38 @@ PY
         :
     else
         # Pull debs from unstable (where the NM protun plugin currently lives).
+        #
+        # Ask dpkg for the architecture rather than assuming amd64. Proton
+        # does publish arm64 - VERIFIED: proton-vpn-linux_0.4.0_arm64.deb is
+        # in the unstable index - so hardcoding amd64 was not merely
+        # unportable, it denied those machines a backend that exists. The
+        # only symptom would have been Stealth still validating as MISS
+        # after a setup that reported success.
         ensure_tor
-        local base="https://repo.protonvpn.com/debian/dists/unstable/main/binary-amd64"
+        local repo="https://repo.protonvpn.com/debian"
+        local arch; arch="$(dpkg --print-architecture 2>/dev/null || echo amd64)"
         local pkg_index="$WORKDIR/Packages.unstable"
-        fetch "$base/Packages" "$pkg_index"
-        local linux_ver lib_ver
-        linux_ver="$(awk '/^Package: proton-vpn-linux$/{p=1} p&&/^Version:/{print $2; exit}' "$pkg_index")"
-        lib_ver="$(awk '/^Package: python3-proton-vpn-lib$/{p=1} p&&/^Version:/{print $2; exit}' "$pkg_index")"
-        [[ -n "$linux_ver" ]] || { bad "Could not find proton-vpn-linux in Proton unstable"; return 1; }
-        [[ -n "$lib_ver" ]] || lib_ver="0.1.1"
-        fetch "$base/python3-proton-vpn-lib_${lib_ver}_amd64.deb" \
-            "$WORKDIR/python3-proton-vpn-lib.deb"
-        fetch "$base/proton-vpn-linux_${linux_ver}_amd64.deb" \
-            "$WORKDIR/proton-vpn-linux.deb"
+        if ! fetch_optional "$repo/dists/unstable/main/binary-${arch}/Packages" \
+                "$pkg_index" || [[ ! -s "$pkg_index" ]]; then
+            bad "Proton publishes no package index for ${arch}."
+            note "Stealth needs proton-vpn-linux, which is not built for it."
+            note "Other protocols still work: pvpn up openvpn-tcp"
+            return 1
+        fi
+
+        # Take the path the index gives rather than reassembling a filename
+        # from the version. Architecture-independent packages are published
+        # as _all.deb, so a guessed "_${arch}.deb" would 404 on the very
+        # package most likely to be arch-independent.
+        local lib_path linux_path
+        lib_path="$(deb_filename python3-proton-vpn-lib "$pkg_index")"
+        linux_path="$(deb_filename proton-vpn-linux "$pkg_index")"
+        [[ -n "$linux_path" && -n "$lib_path" ]] || {
+            bad "Could not find the Stealth packages in Proton unstable (${arch})"
+            return 1
+        }
+        fetch "$repo/$lib_path"   "$WORKDIR/python3-proton-vpn-lib.deb"
+        fetch "$repo/$linux_path" "$WORKDIR/proton-vpn-linux.deb"
         sudo dpkg -i "$WORKDIR/python3-proton-vpn-lib.deb" "$WORKDIR/proton-vpn-linux.deb" \
             || sudo apt-get "${opts[@]}" install -f -y
     fi
