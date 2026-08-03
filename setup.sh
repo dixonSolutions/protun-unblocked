@@ -703,7 +703,14 @@ fi
 
 if everything_ready; then
     ok "already installed — skipping package installs"
-    install_proton            # still ensure Stealth backend (may be missing on older installs)
+    # Still run this. "Already installed" was answered by everything_ready,
+    # which does not look for the Stealth backend - so an install that
+    # predates Stealth support would be told it was up to date and left
+    # without the one protocol that works on a filtered network. Both halves
+    # of install_proton return immediately when satisfied, so on a machine
+    # that really is current this costs a version check and two lines of
+    # output.
+    install_proton
     install_pvpn >/dev/null   # refresh scripts from this checkout
     fix_flatpak_routing
     run_wizard
