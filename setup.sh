@@ -703,6 +703,7 @@ fi
 
 if everything_ready; then
     ok "already installed — skipping package installs"
+    install_proton            # still ensure Stealth backend (may be missing on older installs)
     install_pvpn >/dev/null   # refresh scripts from this checkout
     fix_flatpak_routing
     run_wizard
