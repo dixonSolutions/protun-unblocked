@@ -641,6 +641,7 @@ cmd_up() {
         if (( ${#RANKED_TARGETS[@]} )) && [[ "$now" != "${RANKED_TARGETS[0]}" ]]; then
             warn "Something reconnected to ${now:-another server} - moving to ${RANKED_TARGETS[0]}."
             pv disconnect >/dev/null 2>&1
+            restore >/dev/null 2>&1
             sleep 2
         else
             ok "Already connected."
@@ -744,6 +745,13 @@ cmd_up() {
         unblackhole_api
 
         if [[ $rc -eq 0 ]] && is_connected; then
+            if [[ -n "$target" ]]; then
+                local got; got="$(current_server)"
+                if [[ "$got" != "$target" ]]; then
+                    warn "Landed on ${got:-another server} instead of ${target}."
+                    continue
+                fi
+            fi
             local where; where=$(grep -oE 'Connected to [^.]*' "$LOG" | head -1)
             say "  ${where:-tunnel up} - checking traffic..."
             if net_works_settled; then
