@@ -549,6 +549,7 @@ best_server_names() {
     local -a args=(--serverlist "$SERVERLIST" --format names --limit "$count")
     [[ -n "${PVPN_BEST_COUNTRY:-}" ]] && args+=(--country "$PVPN_BEST_COUNTRY")
     [[ "${PVPN_BEST_FREE:-0}" = 1 ]] && args+=(--free)
+    [[ "${PVPN_BEST_NO_PROBE:-0}" = 1 ]] && args+=(--no-probe)
     timeout "$BEST_TIMEOUT" /usr/bin/python3 "$helper" "${args[@]}" 2>/dev/null
 }
 
@@ -630,10 +631,11 @@ EOF
         return $?
     fi
 
-    say "Measuring servers to pick the fastest..."
+    (( ! quick )) && drop_stale_tunnel "measure"
+    (( ! quick )) && say "Measuring servers to pick the fastest..."
     local -a ranked
     mapfile -t ranked < <(
-        PVPN_BEST_COUNTRY="$country" best_server_names "${PVPN_ATTEMPTS:-3}"
+        PVPN_BEST_COUNTRY="$country" PVPN_BEST_NO_PROBE="$quick" best_server_names "${PVPN_ATTEMPTS:-3}"
     )
     if (( ${#ranked[@]} == 0 )); then
         err "Could not rank any servers."
