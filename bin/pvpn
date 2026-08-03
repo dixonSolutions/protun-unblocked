@@ -1262,7 +1262,7 @@ EOF
         say "To put them back on the tunnel:  pvpn apps --fix"
     fi
 
-    local unfixed=0
+    local unfixed=0 verify_failed=0
     if (( fix )); then
         for app in "${flagged[@]}"; do
             say ""
@@ -1315,14 +1315,16 @@ EOF
                 ok "${app}: ${ip} - same as host, on the tunnel"
             else
                 err "${app}: ${ip} - NOT the host's exit"
+                (( verify_failed++ ))
             fi
         done
     fi
 
     # Non-zero means "something is still off the tunnel": either bypasses
-    # were only reported, or a fix did not take.
+    # were only reported, or a fix did not take, or verify found a mismatch.
     (( ${#flagged[@]} && ! fix )) && return 1
     (( unfixed )) && return 1
+    (( verify_failed )) && return 1
     return 0
 }
 
