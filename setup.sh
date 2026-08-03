@@ -274,7 +274,9 @@ PY
     else
         # Pull debs from unstable (where the NM protun plugin currently lives).
         ensure_tor
-        local base="https://repo.protonvpn.com/debian/dists/unstable/main/binary-amd64"
+        local arch
+        arch="$(dpkg --print-architecture)"
+        local base="https://repo.protonvpn.com/debian/dists/unstable/main/binary-${arch}"
         local pkg_index="$WORKDIR/Packages.unstable"
         fetch "$base/Packages" "$pkg_index"
         local linux_ver lib_ver
@@ -282,9 +284,9 @@ PY
         lib_ver="$(awk '/^Package: python3-proton-vpn-lib$/{p=1} p&&/^Version:/{print $2; exit}' "$pkg_index")"
         [[ -n "$linux_ver" ]] || { bad "Could not find proton-vpn-linux in Proton unstable"; return 1; }
         [[ -n "$lib_ver" ]] || lib_ver="0.1.1"
-        fetch "$base/python3-proton-vpn-lib_${lib_ver}_amd64.deb" \
+        fetch "$base/python3-proton-vpn-lib_${lib_ver}_${arch}.deb" \
             "$WORKDIR/python3-proton-vpn-lib.deb"
-        fetch "$base/proton-vpn-linux_${linux_ver}_amd64.deb" \
+        fetch "$base/proton-vpn-linux_${linux_ver}_${arch}.deb" \
             "$WORKDIR/proton-vpn-linux.deb"
         sudo dpkg -i "$WORKDIR/python3-proton-vpn-lib.deb" "$WORKDIR/proton-vpn-linux.deb" \
             || sudo apt-get "${opts[@]}" install -f -y

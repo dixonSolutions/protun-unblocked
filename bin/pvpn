@@ -813,6 +813,14 @@ cmd_up() {
     if (( ${#RANKED_TARGETS[@]} )); then
         targets=("${RANKED_TARGETS[@]}")
     elif [[ "${PVPN_BEST:-1}" = 1 ]]; then
+        # Proton's reconnection daemon can restore a tunnel while we were
+        # refreshing the server list; probe through it and ranking follows
+        # the current exit, not the path from this machine.
+        if is_connected; then
+            say "Disconnecting first, so servers are timed over your own network."
+            pv disconnect >/dev/null 2>&1
+            restore >/dev/null 2>&1
+        fi
         say "Measuring servers to pick the fastest..."
         mapfile -t targets < <(best_server_names "$((${PVPN_ATTEMPTS:-3} + 2))")
         if (( ${#targets[@]} )); then
