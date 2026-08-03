@@ -1349,6 +1349,8 @@ EOF
             local ip; ip="$(sandbox_ip "$app")"
             if [[ -z "$ip" ]]; then
                 note "${app}: could not tell (no network, or no curl/python3 in its runtime)"
+            elif [[ -z "$host_ip" ]]; then
+                note "${app}: ${ip} - host IP unknown, cannot verify on/off tunnel"
             elif [[ "$ip" == "$host_ip" ]]; then
                 ok "${app}: ${ip} - same as host, on the tunnel"
             else
