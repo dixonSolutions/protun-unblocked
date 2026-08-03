@@ -2,12 +2,14 @@
 #
 # pvpn - simple Proton VPN control for filtered networks.
 #
-#   pvpn up        connect
+#   pvpn up        connect to the fastest measured server
+#   pvpn best      rank the fastest servers you can use
 #   pvpn down      disconnect
 #   pvpn status    are we connected?
 #   pvpn ip        show current public IP
 #   pvpn login     sign in to your Proton account
 #   pvpn account   view or log out of the Proton account
+#   pvpn apps      are my Flatpak apps really on the tunnel?
 #   pvpn try       try every protocol, stop at the first that works
 #
 # Why this wrapper exists:
@@ -83,6 +85,10 @@ PV_DIRECT=(env "PYTHONPATH=$SHIM" PVPN_DEBUG=0 protonvpn)
 # Proton CLI for local-only operations (status, disconnect).
 pv()     { protonvpn "$@"; }
 
+tor_available() {
+    systemctl is-active --quiet tor && (exec 3<>/dev/tcp/127.0.0.1/9050) 2>/dev/null
+}
+
 need_tor() {
     if ! systemctl is-active --quiet tor; then
         err "Tor is not running - Proton's API is blocked without it."
@@ -105,6 +111,9 @@ need_shim() {
 
 # NB: must not match "Disconnected", which contains "connected".
 is_connected() { pv status 2>/dev/null | grep -qE 'Status:[[:space:]]*Connected'; }
+
+# Which server we are on, e.g. SG-FREE#2. Empty when disconnected.
+current_server() { pv status 2>/dev/null | awk '/^Server:/{print $2; exit}'; }
 
 current_protocol() {
     [[ -f "$SETTINGS" ]] || { echo "unknown"; return; }
@@ -284,6 +293,21 @@ restore() {
     # 2. Ask Proton to tear down cleanly.
     pv disconnect >/dev/null 2>&1
 
+    # 2b. Stop NetworkManager from putting the tunnel straight back.
+    #
+    # Proton creates its profile ("ProtonVPN SG-FREE#2") with autoconnect
+    # enabled, so a profile left behind is re-activated on its own.
+    # MEASURED: `pvpn down` at 19:57:31 reported success, and NM re-activated
+    # the same profile at 19:58:01 - half a minute later, with no user
+    # action. That makes "disconnect" look broken, and it pins you to
+    # whichever server the old profile was built for, which is exactly what
+    # `pvpn best` exists to avoid. Match on UUID: the names contain spaces
+    # and '#'.
+    while read -r uuid; do
+        [ -n "$uuid" ] && nmcli con modify "$uuid" connection.autoconnect no >/dev/null 2>&1
+    done < <(nmcli -t -f NAME,UUID con show 2>/dev/null \
+               | awk -F: '$1 ~ /^ProtonVPN /{print $2}')
+
     # 3. Proton builds a kill-switch device (pvpnksintrf0 / "pvpn-killswitch")
     #    while connecting, even with killswitch=0 in settings. If a connect is
     #    interrupted it can survive and blackhole everything, so remove it by
@@ -349,16 +373,26 @@ unblackhole_api() {
 # Tor. serverlist.json is ~2.5 MB and can take minutes over a Tor circuit -
 # but this runs with routing untouched, so your connection keeps working the
 # whole time. Only refresh when the cache is actually stale.
-SERVERLIST="$HOME/.cache/Proton/VPN/serverlist.json"
+SERVERLIST="${PVPN_SERVERLIST:-$HOME/.cache/Proton/VPN/serverlist.json}"
 STALE_HOURS="${PVPN_STALE_HOURS:-24}"
 
+# Pass "optional" when the caller can still do something useful with a stale
+# list - `pvpn best` only reads it, so a missing Tor should not be fatal the
+# way it is for a connect that would otherwise pick from bad data.
 ensure_fresh_data() {
+    local mode="${1:-required}"
     local age_h=99999
     if [[ -s $SERVERLIST ]]; then
         age_h=$(( ( $(date +%s) - $(stat -c %Y "$SERVERLIST") ) / 3600 ))
     fi
     if (( age_h < STALE_HOURS )); then
         say "Server list is ${age_h}h old - no refresh needed."
+        return 0
+    fi
+
+    if [[ "$mode" == optional ]] && ! tor_available; then
+        warn "Server list is stale and Tor is not running - using what we have."
+        note "For fresher loads:  sudo systemctl start tor"
         return 0
     fi
 
@@ -372,7 +406,220 @@ ensure_fresh_data() {
     fi
 }
 
+# --- Flatpak routing ----------------------------------------------------
+#
+# Flatpak apps share the host's network namespace, so the tunnel applies to
+# them like anything else - VERIFIED here: Xonotic's sandbox exits on the
+# same address as the host, over TCP and over UDP.
+#
+# What does escape the tunnel is a proxy. An app told to use a proxy hands
+# its traffic to that proxy, and the exit is then whatever the proxy says it
+# is. MEASURED on this machine: ZapZap carried a leftover override pointing
+# at Tor's SOCKS port, so while the host exited in Mexico City, ZapZap
+# exited in Vienna through a Tor relay.
+#
+# Nothing in the VPN's own status shows this. The tunnel is up, `pvpn ip`
+# reports the tunnel's address, and one app is quietly somewhere else. That
+# is why the connect path checks for it rather than waiting to be asked.
+
+# Only a non-empty value redirects anything: `flatpak override --unset-env`
+# leaves the name behind with nothing after the '='.
+#
+# Both cases are listed deliberately. curl and glibc read the lowercase
+# names; Qt, Go and Rust programs generally read the uppercase ones. An app
+# can be redirected by either, so an audit that checks one is worthless.
+PROXY_VARS_RE='^(http_proxy|https_proxy|ftp_proxy|all_proxy|HTTP_PROXY|HTTPS_PROXY|FTP_PROXY|ALL_PROXY)=.+'
+
+# Proxy settings in an app's effective environment, as VAR=VALUE lines.
+app_proxy_vars() {
+    flatpak info --show-permissions "$1" 2>/dev/null | grep -E "$PROXY_VARS_RE"
+}
+
+# App IDs that are routed around the tunnel, one per line.
+#
+# One `flatpak info` per app, run in parallel. MEASURED across 57 apps on
+# this machine: 2.5s serially, 0.34s at -P 12. Serially this would be too
+# slow to sit in the connect path, which is the only place it is any use.
+flatpak_bypassers() {
+    command -v flatpak >/dev/null 2>&1 || return 0
+    # SC2016: the single quotes are deliberate - $1 is the app id xargs
+    # passes in, and $PROXY_RE is read from the environment by the inner
+    # shell. Expanding either here would break on an app id with a quote in
+    # it, which is the whole reason the id goes in as an argument.
+    # shellcheck disable=SC2016
+    flatpak list --app --columns=application 2>/dev/null \
+        | PROXY_RE="$PROXY_VARS_RE" xargs -r -P 12 -I{} sh -c \
+            'flatpak info --show-permissions "$1" 2>/dev/null \
+                 | grep -qE "$PROXY_RE" && echo "$1"' _ {} \
+        | sort
+}
+
+# Put any app that is routed around the tunnel back on it.
+#
+# Run on every successful connect, because a bypass is silent and permanent
+# until something removes it: an override set once, for some older
+# workaround, keeps that app off every tunnel you ever raise afterwards.
+# Connecting is also the moment it matters and the moment the user is
+# watching, so it is the honest place to say so.
+#
+# Set PVPN_FIX_APPS=0 to be told about bypasses without changing anything.
+enforce_app_routing() {
+    command -v flatpak >/dev/null 2>&1 || return 0
+
+    local -a bypassing
+    mapfile -t bypassing < <(flatpak_bypassers)
+    (( ${#bypassing[@]} )) || return 0
+
+    local app var
+    if [[ "${PVPN_FIX_APPS:-1}" != 1 ]]; then
+        for app in "${bypassing[@]}"; do
+            warn "${app} is routed around the VPN by a proxy setting."
+        done
+        note "Left alone because PVPN_FIX_APPS=0. To fix:  pvpn apps --fix"
+        return 0
+    fi
+
+    for app in "${bypassing[@]}"; do
+        warn "${app} was routed around the VPN by a proxy setting - fixing."
+        while read -r var; do
+            [[ -n "$var" ]] || continue
+            if flatpak override --user --unset-env="$var" "$app" >/dev/null 2>&1; then
+                note "  unset ${var}"
+            else
+                err "  could not unset ${var} - run: pvpn apps --fix"
+            fi
+        done < <(app_proxy_vars "$app" | cut -d= -f1)
+    done
+    note "Already-running apps keep the old setting until restarted."
+}
+
+# --- server selection --------------------------------------------------
+
+# Proton's own "fastest" is a server-side Score that ignores where you
+# actually are: from Sydney it ranks Amsterdam (260ms) above Singapore
+# (100ms). lib/best-server.py measures instead of guessing. See docs/best.md.
+BEST_TIMEOUT="${PVPN_BEST_TIMEOUT:-90}"
+
+# Installed next to the shim; also found in a git checkout so the repo is
+# runnable without installing.
+best_helper() {
+    local here; here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    local candidate
+    for candidate in "$SHIM/best-server.py" "$here/../lib/best-server.py"; do
+        [[ -f "$candidate" ]] && { printf '%s\n' "$candidate"; return 0; }
+    done
+    return 1
+}
+
+# Servers to aim at, best first. `pvpn best --connect` fills this so the
+# connect that follows does not repeat the measurement; cmd_up measures for
+# itself when it is empty.
+RANKED_TARGETS=()
+
+# Ranked server names, best first, one per line. Silent on failure: every
+# caller must be able to carry on without a measurement.
+best_server_names() {
+    local count="${1:-5}" helper
+    helper="$(best_helper)" || return 1
+    local -a args=(--serverlist "$SERVERLIST" --format names --limit "$count")
+    [[ -n "${PVPN_BEST_COUNTRY:-}" ]] && args+=(--country "$PVPN_BEST_COUNTRY")
+    [[ "${PVPN_BEST_FREE:-0}" = 1 ]] && args+=(--free)
+    timeout "$BEST_TIMEOUT" /usr/bin/python3 "$helper" "${args[@]}" 2>/dev/null
+}
+
 # --- commands ---------------------------------------------------------
+
+cmd_best() {
+    local connect=0 quick=0 fmt="table" limit="${PVPN_BEST_LIMIT:-10}" country=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --connect|-c) connect=1; shift ;;
+            --quick|-q)   quick=1; shift ;;
+            --json)       fmt="json"; shift ;;
+            --country)    country="${2:-}"; shift 2 ;;
+            --limit)      limit="${2:-10}"; shift 2 ;;
+            --free)       PVPN_BEST_FREE=1; shift ;;
+            -h|--help)
+                cat <<'EOF'
+pvpn best — find the fastest servers your account can use
+
+  pvpn best                 measure and rank them
+  pvpn best --connect       measure, then connect to the best one
+  pvpn best --country JP    only one country
+  pvpn best --limit 20      show more results
+  pvpn best --quick         skip measuring; rank by distance and load
+  pvpn best --json          machine-readable output
+
+Ranked on measured round-trip time to each server, then reported load,
+then distance. `pvpn up` applies this automatically.
+EOF
+                return 0
+                ;;
+            *) err "Unknown option for 'best': $1"; say "Try: pvpn best --help"; return 1 ;;
+        esac
+    done
+
+    need_shim
+    local helper
+    if ! helper="$(best_helper)"; then
+        err "Missing best-server.py — re-run ./setup.sh"
+        return 1
+    fi
+
+    # --json is meant to be piped into something, so progress notes go to
+    # stderr there and stdout carries nothing but the document.
+    local info=1
+    [[ "$fmt" == json ]] && info=2
+
+    # Loads go stale in ~15 minutes, so a fresh list is worth having, but a
+    # stale one still ranks correctly on the part we measure ourselves.
+    ensure_fresh_data optional >&"$info"
+
+    local -a args=(--serverlist "$SERVERLIST" --limit "$limit" --format "$fmt")
+    [[ -n "$country" ]] && args+=(--country "$country")
+    [[ "${PVPN_BEST_FREE:-0}" = 1 ]] && args+=(--free)
+    (( quick )) && args+=(--no-probe)
+
+    # A probe sent while the tunnel is up travels THROUGH the tunnel, so it
+    # times the current exit plus the hop beyond it - not the path from this
+    # machine to each server.
+    #
+    # MEASURED: connected via Mexico City, a run ranked Mexico City best;
+    # connected via Tokyo, it ranked Tokyo best. The ranking was following
+    # whichever server it was already on. Disconnected, the same code picks
+    # Singapore at 99ms every time.
+    if is_connected && (( ! quick )); then
+        if (( connect )); then
+            say "Disconnecting first, so servers are timed over your own network." >&"$info"
+            pv disconnect >/dev/null 2>&1
+            restore >/dev/null 2>&1
+        else
+            warn "Connected: these times are measured through the tunnel, not to it."
+            note "For true numbers:  pvpn down && pvpn best"
+        fi
+    fi
+
+    if (( ! connect )); then
+        (( ! quick )) && say "Measuring servers (a few seconds)..." >&"$info"
+        timeout "$BEST_TIMEOUT" /usr/bin/python3 "$helper" "${args[@]}"
+        return $?
+    fi
+
+    say "Measuring servers to pick the fastest..."
+    local -a ranked
+    mapfile -t ranked < <(
+        PVPN_BEST_COUNTRY="$country" best_server_names "${PVPN_ATTEMPTS:-3}"
+    )
+    if (( ${#ranked[@]} == 0 )); then
+        err "Could not rank any servers."
+        note "Check the cached list with:  pvpn best --quick"
+        return 1
+    fi
+
+    ok "Best: ${ranked[0]}"
+    RANKED_TARGETS=("${ranked[@]}")
+    PVPN_BEST_COUNTRY="$country" cmd_up
+}
 
 cmd_up() {
     local proto="${1:-}"
@@ -383,8 +630,24 @@ cmd_up() {
     # otherwise have succeeded.
     need_shim
 
+    # Proton runs a reconnection daemon (proton.vpn.daemon, as root), which
+    # can put a tunnel back up on its own choice of server within seconds of
+    # a disconnect. When the caller has already measured and asked for a
+    # specific server, that reconnect must not be mistaken for success -
+    # otherwise "connect me to the fastest server" silently leaves you on
+    # whatever the daemon grabbed.
     if is_connected; then
-        ok "Already connected."; cmd_status; return 0
+        local now; now="$(current_server)"
+        if (( ${#RANKED_TARGETS[@]} )) && [[ "$now" != "${RANKED_TARGETS[0]}" ]]; then
+            warn "Something reconnected to ${now:-another server} - moving to ${RANKED_TARGETS[0]}."
+            pv disconnect >/dev/null 2>&1
+            sleep 2
+        else
+            ok "Already connected."
+            cmd_status
+            note "To move to the fastest server instead:  pvpn best --connect"
+            return 0
+        fi
     fi
 
     # Primary default is Stealth. Explicit args still win when available.
@@ -400,6 +663,26 @@ cmd_up() {
     # server list is stale, connect would try to refresh it mid-connect with
     # your traffic already pointed into a tunnel that isn't up yet.
     ensure_fresh_data
+
+    # Pick the servers to aim at, best first, before touching routing.
+    #
+    # This also fixes the retry problem noted below: a plain reconnect asks
+    # Proton for "the fastest" again and gets the same answer, so a dead
+    # server was retried against itself. With a ranked list, attempt 2 goes
+    # somewhere genuinely different. Set PVPN_BEST=0 to leave the choice to
+    # Proton.
+    local -a targets=()
+    if (( ${#RANKED_TARGETS[@]} )); then
+        targets=("${RANKED_TARGETS[@]}")
+    elif [[ "${PVPN_BEST:-1}" = 1 ]]; then
+        say "Measuring servers to pick the fastest..."
+        mapfile -t targets < <(best_server_names "$((${PVPN_ATTEMPTS:-3} + 2))")
+        if (( ${#targets[@]} )); then
+            ok "Picked ${targets[0]}."
+        else
+            warn "Could not measure servers - letting Proton choose."
+        fi
+    fi
 
     # Adapt to the network instead of assuming the worst everywhere.
     if api_reachable; then
@@ -439,11 +722,22 @@ cmd_up() {
     local attempts="${PVPN_ATTEMPTS:-3}" rc=0 n=0
     while (( n < attempts )); do
         (( n++ ))
-        (( n > 1 )) && { say "Attempt ${n}/${attempts} - reconnecting (may be the same server)..."
-                         pv disconnect >/dev/null 2>&1; sleep 2; }
+        local target="${targets[n-1]:-}"
+        if (( n > 1 )); then
+            if [[ -n "$target" ]]; then
+                say "Attempt ${n}/${attempts} - next best server (${target})..."
+            else
+                say "Attempt ${n}/${attempts} - reconnecting (may be the same server)..."
+            fi
+            pv disconnect >/dev/null 2>&1; sleep 2
+        fi
 
         rc=0
-        timeout "$CONNECT_TIMEOUT" "${PV_DIRECT[@]}" connect >"$LOG" 2>&1 || rc=$?
+        if [[ -n "$target" ]]; then
+            timeout "$CONNECT_TIMEOUT" "${PV_DIRECT[@]}" connect "$target" >"$LOG" 2>&1 || rc=$?
+        else
+            timeout "$CONNECT_TIMEOUT" "${PV_DIRECT[@]}" connect >"$LOG" 2>&1 || rc=$?
+        fi
         # Undo the hosts edit the moment the connect is over, whatever
         # happened. Once the tunnel is up the API is reachable through it.
         unblackhole_api
@@ -455,6 +749,7 @@ cmd_up() {
                 trap cleanup_log EXIT INT TERM
                 ok "Connected via ${proto}."
                 cmd_ip
+                enforce_app_routing
                 return 0
             fi
             warn "That server came up but passes no traffic."
@@ -465,6 +760,17 @@ cmd_up() {
             if grep -qiE 'No valid implementation found' "$LOG"; then
                 err "Backend missing for ${proto}. Run:  pvpn protocols"
                 break
+            fi
+            # Naming a server needs the shim's tier fix (sitecustomize.py
+            # patch 4). Without it Proton refuses any named server on a free
+            # plan, so drop back to letting Proton choose rather than
+            # failing outright.
+            if [[ -n "$target" ]] && grep -qi 'not available on the free plan' "$LOG"; then
+                warn "This install refuses named servers on a free plan."
+                note "Re-run ./setup.sh to install the shim that allows it."
+                note "Falling back to Proton's own choice."
+                targets=()
+                continue
             fi
             # A hard refusal (free-plan limit, bad protocol) will not fix
             # itself on retry, so stop rather than burn three attempts.
@@ -693,11 +999,172 @@ cmd_try() {
     return 1
 }
 
+# --- Flatpak apps -------------------------------------------------------
+#
+# The audit itself lives up in "Flatpak routing", next to the connect path
+# that runs it. What is here is the command around it: naming what was
+# found, and the slow honest check that starts an app and asks it.
+
+# Public IP as seen from inside an app's sandbox - the honest test, since it
+# obeys whatever proxy the app was given. Empty when the sandbox has no tool
+# to ask with, or when the app has no network at all.
+# The http:// fallback is not laziness. Some apps ship an SSL_CERT_FILE
+# pointing at a path that does not exist in their sandbox (ZapZap does),
+# which breaks HTTPS for command-line tools inside it. Refusing to fall back
+# would report "cannot tell" for exactly the apps most worth checking, and
+# we are comparing an address here, not fetching a secret.
+sandbox_ip() {
+    # SC2016: the single quotes are deliberate - $url and $out belong to the
+    # shell running inside the sandbox, not to this one.
+    # shellcheck disable=SC2016
+    timeout "${PVPN_APPS_TIMEOUT:-60}" flatpak run --command=sh "$1" -c '
+        for url in https://ifconfig.me http://ifconfig.me; do
+            if command -v curl >/dev/null 2>&1; then
+                out=$(curl -s --max-time 10 "$url") && [ -n "$out" ] && { echo "$out"; exit 0; }
+            elif command -v python3 >/dev/null 2>&1; then
+                python3 -c "import urllib.request as u; print(u.urlopen(\"$url\", timeout=10).read().decode())" && exit 0
+            fi
+        done' 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -1
+}
+
+cmd_apps() {
+    local fix=0 verify=0
+    local -a wanted=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --fix|-f)    fix=1; shift ;;
+            --verify|-v) verify=1; shift ;;
+            -h|--help)
+                cat <<'EOF'
+pvpn apps — find Flatpak apps whose traffic skips the tunnel
+
+  pvpn apps                  list apps that are routed around the VPN
+  pvpn apps --fix            remove the proxy settings that do that
+  pvpn apps --verify         launch each flagged app, compare its exit IP
+  pvpn apps --verify APP...  check named apps, e.g. org.xonotic.Xonotic
+
+Flatpak apps use the tunnel normally. What takes an app off it is a proxy
+setting, which nothing in `pvpn status` will show you.
+
+`pvpn up` already does the finding and the fixing on every connect. This
+command is for checking on it, and for PVPN_FIX_APPS=0 installs where the
+connect path only reports.
+
+Verifying starts each app, so name the ones you care about rather than
+waiting for all of them.
+EOF
+                return 0
+                ;;
+            -*) err "Unknown option for 'apps': $1"; say "Try: pvpn apps --help"; return 1 ;;
+            *)  wanted+=("$1"); shift ;;
+        esac
+    done
+
+    if ! command -v flatpak >/dev/null 2>&1; then
+        say "Flatpak is not installed - nothing to check."
+        return 0
+    fi
+
+    local -a apps
+    mapfile -t apps < <(flatpak list --app --columns=application 2>/dev/null)
+    if (( ${#apps[@]} == 0 )); then
+        say "No Flatpak apps installed."
+        return 0
+    fi
+
+    say "Checking ${#apps[@]} Flatpak apps for traffic that skips the tunnel..."
+    local -a flagged=()
+    local app
+    mapfile -t flagged < <(flatpak_bypassers)
+
+    if (( ${#flagged[@]} == 0 )); then
+        ok "All ${#apps[@]} apps use the tunnel - no proxy overrides found."
+        (( verify )) || return 0
+    fi
+
+    for app in "${flagged[@]}"; do
+        say ""
+        warn "${app} is routed around the VPN:"
+        app_proxy_vars "$app" | sed 's/^/    /' >&2
+        note "Its exit is decided by that proxy, not by the tunnel."
+    done
+
+    if (( ${#flagged[@]} )) && (( ! fix )); then
+        say ""
+        say "To put them back on the tunnel:  pvpn apps --fix"
+    fi
+
+    local unfixed=0
+    if (( fix )); then
+        for app in "${flagged[@]}"; do
+            say ""
+            say "Fixing ${app}..."
+            local var
+            while read -r var; do
+                [[ -n "$var" ]] || continue
+                if flatpak override --user --unset-env="$var" "$app" 2>/dev/null; then
+                    ok "  unset ${var}"
+                else
+                    err "  could not unset ${var}"
+                fi
+            done < <(app_proxy_vars "$app" | cut -d= -f1)
+
+            # Re-read rather than trust the unset: a proxy baked into the
+            # app's own manifest survives an override and has to be said so.
+            if [[ -n "$(app_proxy_vars "$app")" ]]; then
+                (( unfixed++ ))
+                err "  ${app} still has a proxy set."
+                note "  Inspect it with:  flatpak override --user --show ${app}"
+            else
+                ok "  ${app} now uses the tunnel."
+            fi
+        done
+        say ""
+        note "Already-running apps keep the old setting until restarted."
+        note "To undo:  flatpak override --user --env=http_proxy=socks5://127.0.0.1:9050 APP"
+    fi
+
+    if (( verify )); then
+        say ""
+        say "Verifying real exit addresses (each app has to start, so this is slow)..."
+        local host_ip; host_ip="$("${CURL[@]}" --max-time 10 https://ifconfig.me 2>/dev/null)"
+        say "Host exits at: ${host_ip:-<unknown>}"
+        local -a to_check=()
+        if (( ${#wanted[@]} )); then
+            to_check=("${wanted[@]}")
+        elif (( ${#flagged[@]} )); then
+            to_check=("${flagged[@]}")
+        else
+            note "Nothing flagged. Name the apps to check, e.g."
+            note "  pvpn apps --verify org.xonotic.Xonotic com.rtosta.zapzap"
+            return 0
+        fi
+        for app in "${to_check[@]}"; do
+            local ip; ip="$(sandbox_ip "$app")"
+            if [[ -z "$ip" ]]; then
+                note "${app}: could not tell (no network, or no curl/python3 in its runtime)"
+            elif [[ "$ip" == "$host_ip" ]]; then
+                ok "${app}: ${ip} - same as host, on the tunnel"
+            else
+                err "${app}: ${ip} - NOT the host's exit"
+            fi
+        done
+    fi
+
+    # Non-zero means "something is still off the tunnel": either bypasses
+    # were only reported, or a fix did not take.
+    (( ${#flagged[@]} && ! fix )) && return 1
+    (( unfixed )) && return 1
+    return 0
+}
+
 usage() {
     cat <<'EOF'
 pvpn - simple Proton VPN control
 
-  pvpn up [protocol]   connect (optionally forcing a protocol)
+  pvpn up [protocol]   connect to the fastest measured server
+  pvpn best            rank the fastest servers you can use
+  pvpn best --connect  rank them, then connect to the best
   pvpn down            disconnect and restore normal internet
   pvpn status          show connection state and protocol
   pvpn ip              show your current public IP
@@ -705,6 +1172,7 @@ pvpn - simple Proton VPN control
   pvpn login --browser browser bridge (CAPTCHA in browser → CLI session)
   pvpn account         account helpers (see below)
   pvpn logout          sign out (same as: pvpn account --logout)
+  pvpn apps            find Flatpak apps whose traffic skips the tunnel
   pvpn try             try every protocol, stop at the first that works
   pvpn protocols       which backends are actually available here
   pvpn help            this message
@@ -712,6 +1180,13 @@ pvpn - simple Proton VPN control
 Account:
   pvpn account --view     show signed-in account + VPN state
   pvpn account --logout   sign out and clear local credentials
+
+Choosing a server:
+  pvpn best --country JP  rank one country only
+  pvpn best --quick       skip measuring (distance and load only)
+  pvpn best --json        machine-readable output
+  `pvpn up` measures first and connects to the best result, then works
+  down the list if one fails. PVPN_BEST=0 leaves the choice to Proton.
 
 Default protocol: protun-tls (Stealth) — required on DPI/filtered wifi.
 Others: protun-udp, protun-tcp, protun-smart, openvpn-tcp, openvpn-udp, wireguard
@@ -724,16 +1199,28 @@ Notes:
 EOF
 }
 
+main() {
 case "${1:-help}" in
     up|connect)      shift; cmd_up "${1:-}" ;;
+    best)            shift; cmd_best "$@" ;;
     down|disconnect) cmd_down ;;
     status|st)       cmd_status ;;
     ip)              cmd_ip ;;
     login|signin)    shift; cmd_login "$@" ;;
     account|acct)    shift; cmd_account "${1:-}" ;;
     logout|signout)  cmd_logout ;;
+    apps)            shift; cmd_apps "$@" ;;
     try)             cmd_try ;;
     protocols|protos) cmd_protocols ;;
     help|-h|--help)  usage ;;
     *)               err "Unknown command: $1"; say ""; usage; exit 1 ;;
 esac
+}
+
+# Only dispatch when run as a program. Sourcing gives a caller the functions
+# without the command, which is how the tests reach the ones that are not a
+# subcommand of their own - enforce_app_routing runs on connect, and there
+# is no way to ask for it from the command line.
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi

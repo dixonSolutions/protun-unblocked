@@ -397,6 +397,8 @@ install_pvpn() {
         install -m755 "$SRC/lib/debug-signin.py" "$LIB/" && ok "$LIB/debug-signin.py"
     [[ -f "$SRC/lib/signin-bridge.py" ]] && \
         install -m755 "$SRC/lib/signin-bridge.py" "$LIB/" && ok "$LIB/signin-bridge.py"
+    [[ -f "$SRC/lib/best-server.py" ]] && \
+        install -m755 "$SRC/lib/best-server.py" "$LIB/" && ok "$LIB/best-server.py"
 
     # pvpn defaults its shim dir to ~/.local/share/protonvpn-torshim for
     # backward compatibility; point it at the installed location instead.
@@ -416,6 +418,23 @@ install_pvpn() {
             export PATH="$BIN:$PATH"
             ;;
     esac
+}
+
+# --- Flatpak routing --------------------------------------------------
+
+# Flatpak apps ride the host's tunnel, unless one of them was given a proxy
+# — then it exits wherever that proxy exits, on every tunnel from then on,
+# and no VPN status will ever mention it. `pvpn up` clears these on each
+# connect; this does it once at install, so an existing bypass is gone
+# before the first connect rather than after it.
+fix_flatpak_routing() {
+    command -v flatpak >/dev/null 2>&1 || return 0
+    head_ "Checking Flatpak apps"
+    if "$BIN/pvpn" apps --fix; then
+        ok "no Flatpak app is routed around the VPN"
+    else
+        warn "some apps could not be fixed — see: pvpn apps"
+    fi
 }
 
 # --- guided next steps ------------------------------------------------
@@ -648,6 +667,7 @@ fi
 if everything_ready; then
     ok "already installed — skipping package installs"
     install_pvpn >/dev/null   # refresh scripts from this checkout
+    fix_flatpak_routing
     run_wizard
     exit 0
 fi
@@ -669,15 +689,18 @@ if [[ "$(command -v python3)" != "/usr/bin/python3" ]]; then
 fi
 
 install_pvpn
+fix_flatpak_routing
 
 echo
 head_ "Done installing"
 cat <<'EOF'
   vpn-check          will a VPN work on this wifi?
   pvpn login         sign in to Proton (once)
-  pvpn up            connect
+  pvpn up            connect to the fastest measured server
+  pvpn best          rank the fastest servers you can use
   pvpn down          disconnect
   pvpn status        where am I exiting?
+  pvpn apps          are my Flatpak apps really on the tunnel?
 EOF
 
 run_wizard

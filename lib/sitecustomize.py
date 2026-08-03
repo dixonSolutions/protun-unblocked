@@ -12,6 +12,8 @@ Patches:
      10s CONNECTED wait expires before OpenVPN can try the next port.
   3. Raise the CLI's wait-for-CONNECTED timeout (10s → PVPN_EVENT_TIMEOUT,
      default 45) so a real handshake has time to finish.
+  4. Let a free account name a free server, so `pvpn best` can act on what
+     it measured instead of only reporting it.
 """
 import os
 from contextlib import asynccontextmanager
@@ -105,6 +107,66 @@ try:
             yield
 
     _ctrl._wait_for_event = _patched_wait_for_event
+
+except Exception:
+    pass
+
+
+# --- 4. Free accounts may name a server they are entitled to ------------
+#
+# Controller.find_logical_server refuses a named server whenever the tier is
+# 0, treating "picked a server" as if it were "picked a paid server":
+#
+#     free_user = self.user_tier == 0
+#     requesting_paying_feature = (server_name or country or city or ...)
+#     if free_user and requesting_paying_feature:
+#         raise RequiresHigherTierError
+#
+# That conflates two different things. Choosing a *paid* server is a paid
+# feature; choosing among the ~100 free servers is not, and Proton's own
+# desktop app lets free users do exactly that.
+#
+# The refusal has a real cost here. Without it we can measure that Singapore
+# answers in 100 ms and Amsterdam in 260 ms, and then be forced to accept
+# Amsterdam anyway, because Proton's Score ranks it first.
+#
+# So this replaces the coarse refusal with the precise check the rest of the
+# client already uses for entitlement, `server.tier <= user_tier` - the same
+# predicate as ServerList.get_available_servers. Anything above the account's
+# tier still falls through to the original method and is still refused, and
+# Proton's backend enforces tier independently regardless of what any client
+# asks for. Nothing is unlocked that the account did not already have; only
+# the ability to say which of its own servers it wants.
+try:
+    from proton.vpn.cli.core.controller import Controller as _Controller
+
+    _orig_find_logical_server = _Controller.find_logical_server
+
+    async def _patched_find_logical_server(
+        self,
+        server_name=None,
+        country=None,
+        city=None,
+        features=0,
+        random_server=False,
+    ):
+        selecting_only_by_name = bool(server_name) and not (
+            country or city or features or random_server
+        )
+
+        if selecting_only_by_name and self.is_logged_in:
+            server_list = await self.get_updated_server_list()
+            server = server_list.get_by_name(server_name)
+            if server.tier <= self.user_tier and server.enabled:
+                return server
+            # Out of tier or disabled: let the original refuse it, so the
+            # user still gets Proton's own upgrade message.
+
+        return await _orig_find_logical_server(
+            self, server_name, country, city, features, random_server
+        )
+
+    _Controller.find_logical_server = _patched_find_logical_server
 
 except Exception:
     pass
