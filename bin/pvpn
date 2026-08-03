@@ -645,6 +645,7 @@ cmd_up() {
         else
             ok "Already connected."
             cmd_status
+            enforce_app_routing
             note "To move to the fastest server instead:  pvpn best --connect"
             return 0
         fi
