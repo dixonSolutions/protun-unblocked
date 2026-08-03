@@ -774,6 +774,25 @@ cmd_hop() {
     return 0
 }
 
+# Take down a tunnel that came back while we were busy.
+#
+# The is_connected check at the top of cmd_up can be minutes stale by the
+# time it matters: ensure_fresh_data pulls 2.5 MB over Tor, and Proton's
+# daemon can raise a tunnel in that window. Both things cmd_up does next
+# are wrong if one is up - a probe travels THROUGH the tunnel and times the
+# current exit rather than the path to each server, so the ranking
+# re-elects wherever we already are; and a connect on top of a live tunnel
+# can fail or land somewhere else entirely.
+drop_stale_tunnel() {
+    is_connected || return 0
+    warn "Something reconnected while we were working - disconnecting to ${1}."
+    pv disconnect >/dev/null 2>&1
+    restore >/dev/null 2>&1
+    # The disconnect is asynchronous; going straight on can catch the
+    # tunnel still on its way down.
+    sleep 2
+}
+
 cmd_up() {
     local proto="${1:-}"
     # Deliberately NOT need_tor here. Connecting goes straight to Proton's
@@ -829,28 +848,9 @@ cmd_up() {
     local -a targets=()
     if (( ${#RANKED_TARGETS[@]} )); then
         targets=("${RANKED_TARGETS[@]}")
-        # Same window as the measurement branch below: ensure_fresh_data can
-        # take minutes and Proton's daemon may raise a tunnel in that gap.
-        if is_connected; then
-            warn "Something reconnected while we were working - disconnecting before connect."
-            pv disconnect >/dev/null 2>&1
-            restore >/dev/null 2>&1
-            sleep 2
-        fi
+        drop_stale_tunnel "connect"
     elif [[ "${PVPN_BEST:-1}" = 1 ]]; then
-        # The is_connected check at the top of this function was minutes
-        # ago: ensure_fresh_data can spend a long time pulling 2.5 MB over
-        # Tor, and Proton's daemon can raise a tunnel in that window. Probe
-        # through one and every measurement is the tunnel's own latency, so
-        # the ranking just re-elects the server we are already on. Check
-        # again here, immediately before measuring, rather than trusting the
-        # earlier answer.
-        if is_connected; then
-            warn "Something reconnected while we were working - disconnecting to measure."
-            pv disconnect >/dev/null 2>&1
-            restore >/dev/null 2>&1
-            sleep 2
-        fi
+        drop_stale_tunnel "measure"
         say "Measuring servers to pick the fastest..."
         mapfile -t targets < <(best_server_names "$((${PVPN_ATTEMPTS:-3} + 2))")
         if (( ${#targets[@]} )); then
