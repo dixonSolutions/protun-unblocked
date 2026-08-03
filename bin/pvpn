@@ -718,7 +718,7 @@ PYEOF
 #   pvpn hop SG-FREE#12 that exact server
 cmd_hop() {
     need_shim
-    local want="${1:-}" before after rc
+    local want="${1:-}" before after rc proto
 
     before="$(current_server)"
     [[ -n "$before" ]] && say "Currently on: $(current_server_desc)"
@@ -730,6 +730,12 @@ cmd_hop() {
         [[ -n "$before" ]] || { warn "Not connected - just connecting."; cmd_up; return $?; }
         steer_cache exclude "$before" || { restore_cache; return 1; }
     fi
+
+    if protocol_available "protun-tls"; then
+        set_protocol "protun-tls"
+    fi
+    proto="$(current_protocol)"
+    proto="$(ensure_connect_protocol "$proto")" || { restore_cache; return 1; }
 
     trap 'echo; warn "Interrupted - restoring..."; restore_cache; restore; cleanup_log; exit 130' INT TERM
 
