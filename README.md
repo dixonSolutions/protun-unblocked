@@ -7,8 +7,9 @@ without internet when a connect fails.
 ```
 pvpn up        connect          pvpn status   where am I exiting?
 pvpn best      rank servers     pvpn apps     what skips the tunnel?
-pvpn down      disconnect       pvpn try      try every protocol
-pvpn login     sign in          vpn-check     will a VPN work on this wifi?
+pvpn hop       change server    pvpn try      try every protocol
+pvpn down      disconnect       vpn-check     will a VPN work on this wifi?
+pvpn login     sign in
 ```
 
 ## Why this exists
@@ -79,6 +80,10 @@ To see what it picked and why, or to choose differently:
 pvpn best                 # rank the servers you can use
 pvpn best --connect       # rank them, then connect to the best
 pvpn best --country JP    # one country only
+
+pvpn hop                  # anywhere but the server you are on
+pvpn hop JP               # somewhere in Japan
+pvpn hop SG-FREE#12       # that exact server
 ```
 
 Every connect also checks that your Flatpak apps are on the tunnel and puts
@@ -96,22 +101,30 @@ before you spend time on the client.
 
 ## What it handles
 
-- **Slow settling — the big one.** A tunnel can take a long time to pass its
-  first packet: 12s in one measurement, and **over 20s** on US-FREE#15, which
-  a short window wrote off as dead. It then worked on the next attempt using
-  *the same server*. So `PVPN_SETTLE` defaults to 45s. That costs nothing when
-  things work — probes return in ~0.3s and the loop exits the instant traffic
-  flows — and only a dead tunnel ever pays it. **Don't lower it to "make
-  connects fast"; that just discards tunnels that were about to work.**
-- **Free-tier server roulette — fixed.** Proton's CLI refuses to let a free
-  account name a server, so a failed connect used to retry by asking for "the
-  fastest" again and landing on the same one: two consecutive attempts were
-  observed both picking `US-FREE#15`. `pvpn up` now measures first and holds a
-  *ranked* list, so attempt 2 goes to the second-best server rather than
-  repeating the first. The shim narrows Proton's blanket refusal to the tier
-  check the client already uses, so a free account can use its own free
-  servers — nothing above your tier is reachable, then or now.
-  See [docs/best-server.md](docs/best-server.md).
+- **Slow settling — the big one.** Time until a tunnel passes its first
+  packet, measured on three servers: **12s**, **>20s**, **>45s**. Every single
+  tunnel that got written off as dead turned out to be alive moments later. So
+  `PVPN_SETTLE` is 90s, and — more importantly — **running out of it no longer
+  tears the tunnel down.** It keeps the connection, tells you traffic hasn't
+  started, and leaves `pvpn down` to you. Discarding a slow tunnel costs a full
+  reconnect and often lands on the same server anyway.
+- **Nobody chooses the server, so nothing measures it.** Proton's "fastest" is
+  a server-side score that does not know where you are: from Sydney it ranked
+  Amsterdam (260 ms) above Singapore (100 ms). And the CLI refuses to let a
+  free account ask for a specific one — `--country`, `--random` and by-ID are
+  all rejected — while a plain reconnect is not random either: **six
+  consecutive attempts returned US-FREE#15.**
+
+  Two things fix this, at different levels. `pvpn best` measures round-trip
+  time to each candidate and `pvpn up` connects down that ranked list, so
+  attempt 2 goes somewhere genuinely different; the shim makes that possible
+  by narrowing Proton's blanket refusal to the tier check the client already
+  uses, so a free account can name its own free servers — nothing above your
+  tier is reachable, then or now. `pvpn hop` works one level down, steering
+  Proton's local cache by marking unwanted servers offline and restoring it
+  afterwards, which is what you want for "anywhere but here" or a whole
+  country. Verified: Dallas → Singapore, and Dallas → Tokyo with `pvpn hop
+  JP`, each on the first try. See [docs/best-server.md](docs/best-server.md).
 - **Apps that quietly skip the tunnel.** A proxy setting takes an app off the
   VPN without anything in `pvpn status` showing it. Found here: ZapZap carried
   a leftover `ALL_PROXY=socks5://127.0.0.1:9050`, so the host exited in Mexico
@@ -142,7 +155,7 @@ before you spend time on the client.
 | variable | default | meaning |
 |---|---|---|
 | `PVPN_TIMEOUT` | 30 | seconds to wait for a tunnel |
-| `PVPN_SETTLE` | 45 | grace period for traffic to start (cheap: exits as soon as traffic flows) |
+| `PVPN_SETTLE` | 90 | grace period for traffic to start (exits as soon as traffic flows) |
 | `PVPN_ATTEMPTS` | 3 | connect attempts (new server each time) |
 | `PVPN_API_TIMEOUT` | 2 | Proton API transport timeout |
 | `PVPN_FAST` | 0 | blackhole the API in `/etc/hosts` for the connect (needs sudo) |
