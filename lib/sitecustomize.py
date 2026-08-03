@@ -159,8 +159,9 @@ try:
             server = server_list.get_by_name(server_name)
             if server is not None and server.tier <= self.user_tier and server.enabled:
                 return server
-            # Out of tier or disabled: let the original refuse it, so the
-            # user still gets Proton's own upgrade message.
+            # Unknown, out of tier, or disabled: fall through to the
+            # original, so the user still gets Proton's own wording rather
+            # than ours - an upgrade prompt, or its "no such server".
 
         return await _orig_find_logical_server(
             self, server_name, country, city, features, random_server

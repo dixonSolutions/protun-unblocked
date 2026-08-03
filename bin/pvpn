@@ -881,11 +881,19 @@ cmd_up() {
         unblackhole_api
 
         if [[ $rc -eq 0 ]] && is_connected; then
+            # Proton can hand out a server other than the one asked for. On
+            # a ranked connect that is a real miss, so try again - but only
+            # while there are attempts left. Spending the last one to tear
+            # down a working tunnel because it is in the wrong city is the
+            # exact mistake the settle rules above exist to stop making.
             if [[ -n "$target" ]]; then
                 local got; got="$(current_server)"
-                if [[ "$got" != "$target" ]]; then
-                    warn "Landed on ${got:-another server} instead of ${target}."
+                if [[ "$got" != "$target" ]] && (( n < attempts )); then
+                    warn "Landed on ${got:-another server} instead of ${target} - retrying."
                     continue
+                elif [[ "$got" != "$target" ]]; then
+                    warn "Landed on ${got:-another server}, not ${target}. Keeping it:"
+                    warn "  a working tunnel beats no tunnel. Move with:  pvpn hop"
                 fi
             fi
             local where; where=$(grep -oE 'Connected to [^.]*' "$LOG" | head -1)
