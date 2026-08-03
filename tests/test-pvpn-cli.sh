@@ -91,9 +91,14 @@ write_fake_flatpak() {
 state="${FAKE_FLATPAK_STATE:?}"
 
 # Report VAR as set, unless a previous `override --unset-env` cleared it.
+#
+# FAKE_FLATPAK_STUBBORN names an app whose proxy survives the unset, the way
+# one written into the app's own manifest does.
 env_line() {
     local app="$1" var="$2" value="$3"
-    if grep -qxF "$app $var" "$state" 2>/dev/null; then
+    if [[ "$app" == "${FAKE_FLATPAK_STUBBORN:-}" ]]; then
+        printf '%s=%s\n' "$var" "$value"
+    elif grep -qxF "$app $var" "$state" 2>/dev/null; then
         printf '%s=\n' "$var"
     else
         printf '%s=%s\n' "$var" "$value"
@@ -307,6 +312,7 @@ assert_contains "audit reports everything on the tunnel" "no proxy overrides fou
 
 call_enforce() {
     PATH="$FAKE_BIN:$PATH" FAKE_FLATPAK_STATE="$FAKE_STATE" \
+        FAKE_FLATPAK_STUBBORN="${FAKE_FLATPAK_STUBBORN:-}" \
         bash -c 'source "$1"; enforce_app_routing' _ "$PVPN" 2>&1
 }
 
@@ -328,6 +334,13 @@ if [[ -s "$FAKE_STATE" ]]; then
 else
     pass "PVPN_FIX_APPS=0 changes nothing"
 fi
+
+# A proxy baked into an app's own manifest survives `--unset-env`. Saying
+# "fixing" and then falling silent is the one outcome that would stop
+# someone looking, so the connect path has to re-read and admit it.
+write_fake_flatpak
+out="$(FAKE_FLATPAK_STUBBORN=org.example.Proxied call_enforce)"
+assert_contains "a fix that did not take is reported" "STILL routed around the VPN" "$out"
 
 if grep -q 'enforce_app_routing' <(sed -n '/^cmd_up()/,/^}/p' "$PVPN"); then
     pass "cmd_up enforces app routing on connect"

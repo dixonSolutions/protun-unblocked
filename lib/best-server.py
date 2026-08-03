@@ -573,6 +573,19 @@ def main(argv: Sequence[str] | None = None) -> int:
                   file=sys.stderr)
             results = rank_without_probing(candidates)
 
+    # A name here is a server `pvpn up` will spend a connect attempt on, so
+    # the ones just watched to time out do not belong in it. rank() keeps
+    # them deliberately - a table should show that a server was tried and
+    # did not answer - but a connect list is not a report.
+    #
+    # Filtered before the limit, so asking for five connectable names does
+    # not quietly return two. And only while something is left: under
+    # --no-probe, and when the network blocked port 443 outright, nothing
+    # measures as reachable and the distance-and-load order is the best
+    # guess available.
+    if args.format == "names":
+        results = [c for c in results if c.reachable] or results
+
     if args.limit > 0:
         results = results[:args.limit]
 

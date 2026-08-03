@@ -505,6 +505,15 @@ enforce_app_routing() {
                 err "  could not unset ${var} - run: pvpn apps --fix"
             fi
         done < <(app_proxy_vars "$app" | cut -d= -f1)
+
+        # Re-read rather than trust the unset, exactly as `pvpn apps --fix`
+        # does. A proxy baked into an app's own manifest survives an
+        # override, and claiming a fix that did not take is worse than the
+        # bypass: it is the one message that would stop someone looking.
+        if [[ -n "$(app_proxy_vars "$app")" ]]; then
+            err "  ${app} is STILL routed around the VPN."
+            note "  Inspect it with:  flatpak override --user --show ${app}"
+        fi
     done
     note "Already-running apps keep the old setting until restarted."
 }

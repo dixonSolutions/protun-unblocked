@@ -436,12 +436,13 @@ install_pvpn() {
     [[ -f "$SRC/lib/best-server.py" ]] && \
         install -m755 "$SRC/lib/best-server.py" "$LIB/" && ok "$LIB/best-server.py"
 
-    # pvpn defaults its shim dir to ~/.local/share/protonvpn-torshim for
-    # backward compatibility; point it at the installed location instead.
-    if grep -q 'protonvpn-torshim' "$BIN/pvpn"; then
-        sed -i "s|\$HOME/.local/share/protonvpn-torshim|\$HOME/.local/share/pvpn|g" "$BIN/pvpn"
-        ok "shim path set to $LIB"
-    fi
+    # No shim-path rewrite here any more. pvpn already defaults to
+    # ~/.local/share/pvpn and only falls back to the old
+    # ~/.local/share/protonvpn-torshim when that is the directory that
+    # exists. The rewrite predated that default, and by this point it was
+    # matching the fallback line itself and editing the old path out of it -
+    # so an upgrade whose shims were still in the old directory lost the one
+    # line that would have found them.
 
     case ":$PATH:" in
         *":$BIN:"*) ok "$BIN already on PATH" ;;

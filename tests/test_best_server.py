@@ -525,6 +525,46 @@ class TestMain(unittest.TestCase):
         code, _ = self.run_main("--country", "ZZ")
         self.assertEqual(code, 1)
 
+    def test_names_omit_servers_that_did_not_answer(self):
+        """`pvpn up` spends a connect attempt on each name it is given.
+
+        rank() keeps unreachable servers on purpose, so a table can show
+        that one was tried and did not answer. A connect list is not a
+        report, and the filter has to happen before the limit or asking for
+        two connectable names quietly returns one.
+        """
+        buffer = io.StringIO()
+
+        async def only_singapore_answers(candidates, **_kwargs):
+            for candidate in candidates:
+                candidate.latency_ms = 40.0 if candidate.country == "SG" else None
+            return bs.rank(candidates)
+
+        original, bs.measure = bs.measure, only_singapore_answers
+        try:
+            with redirect_stdout(buffer):
+                bs.main(["--serverlist", str(self.path), "--format", "names", "--limit", "2"])
+        finally:
+            bs.measure = original
+
+        self.assertEqual(buffer.getvalue().split(), ["SG-FREE#2"])
+
+    def test_names_fall_back_when_nothing_answers(self):
+        """A blocked port 443 must not leave `pvpn up` with nothing to try."""
+        buffer = io.StringIO()
+
+        async def nothing_answers(candidates, **_kwargs):
+            return bs.rank(candidates)
+
+        original, bs.measure = bs.measure, nothing_answers
+        try:
+            with redirect_stdout(buffer):
+                bs.main(["--serverlist", str(self.path), "--format", "names", "--limit", "2"])
+        finally:
+            bs.measure = original
+
+        self.assertEqual(buffer.getvalue().split(), ["SG-FREE#2", "JP-FREE#9"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
