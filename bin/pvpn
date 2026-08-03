@@ -777,10 +777,12 @@ cmd_up() {
         if (( ${#RANKED_TARGETS[@]} )) && [[ "$now" != "${RANKED_TARGETS[0]}" ]]; then
             warn "Something reconnected to ${now:-another server} - moving to ${RANKED_TARGETS[0]}."
             pv disconnect >/dev/null 2>&1
+            restore >/dev/null 2>&1
             sleep 2
         else
             ok "Already connected."
             cmd_status
+            enforce_app_routing
             note "To move to the fastest server instead:  pvpn best --connect"
             return 0
         fi
@@ -879,6 +881,13 @@ cmd_up() {
         unblackhole_api
 
         if [[ $rc -eq 0 ]] && is_connected; then
+            if [[ -n "$target" ]]; then
+                local got; got="$(current_server)"
+                if [[ "$got" != "$target" ]]; then
+                    warn "Landed on ${got:-another server} instead of ${target}."
+                    continue
+                fi
+            fi
             local where; where=$(grep -oE 'Connected to [^.]*' "$LOG" | head -1)
             say "  ${where:-tunnel up} - checking traffic..."
             trap cleanup_log EXIT INT TERM

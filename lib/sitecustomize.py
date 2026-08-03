@@ -157,7 +157,7 @@ try:
         if selecting_only_by_name and self.is_logged_in:
             server_list = await self.get_updated_server_list()
             server = server_list.get_by_name(server_name)
-            if server.tier <= self.user_tier and server.enabled:
+            if server is not None and server.tier <= self.user_tier and server.enabled:
                 return server
             # Out of tier or disabled: let the original refuse it, so the
             # user still gets Proton's own upgrade message.
