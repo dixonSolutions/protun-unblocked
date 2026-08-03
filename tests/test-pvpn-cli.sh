@@ -229,6 +229,23 @@ fi
 
 assert_not_contains "best --json keeps chatter off stdout" "no refresh needed" "$out"
 
+# --quick promises not to measure. The connect path builds its list through
+# a different function than the reporting path, and that one used to probe
+# regardless - so the promise held right up until you acted on it.
+if grep -q 'PVPN_BEST_NO_PROBE' <(sed -n '/^best_server_names/,/^}/p' "$PVPN"); then
+    pass "the connect path can be told not to probe"
+else
+    fail "the connect path can be told not to probe" "--quick --connect would measure anyway"
+fi
+
+# SC2016: matching pvpn's source text, so the $ is literal, not ours.
+# shellcheck disable=SC2016
+if grep -q 'PVPN_BEST_NO_PROBE="\$quick"' "$PVPN"; then
+    pass "best --connect passes --quick through"
+else
+    fail "best --connect passes --quick through" "the flag stops at the reporting path"
+fi
+
 # --- pvpn apps ---------------------------------------------------------
 
 out="$(run_pvpn help)"
