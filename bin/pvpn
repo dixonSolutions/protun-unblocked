@@ -746,6 +746,7 @@ cmd_hop() {
         trap cleanup_log EXIT INT TERM
         ok "Hopped${before:+: ${before} ->} ${after}"
         cmd_ip
+        enforce_app_routing
         return 0
     fi
 
@@ -754,6 +755,7 @@ cmd_hop() {
     warn "Keeping it - slow starts are normal here and it may come good."
     say  "  check with:  pvpn status   |   move on with:  pvpn hop   |   stop:  pvpn down"
     cmd_ip
+    enforce_app_routing
     return 0
 }
 

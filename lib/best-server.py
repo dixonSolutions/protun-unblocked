@@ -346,7 +346,13 @@ async def _probe_candidate(
             [await _probe_once(candidate.entry_ip, PROBE_PORT, timeout) for _ in range(rounds)]
             if result is not None
         ]
-    candidate.latency_ms = min(timings) if timings else None
+    new_latency = min(timings) if timings else None
+    if new_latency is not None:
+        candidate.latency_ms = (
+            min(candidate.latency_ms, new_latency)
+            if candidate.latency_ms is not None
+            else new_latency
+        )
 
 
 async def probe_all(
