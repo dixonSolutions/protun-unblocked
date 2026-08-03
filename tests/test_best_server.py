@@ -385,6 +385,37 @@ class TestProbing(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(results[0].reachable)
         self.assertFalse(results[1].reachable)
 
+    async def test_a_probe_never_worsens_a_measurement(self):
+        """The refine pass must not bury what the sweep already measured.
+
+        measure() probes twice, and the second pass is the one under
+        contention from nothing else - but it can still time out. Letting
+        it assign unconditionally meant a slow sample replaced a fast one,
+        and a pass that timed out entirely marked a server we had already
+        reached as unreachable, dropping it out of the ranking.
+        """
+        target = candidate(name="target")
+        target.latency_ms = 99.0
+        semaphore = asyncio.Semaphore(1)
+
+        async def probe_returning(value):
+            async def fake(*_args, **_kwargs):
+                return value
+            original, bs._probe_once = bs._probe_once, fake
+            try:
+                await bs._probe_candidate(target, 2, 0.1, semaphore)
+            finally:
+                bs._probe_once = original
+
+        await probe_returning(None)
+        self.assertEqual(target.latency_ms, 99.0, "a failed pass erased a good one")
+
+        await probe_returning(250.0)
+        self.assertEqual(target.latency_ms, 99.0, "a slower pass replaced a faster one")
+
+        await probe_returning(40.0)
+        self.assertEqual(target.latency_ms, 40.0, "a faster pass was ignored")
+
 
 # --- output ------------------------------------------------------------
 

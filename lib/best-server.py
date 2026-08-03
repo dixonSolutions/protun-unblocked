@@ -346,7 +346,14 @@ async def _probe_candidate(
             [await _probe_once(candidate.entry_ip, PROBE_PORT, timeout) for _ in range(rounds)]
             if result is not None
         ]
-    candidate.latency_ms = min(timings) if timings else None
+    # Best across all passes, not just this one. measure() probes twice - a
+    # wide sweep, then a refine on the leaders - and assigning here let a
+    # slower refine sample bury a good sweep result. Worse, a refine that
+    # timed out entirely reset this to None, marking a server we had
+    # already reached as unreachable.
+    best = min(timings, default=None)
+    if best is not None and (candidate.latency_ms is None or best < candidate.latency_ms):
+        candidate.latency_ms = best
 
 
 async def probe_all(
