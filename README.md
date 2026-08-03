@@ -6,8 +6,10 @@ without internet when a connect fails.
 
 ```
 pvpn up        connect          pvpn status   where am I exiting?
-pvpn down      disconnect       pvpn try      try every protocol
-pvpn login     sign in          vpn-check     will a VPN work on this wifi?
+pvpn best      rank servers     pvpn apps     what skips the tunnel?
+pvpn hop       change server    pvpn try      try every protocol
+pvpn down      disconnect       vpn-check     will a VPN work on this wifi?
+pvpn login     sign in
 ```
 
 ## Why this exists
@@ -40,23 +42,57 @@ naive checks measure the proxy rather than the tunnel — and a proxy's circuits
 break the instant the tunnel takes over routing, so a working VPN looks dead.
 Every check here uses `curl --noproxy '*'`.
 
+**4. Its "fastest server" is not measured.** Proton ranks servers by a
+server-side `Score`. Measured from Sydney on a free account, its top pick is
+Amsterdam at **260 ms**, while Singapore — which it never suggests — answers in
+**99 ms**. `pvpn best` times the servers you can actually use and ranks those;
+`pvpn up` connects to the winner. See [docs/best-server.md](docs/best-server.md).
+
 ## Install
 
 ```bash
 git clone https://github.com/luohoa97/protun-unblocked.git && cd protun-unblocked && ./setup.sh
 ```
 
-Installs only under `$HOME`. `./setup.sh --uninstall` removes it. You need
-`proton-vpn-cli` and NetworkManager; setup.sh checks and tells you what's
-missing. `tor` + `torsocks` are needed only if Proton's API is blocked where
-you are.
+`setup.sh` detects **apt** (Debian/Ubuntu) or **dnf** (Fedora), installs
+`proton-vpn-cli` + Tor/NetworkManager deps, then installs `pvpn` under `$HOME`
+and walks you through `vpn-check` → `pvpn login` → `pvpn up`.
+
+If `repo.protonvpn.com` is blocked, the Proton repo package and apt/dnf
+refreshes for that host go through Tor automatically (`socks5h://127.0.0.1:9050`).
+
+```bash
+./setup.sh --no-wizard   # install only, skip login prompts
+./setup.sh --uninstall   # remove ~/.local pvpn files
+```
 
 ## Usage
 
 ```bash
 vpn-check          # is a VPN even possible on this network?
 pvpn login         # once
-pvpn up            # connect
+pvpn up            # measure servers, connect to the fastest
+```
+
+To see what it picked and why, or to choose differently:
+
+```bash
+pvpn best                 # rank the servers you can use
+pvpn best --connect       # rank them, then connect to the best
+pvpn best --country JP    # one country only
+
+pvpn hop                  # anywhere but the server you are on
+pvpn hop JP               # somewhere in Japan
+pvpn hop SG-FREE#12       # that exact server
+```
+
+Every connect also checks that your Flatpak apps are on the tunnel and puts
+back any that a proxy setting had taken off it. To look at that yourself:
+
+```bash
+pvpn apps                 # anything routed around the tunnel?
+pvpn apps --fix           # put it back on
+pvpn apps --verify        # start the apps and compare their real exit
 ```
 
 `vpn-check` reports whether Proton's servers are reachable, whether UDP can
@@ -72,11 +108,41 @@ before you spend time on the client.
   tears the tunnel down.** It keeps the connection, tells you traffic hasn't
   started, and leaves `pvpn down` to you. Discarding a slow tunnel costs a full
   reconnect and often lands on the same server anyway.
-- **No server selection on free.** `--country`, `--random` and by-ID are all
-  refused, and reconnecting is not random: **six consecutive attempts returned
-  US-FREE#15.** `pvpn hop` gets around this by temporarily marking unwanted
-  servers offline in Proton's local cache, then restoring it. Verified: Dallas
-  → Singapore, and Dallas → Tokyo with `pvpn hop JP`, each on the first try.
+- **Nobody chooses the server, so nothing measures it.** Proton's "fastest" is
+  a server-side score that does not know where you are: from Sydney it ranked
+  Amsterdam (260 ms) above Singapore (100 ms). And the CLI refuses to let a
+  free account ask for a specific one — `--country`, `--random` and by-ID are
+  all rejected — while a plain reconnect is not random either: **six
+  consecutive attempts returned US-FREE#15.**
+
+  Two things fix this, at different levels. `pvpn best` measures round-trip
+  time to each candidate and `pvpn up` connects down that ranked list, so
+  attempt 2 goes somewhere genuinely different; the shim makes that possible
+  by narrowing Proton's blanket refusal to the tier check the client already
+  uses, so a free account can name its own free servers — nothing above your
+  tier is reachable, then or now. `pvpn hop` works one level down, steering
+  Proton's local cache by marking unwanted servers offline and restoring it
+  afterwards, which is what you want for "anywhere but here" or a whole
+  country. Verified: Dallas → Singapore, and Dallas → Tokyo with `pvpn hop
+  JP`, each on the first try. See [docs/best-server.md](docs/best-server.md).
+- **Apps that quietly skip the tunnel.** A proxy setting takes an app off the
+  VPN without anything in `pvpn status` showing it. Found here: ZapZap carried
+  a leftover `ALL_PROXY=socks5://127.0.0.1:9050`, so the host exited in Mexico
+  City while that one app exited through a Tor relay in Vienna. Nothing about
+  that decays on its own, so `pvpn up` clears it on every connect (0.34s
+  across 57 apps) and says what it removed; `pvpn apps` is there to check.
+  Flatpak itself is not the problem — sandboxes share the host's network, and
+  Xonotic was verified on the tunnel over both TCP and UDP.
+  See [docs/flatpak.md](docs/flatpak.md).
+- **Measuring through a tunnel.** Probing servers while connected times the
+  tunnel, not the path to each server: connected via Mexico City, the ranking
+  picked Mexico City. `pvpn best --connect` disconnects before measuring, and
+  `pvpn best` warns when a tunnel is up.
+- **Self-resurrecting tunnels.** Proton's NM profile is created with
+  autoconnect on, so `pvpn down` was observed being undone by NetworkManager
+  30 seconds later. `pvpn down` now clears that flag. Proton also runs a
+  reconnection daemon as root, which can beat you to a server; `pvpn up` moves
+  off it when you asked for a specific one.
 - **Stray kill-switch.** Proton creates `pvpnksintrf0` while connecting even
   with the kill switch off. An interrupted connect can leave it behind,
   blackholing everything. `pvpn down` removes it explicitly.
@@ -93,15 +159,30 @@ before you spend time on the client.
 | `PVPN_ATTEMPTS` | 3 | connect attempts (new server each time) |
 | `PVPN_API_TIMEOUT` | 2 | Proton API transport timeout |
 | `PVPN_FAST` | 0 | blackhole the API in `/etc/hosts` for the connect (needs sudo) |
+| `PVPN_BEST` | 1 | measure and pick the server; 0 leaves the choice to Proton |
+| `PVPN_BEST_TIMEOUT` | 90 | seconds allowed for a measurement run |
+| `PVPN_FIX_APPS` | 1 | put Flatpak apps back on the tunnel; 0 only reports |
+
+## Tests
+
+```bash
+tests/run-tests.sh
+```
+
+Offline and read-only — no connect, no disconnect, no routing changes, and no
+need to be signed in. Safe to run with the VPN up.
 
 ## Limits — read before filing a bug
 
 - **If the network drops your VPN's packets, nothing here helps.** Run
   `vpn-check`; if it says VPNs are blocked by address, that's the answer, on
   any OS.
-- Free tier gives no server choice, so latency is luck.
-- UDP-blocking networks kill WireGuard and OpenVPN-UDP. Stealth (`protun-tls`)
-  rides TCP/443 and is the protocol that tends to survive.
+- Free tier gives you ~100 servers to choose between, not the full list. `pvpn
+  best` finds the best of those; it cannot conjure a closer one.
+- UDP-blocking / DPI networks kill WireGuard, OpenVPN-UDP, and often OpenVPN-TCP
+  (TCP connects, TLS handshake dies). **Stealth (`protun-tls`) is the default**
+  and the protocol that survives — needs `python3-proton-vpn-lib` +
+  `proton-vpn-linux` (NM protun plugin; currently in Proton unstable).
 - `PVPN_FAST=1` is the least-tested path — it edits `/etc/hosts` and removes
   its own block on exit, but verify `/etc/hosts` if it's ever killed with -9.
 
