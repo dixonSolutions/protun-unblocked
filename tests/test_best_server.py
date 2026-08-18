@@ -367,7 +367,12 @@ class TestProbing(unittest.IsolatedAsyncioTestCase):
     async def test_returns_none_for_an_unroutable_address(self):
         # 203.0.113.0/24 is TEST-NET-3: reserved for documentation, never
         # routed, so this exercises the timeout path without real traffic.
-        self.assertIsNone(await bs._probe_once("203.0.113.1", 443, timeout=0.2))
+        #
+        # Not port 443. Filtered networks run a transparent proxy that
+        # answers TCP/443 and TCP/80 for every address including this one,
+        # which completed the connection and failed the test. A high port is
+        # left alone. See docs/transparent-proxy.md.
+        self.assertIsNone(await bs._probe_once("203.0.113.1", 47001, timeout=0.2))
 
     async def test_measure_marks_reachable_and_unreachable(self):
         original_port = bs.PROBE_PORT
