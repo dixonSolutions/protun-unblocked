@@ -174,6 +174,14 @@ need to be signed in. Safe to run with the VPN up.
 
 ## Limits — read before filing a bug
 
+- **A network can pass every reachability check and still refuse the tunnel.**
+  Some filters terminate TLS on a local proxy: the handshake completes, then the
+  session is closed a fraction of a second later, before any tunnel data moves.
+  "Proton reachable on TCP/443" is true and the tunnel still fails. Measured on
+  one school network: **28 of 29 Stealth sessions closed ~0.2s after the
+  handshake**, the 29th ran fine — so connecting is slow (~90s of retries)
+  rather than impossible. `vpn-check` now detects this case.
+  See [docs/transparent-proxy.md](docs/transparent-proxy.md).
 - **If the network drops your VPN's packets, nothing here helps.** Run
   `vpn-check`; if it says VPNs are blocked by address, that's the answer, on
   any OS.

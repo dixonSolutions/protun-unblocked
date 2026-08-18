@@ -26,7 +26,7 @@ c '1;36' "Network: ${SSID:-unknown}   $(ip -4 route show default | awk '{print "
 echo
 
 pass=0; fail=0
-INTERNET=0; PROTON_TCP=0; UDP=0; DNS_HIJACK=0
+INTERNET=0; PROTON_TCP=0; UDP=0; DNS_HIJACK=0; TLS_PROXY=0
 DNS_SERVER=""
 
 # 1. Baseline: is the internet up at all?
@@ -39,6 +39,7 @@ internet=0
 proton_tcp=0
 udp=0
 dns_hijack=0
+tls_proxy=0
 dns_server=''
 ssid=$(printf '%q' "${SSID:-}")
 verdict=no_internet
@@ -60,7 +61,24 @@ else
   note "the network blocks the provider by address - Stealth/OpenVPN-TCP cannot help"
 fi
 
-# 3. General UDP egress, using a non-Google STUN server (Google is often
+# 3. Is a transparent proxy terminating TLS? RFC 5737 TEST-NET addresses are
+#    reserved for documentation - nothing listens on them anywhere. If TCP/443
+#    to one "succeeds", a local box answered on its behalf, which means every
+#    result above describes that box and not the server you asked for.
+for ip in 198.51.100.77 203.0.113.9 192.0.2.55; do
+  if timeout 5 bash -c "exec 3<>/dev/tcp/$ip/443" 2>/dev/null; then TLS_PROXY=1; break; fi
+done
+if ((TLS_PROXY)); then
+  bad "a transparent proxy is terminating TLS here"; ((fail++))
+  note "it answered for an address that does not exist, so 'reachable' above"
+  note "means reachable to the proxy. Such a proxy can complete the TLS"
+  note "handshake and close the session a moment later - see"
+  note "docs/transparent-proxy.md"
+else
+  ok "no transparent TLS proxy detected"; ((pass++))
+fi
+
+# 4. General UDP egress, using a non-Google STUN server (Google is often
 #    allowlisted for Meet, which would give a false pass).
 if /usr/bin/python3 - <<'PY' 2>/dev/null
 import socket, struct, sys
@@ -84,7 +102,7 @@ else
   note "kills WireGuard/OpenVPN-UDP — use Stealth (protun-tls) instead"
 fi
 
-# 4. Is DNS forced to a local resolver?
+# 5. Is DNS forced to a local resolver?
 DNS=$(resolvectl status 2>/dev/null | awk '/Current DNS Server/{print $NF; exit}')
 DNS_SERVER="${DNS:-}"
 if [[ $DNS =~ ^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.) ]]; then
@@ -98,6 +116,11 @@ VERDICT="ok"
 if ((fail==0)); then
   c '1;32' "VERDICT: a VPN should work here. Try:  pvpn up"
   VERDICT="ok"
+elif ((TLS_PROXY)) && ((protok)); then
+  c '1;33' "VERDICT: a transparent proxy terminates TLS on this network."
+  note "Stealth can still get through, but expect many refused attempts"
+  note "before one sticks. Give 'pvpn up' time and re-run it if it gives up."
+  VERDICT="proxied"
 elif ((protok)); then
   c '1;33' "VERDICT: partly filtered. Proton is reachable, so try:  pvpn try"
   note "prefer Stealth (TCP/443):  pvpn up protun-tls"
@@ -114,6 +137,7 @@ internet=$INTERNET
 proton_tcp=$PROTON_TCP
 udp=$UDP
 dns_hijack=$DNS_HIJACK
+tls_proxy=$TLS_PROXY
 dns_server=$(printf '%q' "$DNS_SERVER")
 ssid=$(printf '%q' "${SSID:-}")
 verdict=$VERDICT
