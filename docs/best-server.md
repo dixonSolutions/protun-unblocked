@@ -37,13 +37,43 @@ suggests. The gap is not subtle and it is not noise: Singapore measures
 3. **Shortlist.** Take the nearest servers and the least loaded servers, up
    to `--shortlist` (default 40). Distance predicts latency well, but a
    near server that is saturated is no use, so both criteria contribute.
-4. **Sweep.** Open a TCP connection to each shortlisted server's entry IP on
-   port 443 and time the handshake. Port 443 is where Stealth, OpenVPN-TCP
-   and WireGuard-TLS terminate, and it is the port least likely to be
-   dropped by a filtering network.
+4. **Sweep.** Complete a **TLS** handshake to each shortlisted server's entry
+   IP on port 443 and time it. Port 443 is where Stealth, OpenVPN-TCP and
+   WireGuard-TLS terminate, and it is the port least likely to be dropped by
+   a filtering network.
+
+   The handshake is TLS rather than TCP because a network can answer the TCP
+   one locally. Behind a transparent proxy every server on earth "replies" in
+   about 2 ms, so timing the connect ranks servers by jitter - which is how a
+   Sydney client got handed Amsterdam over Singapore. A TLS handshake has to
+   reach the real server. Measured through such a proxy: Netherlands 1157 ms,
+   United States 867 ms, against 1.7-3.1 ms for every TCP connect.
+
+   An SNI is required - the same proxy drops a ClientHello without one - and
+   the teardown is bounded, because these servers never send `close_notify`
+   and `wait_closed()` otherwise blocks for 30 s *after* the measurement is
+   already taken.
 5. **Refine.** Re-time the top `--refine` finalists (default 8) at low
    concurrency. See "Probes interfere with each other" below.
-6. **Rank.** Combine the results.
+6. **Rank.** Combine the results - unless the measurements are not credible,
+   see below.
+
+### When the measurements are ignored
+
+Normalising against the observed range is what makes the weights comparable,
+but it also means a meaningless spread gets amplified to full scale: 1.4 ms
+of jitter stretched across 0..1 outweighs 16,000 km of real geography at
+four times the weight. So before ranking, the timings are sanity-checked.
+
+If nothing measured is plausibly far away (everything under
+`IMPLAUSIBLE_LATENCY_MS`, 20 ms) while some servers demonstrably are (further
+than `NEARBY_KM`, 1000 km), the numbers describe a middlebox and not the
+path. Latency is then dropped and its weight goes to distance, the only
+honest predictor left. `pvpn up` says so rather than quoting a latency it
+does not believe, and `--format table` prints a note.
+
+Low numbers are not suspicious on their own - if every candidate really is
+nearby, they are simply true.
 
 ### The rating
 
@@ -53,9 +83,9 @@ percentages are comparable:
 
 | term | weight | why |
 |---|---|---|
-| measured latency | 0.60 | the only term that reflects your actual network |
+| measured latency | 0.60 | the only term that reflects your actual network (0.00 when not credible) |
 | reported load | 0.25 | a busy server answers a handshake fast and still crawls under traffic |
-| distance | 0.15 | mostly redundant with latency, but it steadies a noisy probe run |
+| distance | 0.15 | mostly redundant with latency, but it steadies a noisy probe run (0.75 when latency is dropped) |
 
 The published rating is 0-100, higher is better. Load is treated as
 saturated at 95%, so the difference between 95% and 99% cannot swamp a real

@@ -320,6 +320,63 @@ class TestRank(unittest.TestCase):
         self.assertEqual(bs.rank([]), [])
 
 
+class TestLatencyIsInformative(unittest.TestCase):
+    """Measurements that describe a middlebox must not be ranked on.
+
+    A transparent proxy answers TCP and completes TLS on behalf of every
+    destination, so every server comes back a couple of milliseconds away.
+    Normalising that spread stretches jitter across the whole 0..1 axis,
+    where it outweighs thousands of kilometres of real geography - which is
+    how a Sydney client was handed Amsterdam over Singapore.
+    """
+
+    def test_rejects_impossibly_fast_intercontinental_replies(self):
+        pool = [
+            candidate(name="NL", latency=3.1, distance=16600),
+            candidate(name="SG", latency=2.4, distance=6300),
+            candidate(name="JP", latency=2.0, distance=7800),
+        ]
+        self.assertFalse(bs.latency_is_informative(pool))
+
+    def test_accepts_plausible_measurements(self):
+        pool = [
+            candidate(name="NL", latency=280.0, distance=16600),
+            candidate(name="SG", latency=99.0, distance=6300),
+        ]
+        self.assertTrue(bs.latency_is_informative(pool))
+
+    def test_fast_replies_are_fine_when_everything_is_nearby(self):
+        """Low numbers are not suspicious if no server is far away."""
+        pool = [
+            candidate(name="A", latency=3.0, distance=40),
+            candidate(name="B", latency=2.0, distance=120),
+        ]
+        self.assertTrue(bs.latency_is_informative(pool))
+
+    def test_no_geography_means_the_numbers_stand(self):
+        pool = [candidate(name="A", latency=2.0), candidate(name="B", latency=3.0)]
+        self.assertTrue(bs.latency_is_informative(pool))
+
+    def test_unreachable_only_is_not_informative(self):
+        self.assertFalse(bs.latency_is_informative([candidate(name="A")]))
+
+    def test_rank_falls_back_to_distance_when_latency_is_noise(self):
+        """The nearest server must win when the timings are meaningless."""
+        pool = [
+            candidate(name="NL", latency=1.7, distance=16600, load=50),
+            candidate(name="SG", latency=2.4, distance=6300, load=50),
+        ]
+        self.assertEqual([c.name for c in bs.rank(pool)], ["SG", "NL"])
+
+    def test_rank_still_prefers_a_measured_win(self):
+        """A genuinely faster distant server beats a nearer slow one."""
+        pool = [
+            candidate(name="far-fast", latency=90.0, distance=16600, load=50),
+            candidate(name="near-slow", latency=400.0, distance=1200, load=50),
+        ]
+        self.assertEqual([c.name for c in bs.rank(pool)][0], "far-fast")
+
+
 class TestRankWithoutProbing(unittest.TestCase):
     def test_orders_by_distance_then_load(self):
         far = candidate(name="far", distance=9000, load=10)
@@ -354,7 +411,7 @@ class TestProbing(unittest.IsolatedAsyncioTestCase):
         await self.server.wait_closed()
 
     async def test_reports_a_time_for_a_listening_port(self):
-        elapsed = await bs._probe_once("127.0.0.1", self.port, timeout=2.0)
+        elapsed = await bs._probe_once("127.0.0.1", self.port, timeout=2.0, tls=False)
         self.assertIsNotNone(elapsed)
         self.assertGreaterEqual(elapsed, 0.0)
 
@@ -362,7 +419,8 @@ class TestProbing(unittest.IsolatedAsyncioTestCase):
         with socket.socket() as probe:
             probe.bind(("127.0.0.1", 0))
             closed_port = probe.getsockname()[1]
-        self.assertIsNone(await bs._probe_once("127.0.0.1", closed_port, timeout=1.0))
+        self.assertIsNone(
+            await bs._probe_once("127.0.0.1", closed_port, timeout=1.0, tls=False))
 
     async def test_returns_none_for_an_unroutable_address(self):
         # 203.0.113.0/24 is TEST-NET-3: reserved for documentation, never
@@ -372,7 +430,8 @@ class TestProbing(unittest.IsolatedAsyncioTestCase):
         # answers TCP/443 and TCP/80 for every address including this one,
         # which completed the connection and failed the test. A high port is
         # left alone. See docs/transparent-proxy.md.
-        self.assertIsNone(await bs._probe_once("203.0.113.1", 47001, timeout=0.2))
+        self.assertIsNone(
+            await bs._probe_once("203.0.113.1", 47001, timeout=0.2, tls=False))
 
     async def test_measure_marks_reachable_and_unreachable(self):
         original_port = bs.PROBE_PORT
@@ -382,13 +441,27 @@ class TestProbing(unittest.IsolatedAsyncioTestCase):
             up.entry_ip = "127.0.0.1"
             down = candidate(name="down")
             down.entry_ip = "203.0.113.1"
-            results = await bs.measure([up, down], rounds=1, timeout=0.3, refine=2)
+            results = await bs.measure(
+                [up, down], rounds=1, timeout=0.3, refine=2, tls=False)
         finally:
             bs.PROBE_PORT = original_port
 
         self.assertEqual(results[0].name, "up")
         self.assertTrue(results[0].reachable)
         self.assertFalse(results[1].reachable)
+
+    async def test_tls_probe_fails_against_a_plain_tcp_server(self):
+        """The default probe is a TLS handshake, not a bare connect.
+
+        Timing the TCP handshake is what let a transparent proxy - which
+        answers locally for every destination - make Amsterdam and Singapore
+        look equally close. A server that cannot complete TLS on 443 is not
+        one the tunnel could have used anyway.
+        """
+        self.assertIsNone(
+            await bs._probe_once("127.0.0.1", self.port, timeout=2.0, tls=True))
+        self.assertIsNotNone(
+            await bs._probe_once("127.0.0.1", self.port, timeout=2.0, tls=False))
 
     async def test_a_probe_never_worsens_a_measurement(self):
         """The refine pass must not bury what the sweep already measured.

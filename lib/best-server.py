@@ -31,6 +31,7 @@ import json
 import math
 import os
 import re
+import ssl
 import sys
 from collections.abc import Iterable, Sequence
 from dataclasses import asdict, dataclass
@@ -48,8 +49,31 @@ TIMEZONE_FILE = Path("/etc/timezone")
 # makes it both the most relevant and the most reliable thing to time.
 PROBE_PORT = 443
 
+# Probes complete a TLS handshake, not just a TCP one. On a network with a
+# transparent proxy the TCP handshake is answered locally - Amsterdam and
+# Singapore both "reply" in about 2 ms - so timing it ranks servers by
+# nothing but jitter. The TLS handshake has to reach the real server, so it
+# still carries the path. Measured through one such proxy: Netherlands
+# 1157 ms, United States 867 ms, against 1.7-3.1 ms for every TCP connect.
+#
+# An SNI is required: the same proxy drops a ClientHello that has none.
+# vpn-check already sends this name for the same reason.
+PROBE_SNI = "www.google.com"
+
+# A handshake this fast cannot have crossed an ocean, so if every server
+# looks this good while some of them are continents away, we are timing a
+# middlebox and the numbers mean nothing. See latency_is_informative.
+IMPLAUSIBLE_LATENCY_MS = 20.0
+NEARBY_KM = 1000.0
+
+# Reserved for documentation (RFC 5737), so nothing is behind them anywhere.
+# A TCP connection that succeeds proves a local box is answering for them.
+TEST_NET_ADDRESSES = ("198.51.100.77", "203.0.113.9", "192.0.2.55")
+
 DEFAULT_PROBE_ROUNDS = 2
-DEFAULT_PROBE_TIMEOUT = 2.0
+# A TLS handshake costs far more than a bare connect - about 1.1 s through a
+# proxy - so this is the round trip budget for the whole handshake.
+DEFAULT_PROBE_TIMEOUT = 5.0
 DEFAULT_SHORTLIST = 40
 DEFAULT_RESULTS = 10
 
@@ -63,7 +87,7 @@ DEFAULT_RESULTS = 10
 # have handed the win to whichever server happened to be least delayed by
 # our own traffic. Re-timing a handful of finalists at low concurrency costs
 # about a second and makes the top of the table trustworthy.
-SWEEP_CONCURRENCY = 32
+SWEEP_CONCURRENCY = 16
 REFINE_CONCURRENCY = 4
 DEFAULT_REFINE = 8
 
@@ -91,6 +115,10 @@ WEIGHT_DISTANCE = 0.15
 # A server this loaded is treated as fully saturated when scoring, so the
 # difference between 95% and 99% does not swamp a real latency advantage.
 LOAD_SATURATION_PERCENT = 95.0
+
+# When the measurements cannot be trusted, latency's share goes to distance,
+# which is the only honest predictor left.
+WEIGHT_DISTANCE_UNMEASURED = WEIGHT_LATENCY + WEIGHT_DISTANCE
 
 
 # --- data model --------------------------------------------------------
@@ -309,23 +337,56 @@ def shortlist(candidates: Sequence[Candidate], limit: int) -> list[Candidate]:
 
 # --- probing -----------------------------------------------------------
 
-async def _probe_once(host: str, port: int, timeout: float) -> float | None:
-    """Time a single TCP handshake, in milliseconds. ``None`` if unreachable."""
+def _probe_ssl_context() -> ssl.SSLContext:
+    """A context that completes a handshake with anything and verifies nothing.
+
+    We are timing the path, not authenticating the peer - the tunnel does
+    that itself later - and Proton entry servers present a generic
+    certificate that would fail hostname checks anyway.
+    """
+    context = ssl.create_default_context()
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    return context
+
+
+async def _probe_once(
+    host: str, port: int, timeout: float, tls: bool = True
+) -> float | None:
+    """Time a single handshake, in milliseconds. ``None`` if unreachable.
+
+    With ``tls`` the timing covers the full TLS handshake, which is what
+    makes the number reflect the real path rather than whatever answered the
+    SYN. ``tls=False`` times the TCP handshake alone.
+    """
     loop = asyncio.get_running_loop()
     started = loop.time()
     writer = None
     try:
-        _, writer = await asyncio.wait_for(
-            asyncio.open_connection(host, port), timeout=timeout
-        )
+        if tls:
+            _, writer = await asyncio.wait_for(
+                asyncio.open_connection(
+                    host, port, ssl=_probe_ssl_context(), server_hostname=PROBE_SNI
+                ),
+                timeout=timeout,
+            )
+        else:
+            _, writer = await asyncio.wait_for(
+                asyncio.open_connection(host, port), timeout=timeout
+            )
         return (loop.time() - started) * 1000
-    except (OSError, asyncio.TimeoutError):
+    except (OSError, asyncio.TimeoutError, ssl.SSLError):
         return None
     finally:
         if writer is not None:
             writer.close()
-            with contextlib.suppress(OSError, asyncio.TimeoutError):
-                await writer.wait_closed()
+            # Bounded. On a TLS connection wait_closed() blocks on the
+            # shutdown handshake, and these servers never send close_notify -
+            # every probe returned its measurement in ~350 ms and then sat
+            # here for 30 s, which alone made a six-server ranking take a
+            # minute. The timing is already taken by this point.
+            with contextlib.suppress(OSError, asyncio.TimeoutError, ssl.SSLError):
+                await asyncio.wait_for(writer.wait_closed(), timeout=0.25)
 
 
 async def _probe_candidate(
@@ -333,6 +394,7 @@ async def _probe_candidate(
     rounds: int,
     timeout: float,
     semaphore: asyncio.Semaphore,
+    tls: bool = True,
 ) -> None:
     """Probe one server several times and keep the best result.
 
@@ -343,7 +405,8 @@ async def _probe_candidate(
     async with semaphore:
         timings = [
             result for result in
-            [await _probe_once(candidate.entry_ip, PROBE_PORT, timeout) for _ in range(rounds)]
+            [await _probe_once(candidate.entry_ip, PROBE_PORT, timeout, tls)
+             for _ in range(rounds)]
             if result is not None
         ]
     # Best across all passes, not just this one. measure() probes twice - a
@@ -361,11 +424,12 @@ async def probe_all(
     rounds: int = DEFAULT_PROBE_ROUNDS,
     timeout: float = DEFAULT_PROBE_TIMEOUT,
     concurrency: int = SWEEP_CONCURRENCY,
+    tls: bool = True,
 ) -> None:
     """Measure every candidate concurrently, in place."""
     semaphore = asyncio.Semaphore(max(1, concurrency))
     await asyncio.gather(*(
-        _probe_candidate(candidate, rounds, timeout, semaphore)
+        _probe_candidate(candidate, rounds, timeout, semaphore, tls)
         for candidate in candidates
     ))
 
@@ -375,18 +439,21 @@ async def measure(
     rounds: int = DEFAULT_PROBE_ROUNDS,
     timeout: float = DEFAULT_PROBE_TIMEOUT,
     refine: int = DEFAULT_REFINE,
+    tls: bool = True,
 ) -> list[Candidate]:
     """Sweep every candidate, then re-time the finalists without contention.
 
     :returns: all candidates, ranked best first.
     """
-    await probe_all(candidates, rounds=1, timeout=timeout, concurrency=SWEEP_CONCURRENCY)
+    await probe_all(candidates, rounds=1, timeout=timeout,
+                    concurrency=SWEEP_CONCURRENCY, tls=tls)
     ranked = rank(candidates)
 
     finalists = [c for c in ranked if c.reachable][:refine]
     if finalists and rounds > 0:
         await probe_all(
-            finalists, rounds=rounds, timeout=timeout, concurrency=REFINE_CONCURRENCY
+            finalists, rounds=rounds, timeout=timeout,
+            concurrency=REFINE_CONCURRENCY, tls=tls
         )
         ranked = rank(candidates)
 
@@ -394,6 +461,35 @@ async def measure(
 
 
 # --- ranking -----------------------------------------------------------
+
+def latency_is_informative(candidates: Sequence[Candidate]) -> bool:
+    """Do the measured latencies describe the path, or a middlebox?
+
+    A transparent proxy answers on behalf of every destination, so every
+    server comes back a couple of milliseconds away. Ranking on that is
+    ranking on jitter: normalising a 1.4 ms spread stretches it across the
+    whole 0..1 axis, where it outweighs thousands of kilometres of real
+    geography. If nothing we measured is plausibly far away while some
+    servers demonstrably are, the measurements are not about distance.
+    """
+    reachable = [c for c in candidates if c.reachable]
+    if not reachable:
+        return False
+    if max(c.latency_ms for c in reachable) >= IMPLAUSIBLE_LATENCY_MS:
+        return True
+    distances = [c.distance_km for c in reachable if c.distance_km is not None]
+    if not distances:
+        return True          # no geography to contradict them; take them as read
+    return max(distances) < NEARBY_KM
+
+
+async def transparent_proxy_present(timeout: float = 3.0) -> bool:
+    """Is something answering TCP/443 for addresses that do not exist?"""
+    for address in TEST_NET_ADDRESSES:
+        if await _probe_once(address, PROBE_PORT, timeout, tls=False) is not None:
+            return True
+    return False
+
 
 def _normalise(value: float, low: float, high: float) -> float:
     """Scale ``value`` into 0..1 against an observed range."""
@@ -414,6 +510,14 @@ def rank(candidates: Sequence[Candidate]) -> list[Candidate]:
     reachable = [c for c in candidates if c.reachable]
     unreachable = [c for c in candidates if not c.reachable]
 
+    # Measurements that describe a middlebox rather than the path are worse
+    # than no measurement at all, because normalising amplifies their jitter
+    # to full scale. When that happens latency is dropped and its weight
+    # goes to distance.
+    measured = latency_is_informative(candidates)
+    weight_latency = WEIGHT_LATENCY if measured else 0.0
+    weight_distance = WEIGHT_DISTANCE if measured else WEIGHT_DISTANCE_UNMEASURED
+
     if reachable:
         latencies = [c.latency_ms for c in reachable]
         loads = [float(c.load) for c in reachable]
@@ -427,12 +531,12 @@ def rank(candidates: Sequence[Candidate]) -> list[Candidate]:
 
         for candidate in reachable:
             cost = (
-                WEIGHT_LATENCY * _normalise(candidate.latency_ms, latency_low, latency_high)
+                weight_latency * _normalise(candidate.latency_ms, latency_low, latency_high)
                 + WEIGHT_LOAD * _normalise(min(float(candidate.load), LOAD_SATURATION_PERCENT),
                                            load_low, load_high)
             )
             if candidate.distance_km is not None and distances:
-                cost += WEIGHT_DISTANCE * _normalise(
+                cost += weight_distance * _normalise(
                     candidate.distance_km, distance_low, distance_high
                 )
             candidate.rating = round(100.0 * (1.0 - cost), 1)
@@ -440,7 +544,13 @@ def rank(candidates: Sequence[Candidate]) -> list[Candidate]:
     for candidate in unreachable:
         candidate.rating = None
 
-    reachable.sort(key=lambda c: (-(c.rating or 0.0), c.latency_ms))
+    if measured:
+        reachable.sort(key=lambda c: (-(c.rating or 0.0), c.latency_ms))
+    else:
+        reachable.sort(key=lambda c: (
+            -(c.rating or 0.0),
+            c.distance_km if c.distance_km is not None else math.inf,
+        ))
     unreachable.sort(key=lambda c: (c.distance_km if c.distance_km is not None else math.inf))
     return reachable + unreachable
 
@@ -529,9 +639,29 @@ def build_parser() -> argparse.ArgumentParser:
                         help=f"seconds before a probe is a miss (default {DEFAULT_PROBE_TIMEOUT})")
     parser.add_argument("--no-probe", action="store_true",
                         help="skip measurement; rank by distance and load only")
-    parser.add_argument("--format", choices=("table", "json", "names"), default="table",
+    parser.add_argument("--format", choices=("table", "json", "names", "tsv"), default="table",
                         help="table for people, json for tools, names for scripts")
     return parser
+
+
+def render_tsv(results: Sequence[Candidate], measured: bool) -> str:
+    """One row per server for shell callers, so they can explain the choice.
+
+    Columns: name, latency ms, load %, distance km, rating, ranking basis.
+    Empty cells where a value is unknown.
+    """
+    basis = "measured" if measured else "distance"
+    return "\n".join(
+        "\t".join((
+            candidate.name,
+            f"{candidate.latency_ms:.0f}" if candidate.latency_ms is not None else "",
+            str(candidate.load),
+            f"{candidate.distance_km:.0f}" if candidate.distance_km is not None else "",
+            f"{candidate.rating:.1f}" if candidate.rating is not None else "",
+            basis,
+        ))
+        for candidate in results
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -583,7 +713,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     # --no-probe, and when the network blocked port 443 outright, nothing
     # measures as reachable and the distance-and-load order is the best
     # guess available.
-    if args.format == "names":
+    measured = latency_is_informative(results)
+    if not measured and args.format == "table":
+        print("Latency looked like a local middlebox answering, not the real "
+              "servers,\nso these are ranked by distance and load instead.",
+              file=sys.stderr)
+
+    if args.format in ("names", "tsv"):
         results = [c for c in results if c.reachable] or results
 
     if args.limit > 0:
@@ -593,6 +729,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(render_json(results, origin))
     elif args.format == "names":
         print("\n".join(candidate.name for candidate in results))
+    elif args.format == "tsv":
+        print(render_tsv(results, measured))
     else:
         print(render_table(results, origin))
 

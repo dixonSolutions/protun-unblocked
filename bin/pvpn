@@ -553,6 +553,50 @@ best_server_names() {
     timeout "$BEST_TIMEOUT" /usr/bin/python3 "$helper" "${args[@]}" 2>/dev/null
 }
 
+# Ranked servers with their stats, best first, one TSV row per server:
+#   name <TAB> latency_ms <TAB> load <TAB> distance_km <TAB> rating <TAB> basis
+# Same contract as best_server_names: silent on failure, callers carry on.
+best_server_rows() {
+    local count="${1:-5}" helper
+    helper="$(best_helper)" || return 1
+    local -a args=(--serverlist "$SERVERLIST" --format tsv --limit "$count")
+    [[ -n "${PVPN_BEST_COUNTRY:-}" ]] && args+=(--country "$PVPN_BEST_COUNTRY")
+    [[ "${PVPN_BEST_FREE:-0}" = 1 ]] && args+=(--free)
+    [[ "${PVPN_BEST_NO_PROBE:-0}" = 1 ]] && args+=(--no-probe)
+    timeout "$BEST_TIMEOUT" /usr/bin/python3 "$helper" "${args[@]}" 2>/dev/null
+}
+
+# Say what was chosen and why, from a TSV row. "Picked X." alone gave no way
+# to tell a good choice from a bad one - the whole point of measuring.
+describe_pick() {
+    local row="$1" runner="$2"
+    local name lat load dist basis
+    IFS=$'\t' read -r name lat load dist _ basis <<<"$row"
+    # Only quote a latency we believe. Printing "2ms" next to "these probes
+    # are not real" invites the reader to trust the number anyway.
+    local detail=""
+    [[ -n "$lat" && "$basis" == "measured" ]] && detail+="${lat}ms"
+    [[ -n "$load" ]] && detail+="${detail:+, }${load}% load"
+    [[ -n "$dist" ]] && detail+="${detail:+, }${dist}km"
+    if [[ -n "$detail" ]]; then
+        ok "Picked ${name} - ${detail}."
+    else
+        ok "Picked ${name}."
+    fi
+    if [[ "$basis" == "distance" ]]; then
+        note "Ranked by distance and load: the latency probes came back too"
+        note "fast to be real, which means a middlebox answered them."
+    fi
+    if [[ -n "$runner" ]]; then
+        local rname rlat rdist
+        IFS=$'\t' read -r rname rlat _ rdist _ _ <<<"$runner"
+        local rdetail=""
+        [[ -n "$rlat" && "$basis" == "measured" ]] && rdetail+="${rlat}ms"
+        [[ -n "$rdist" ]] && rdetail+="${rdetail:+, }${rdist}km"
+        [[ -n "$rdetail" ]] && note "Next best ${rname} - ${rdetail}."
+    fi
+}
+
 # --- commands ---------------------------------------------------------
 
 cmd_best() {
@@ -866,9 +910,15 @@ cmd_up() {
     elif [[ "${PVPN_BEST:-1}" = 1 ]]; then
         drop_stale_tunnel "measure"
         say "Measuring servers to pick the fastest..."
-        mapfile -t targets < <(best_server_names "$((${PVPN_ATTEMPTS:-3} + 2))")
+        local -a rows=()
+        mapfile -t rows < <(best_server_rows "$((${PVPN_ATTEMPTS:-3} + 2))")
+        targets=()
+        local row
+        for row in "${rows[@]}"; do
+            targets+=("${row%%$'\t'*}")
+        done
         if (( ${#targets[@]} )); then
-            ok "Picked ${targets[0]}."
+            describe_pick "${rows[0]}" "${rows[1]:-}"
         else
             warn "Could not measure servers - letting Proton choose."
         fi
