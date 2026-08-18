@@ -687,6 +687,11 @@ restore_cache() {
 # steer_cache <mode> <pattern>
 #   exclude <name>    - hide exactly this server
 #   only    <pattern> - hide every free server NOT matching (case-insensitive)
+#
+# A pattern containing '#' is a full server id and must match exactly. It used
+# to be a substring test, so `pvpn hop SG-FREE#2` also matched SG-FREE#21 and
+# handed you a server you did not ask for. Patterns without '#' stay substring
+# matches, which is what makes `pvpn hop JP` and `pvpn hop SG-FREE` work.
 steer_cache() {
     local mode="$1" pat="$2"
     [[ -s "$SERVERLIST" ]] || { err "No cached server list. Run: pvpn up"; return 1; }
@@ -696,6 +701,7 @@ steer_cache() {
     MODE="$mode" PAT="$pat" SL="$SERVERLIST" /usr/bin/python3 - <<'PYEOF'
 import json, os, sys, pathlib
 mode, pat = os.environ["MODE"], os.environ["PAT"].upper()
+exact = "#" in pat          # a full server id selects that server only
 p = pathlib.Path(os.environ["SL"])
 d = json.loads(p.read_text())
 key = "LogicalServers" if "LogicalServers" in d else "Servers"
@@ -704,7 +710,7 @@ for srv in d[key]:
     name = (srv.get("Name") or "").upper()
     if "FREE" not in name:
         continue                      # paid servers are unreachable to us anyway
-    match = pat in name
+    match = name == pat if exact else pat in name
     hide = match if mode == "exclude" else not match
     if hide:
         srv["Status"] = 0

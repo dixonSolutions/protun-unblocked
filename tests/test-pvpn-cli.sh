@@ -391,6 +391,59 @@ else
     fail "shim allows naming an in-tier server" "free accounts could not act on the ranking"
 fi
 
+# --- hop server matching -----------------------------------------------
+#
+# `pvpn hop SG-FREE#2` must land on SG-FREE#2 and nowhere else. steer_cache
+# used to substring-match, so that pattern also kept SG-FREE#21 and Proton
+# could hand you a server you never asked for. Patterns without '#' stay
+# family matches, which is what makes `pvpn hop JP` work.
+
+HOPFIX="$FIXTURE_DIR/hop.json"
+cat >"$HOPFIX" <<'JSON'
+{"LogicalServers":[
+ {"Name":"SG-FREE#2","Status":1},
+ {"Name":"SG-FREE#21","Status":1},
+ {"Name":"JP-FREE#1","Status":1},
+ {"Name":"JP-FREE#12","Status":1},
+ {"Name":"US-PLUS#4","Status":1}
+]}
+JSON
+
+assert_eq() {
+    local label="$1" expected="$2" actual="$3"
+    if [[ "$expected" == "$actual" ]]; then
+        pass "$label"
+    else
+        fail "$label" "expected [$expected], got [$actual]"
+    fi
+}
+
+# Free servers still selectable after steering, comma separated and sorted.
+kept_free() {
+    local mode="$1" pat="$2" work="$FIXTURE_DIR/hop-work.json"
+    cp -f "$HOPFIX" "$work"
+    PVPN_SERVERLIST="$work" bash -c 'source "$1"; steer_cache "$2" "$3"' \
+        _ "$PVPN" "$mode" "$pat" >/dev/null 2>&1
+    /usr/bin/python3 - "$work" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+print(",".join(sorted(s["Name"] for s in d["LogicalServers"]
+                      if s.get("Status") == 1 and "FREE" in s["Name"])))
+PY
+}
+
+assert_eq "hop to an exact server excludes its longer neighbours" \
+    "SG-FREE#2" "$(kept_free only 'SG-FREE#2')"
+
+assert_eq "hop to the longer name still selects only that one" \
+    "SG-FREE#21" "$(kept_free only 'SG-FREE#21')"
+
+assert_eq "a country pattern still matches the whole family" \
+    "JP-FREE#1,JP-FREE#12" "$(kept_free only 'JP')"
+
+assert_eq "excluding a server leaves its longer neighbour available" \
+    "JP-FREE#1,JP-FREE#12,SG-FREE#21" "$(kept_free exclude 'SG-FREE#2')"
+
 # --- summary -----------------------------------------------------------
 
 echo
