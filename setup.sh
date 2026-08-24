@@ -12,9 +12,9 @@
 # exists for.
 #
 # pvpn itself lands only under $HOME:
-#   ~/.local/bin/pvpn
+#   ~/.local/bin/pvpn          the CLI (one binary, nothing runs in the background)
 #   ~/.local/bin/vpn-check
-#   ~/.local/share/pvpn/
+#   ~/.local/share/pvpn/       Python shims (sitecustomize, sign-in)
 #
 set -euo pipefail
 
@@ -182,7 +182,8 @@ base_deps_present() {
 }
 
 pvpn_installed() {
-    [[ -x "$BIN/pvpn" && -x "$BIN/vpn-check" && -f "$LIB/sitecustomize.py" && -f "$LIB/aiodns.py" ]]
+    [[ -x "$BIN/pvpn" && -x "$BIN/vpn-check" \
+        && -f "$LIB/sitecustomize.py" && -f "$LIB/aiodns.py" ]]
 }
 
 everything_ready() {
@@ -422,10 +423,67 @@ install_proton() {
 
 # --- pvpn files -------------------------------------------------------
 
+find_cargo() {
+    if command -v cargo >/dev/null 2>&1; then
+        command -v cargo
+        return 0
+    fi
+    if [[ -x "$HOME/.cargo/bin/cargo" ]]; then
+        export PATH="$HOME/.cargo/bin:$PATH"
+        echo "$HOME/.cargo/bin/cargo"
+        return 0
+    fi
+    return 1
+}
+
+install_rust_toolchain() {
+    if find_cargo >/dev/null; then
+        return 0
+    fi
+    head_ "Rust (cargo) is required to build pvpn"
+    if [[ ! -t 0 ]]; then
+        bad "cargo not found. Install rustup: https://rustup.rs/"
+        return 1
+    fi
+    if ask_yes "Install a user-local Rust toolchain via rustup?"; then
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+        export PATH="$HOME/.cargo/bin:$PATH"
+        find_cargo >/dev/null
+        return $?
+    fi
+    bad "Skipped. Install cargo and re-run ./setup.sh"
+    return 1
+}
+
+# There used to be a pvpnd user service that reconnected on its own. It
+# is gone, and leaving a copy of it running would fight every command this
+# script is about to install — so take it out before installing anything.
+remove_old_daemon() {
+    local unit="$HOME/.config/systemd/user/pvpnd.service"
+    [[ -f "$unit" || -x "$BIN/pvpnd" ]] || return 0
+    head_ "Removing the old pvpnd daemon"
+    if systemctl --user is-active --quiet pvpnd 2>/dev/null; then
+        note "stopping pvpnd (this leaves any tunnel it built alone)"
+    fi
+    systemctl --user disable --now pvpnd 2>/dev/null || true
+    rm -f "$unit"
+    systemctl --user daemon-reload 2>/dev/null || true
+    rm -f "$BIN/pvpnd"
+    ok "pvpnd removed — nothing runs in the background any more"
+    note "Your fast/blocked server lists are untouched (~/.local/share/pvpn/state.json)"
+}
+
 install_pvpn() {
     head_ "Installing pvpn"
     mkdir -p "$BIN" "$LIB"
-    install -m755 "$SRC/bin/pvpn"      "$BIN/pvpn";      ok "$BIN/pvpn"
+    remove_old_daemon
+
+    install_rust_toolchain || return 1
+    local cargo
+    cargo="$(find_cargo)"
+    note "Building release binaries (first time can take a minute)..."
+    (cd "$SRC" && "$cargo" build --release --locked)
+    install -m755 "$SRC/target/release/pvpn"  "$BIN/pvpn";  ok "$BIN/pvpn"
     install -m755 "$SRC/bin/vpn-check" "$BIN/vpn-check"; ok "$BIN/vpn-check"
     install -m644 "$SRC/lib/sitecustomize.py" "$LIB/";   ok "$LIB/sitecustomize.py"
     install -m644 "$SRC/lib/aiodns.py"        "$LIB/";   ok "$LIB/aiodns.py"
@@ -433,17 +491,8 @@ install_pvpn() {
         install -m755 "$SRC/lib/debug-signin.py" "$LIB/" && ok "$LIB/debug-signin.py"
     [[ -f "$SRC/lib/signin-bridge.py" ]] && \
         install -m755 "$SRC/lib/signin-bridge.py" "$LIB/" && ok "$LIB/signin-bridge.py"
-    [[ -f "$SRC/lib/best-server.py" ]] && \
-        install -m755 "$SRC/lib/best-server.py" "$LIB/" && ok "$LIB/best-server.py"
-
-    # No shim-path rewrite here any more. pvpn already defaults to
-    # ~/.local/share/pvpn and only falls back to the old
-    # ~/.local/share/protonvpn-torshim when that is the directory that
-    # exists. The rewrite predated that default, and by this point it was
-    # matching the fallback line itself and editing the old path out of it -
-    # so an upgrade whose shims were still in the old directory lost the one
-    # line that would have found them.
-
+    # lib/best-server.py stays in the checkout for comparison; ranking now
+    # lives in pvpn-core and is not installed into the shim path.
     case ":$PATH:" in
         *":$BIN:"*) ok "$BIN already on PATH" ;;
         *)
@@ -681,10 +730,17 @@ PY
 # --- uninstall --------------------------------------------------------
 
 if [[ "${1:-}" == "--uninstall" ]]; then
-    rm -f "$BIN/pvpn" "$BIN/vpn-check"
+    # The unit and the daemon binary are from older installs; remove them
+    # here too so an uninstall does not leave one behind.
+    systemctl --user disable --now pvpnd 2>/dev/null || true
+    rm -f "$HOME/.config/systemd/user/pvpnd.service"
+    systemctl --user daemon-reload 2>/dev/null || true
+    rm -f "$BIN/pvpn" "$BIN/pvpnd" "$BIN/vpn-check"
     rm -rf "$LIB"
     c '1;32' "Removed pvpn. Your Proton config in ~/.config/Proton was left alone."
-    echo "To remove that too:  rm -rf ~/.config/Proton ~/.cache/Proton"
+    echo "Settings and server lists left at ~/.config/pvpn and ~/.local/share/pvpn/state.json"
+    echo "To remove that too:  rm -rf ~/.config/pvpn ~/.local/share/pvpn"
+    echo "To remove Proton too:  rm -rf ~/.config/Proton ~/.cache/Proton"
     echo "To remove the Proton CLI package:"
     case "$(detect_pm)" in
         apt) echo "  sudo apt autoremove --purge proton-vpn-cli protonvpn-stable-release" ;;
@@ -746,6 +802,7 @@ cat <<'EOF'
   pvpn down          disconnect
   pvpn status        where am I exiting?
   pvpn apps          are my Flatpak apps really on the tunnel?
+  pvpn blocked       which servers this network has refused
 EOF
 
 run_wizard
