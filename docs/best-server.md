@@ -1,7 +1,10 @@
 # Picking a server
 
 `pvpn best` measures the servers your account can use and ranks them.
-`pvpn up` applies that ranking automatically.
+`pvpn up` applies that ranking automatically. The ranking engine now lives
+in `crates/pvpn-core` (`rank`, `probe`, `geo`, `serverlist`);
+`lib/best-server.py` is kept as a standalone reference and is no longer
+called by `pvpn best`. See [architecture.md](architecture.md).
 
 ```bash
 pvpn best             # measure and rank
@@ -60,10 +63,9 @@ suggests. The gap is not subtle and it is not noise: Singapore measures
 
 ### When the measurements are ignored
 
-Normalising against the observed range is what makes the weights comparable,
-but it also means a meaningless spread gets amplified to full scale: 1.4 ms
-of jitter stretched across 0..1 outweighs 16,000 km of real geography at
-four times the weight. So before ranking, the timings are sanity-checked.
+A meaningless spread stretched across 0..1 outweighs real geography: 1.4 ms
+of jitter can beat 16,000 km at four times the weight. So before ranking,
+the timings are sanity-checked.
 
 If nothing measured is plausibly far away (everything under
 `IMPLAUSIBLE_LATENCY_MS`, 20 ms) while some servers demonstrably are (further
@@ -77,19 +79,52 @@ nearby, they are simply true.
 
 ### The rating
 
-Each term is normalised against the range observed in that run, so the
-weights express relative importance rather than pretending milliseconds and
-percentages are comparable:
-
 | term | weight | why |
 |---|---|---|
 | measured latency | 0.60 | the only term that reflects your actual network (0.00 when not credible) |
 | reported load | 0.25 | a busy server answers a handshake fast and still crawls under traffic |
 | distance | 0.15 | mostly redundant with latency, but it steadies a noisy probe run (0.75 when latency is dropped) |
 
-The published rating is 0-100, higher is better. Load is treated as
-saturated at 95%, so the difference between 95% and 99% cannot swamp a real
-latency advantage.
+Each term is scored against a **fixed saturation point**, not against the
+range the pool happens to span:
+
+- **latency** against the fastest server measured, saturating at twice it
+  (`LATENCY_SATURATION_RATIO`)
+- **load** against 95%, so 95 vs 99 cannot swamp a real latency advantage
+  (`LOAD_SATURATION_PERCENT`)
+- **distance** against 15,000 km, roughly the far side of the planet by
+  cable (`DISTANCE_SATURATION_KM`)
+
+The published rating is 0-100, higher is better. 100 means an ideal server
+— fastest measured, idle, next door — so ratings mean the same thing from
+one run to the next, and a server that merely came first in a bad pool does
+not score 100.
+
+#### Why not normalise against the observed range
+
+Because the range is set by servers nobody would pick. Min-max
+normalisation was the original approach and it produced a clear wrong
+answer: a Sydney client was handed **Los Angeles** (285 ms, 12,073 km) over
+**Singapore** (206 ms, 6,300 km).
+
+Half the 40-server shortlist came back Amsterdam — free NL servers are the
+least loaded, and the shortlist reserves half its slots for the least
+loaded. Amsterdam is 16,644 km and ~600 ms away, so those 19 servers set
+`latency_high` and `distance_high`. Against that scale the two terms that
+should have punished Los Angeles nearly vanished:
+
+| term | Singapore | Los Angeles | gap |
+|---|---|---|---|
+| latency | 0.004 | 0.112 | 0.108 |
+| distance | 0.000 | 0.084 | 0.084 |
+| load | 0.212 | 0.019 | **0.193** |
+
+Load's range *was* set by real contenders, so it kept its full span and
+decided the ranking on its own — at a nominal weight of 0.25 against
+latency's 0.60. The effective weights were roughly 11/25/8, not 60/25/15.
+A ratio is also the only thing that travels between networks: this tool
+exists for links where a middlebox adds a few hundred milliseconds to
+*every* handshake, and only the ratio between servers survives that.
 
 ## Two things that will mislead you
 

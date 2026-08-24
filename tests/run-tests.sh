@@ -24,7 +24,7 @@ head_() { printf '\n%s== %s ==%s\n' "$B" "$1" "$X"; }
 FAILED=()
 
 head_ "Bash syntax"
-for script in "$REPO"/bin/pvpn "$REPO"/bin/vpn-check "$REPO"/setup.sh "$HERE"/*.sh; do
+for script in "$REPO"/legacy/pvpn.sh "$REPO"/bin/pvpn "$REPO"/bin/vpn-check "$REPO"/setup.sh "$HERE"/*.sh; do
     if bash -n "$script"; then
         printf '  ok   %s\n' "${script#"$REPO"/}"
     else
@@ -43,7 +43,7 @@ fi
 # stays runnable on a bare machine.
 head_ "Linters"
 if command -v shellcheck >/dev/null 2>&1; then
-    if shellcheck "$REPO/bin/pvpn" "$HERE"/*.sh; then
+    if shellcheck "$REPO/legacy/pvpn.sh" "$REPO/bin/pvpn" "$HERE"/*.sh; then
         printf '  ok   shellcheck\n'
     else
         FAILED+=("shellcheck")
@@ -63,18 +63,38 @@ else
     printf '  --   ruff not installed, skipping\n'
 fi
 
-head_ "Unit tests: server ranking"
+head_ "Unit tests: server ranking (Python, reference)"
 if /usr/bin/python3 -m unittest discover -s "$HERE" -q; then
     printf '  ok   tests/test_best_server.py\n'
 else
     FAILED+=("test_best_server.py")
 fi
 
-head_ "CLI tests: pvpn best"
+head_ "Unit tests: Rust workspace"
+if command -v cargo >/dev/null 2>&1; then
+    if (cd "$REPO" && cargo test --workspace --offline --quiet); then
+        printf '  ok   cargo test\n'
+    else
+        FAILED+=("cargo test")
+    fi
+else
+    printf '  --   cargo not installed, skipping Rust tests\n'
+fi
+
+head_ "CLI tests: legacy bash pvpn"
 if "$HERE/test-pvpn-cli.sh"; then
     :
 else
     FAILED+=("test-pvpn-cli.sh")
+fi
+
+head_ "CLI tests: Rust pvpn"
+if [[ -x "$HERE/test-pvpn-rust.sh" ]]; then
+    if "$HERE/test-pvpn-rust.sh"; then
+        :
+    else
+        FAILED+=("test-pvpn-rust.sh")
+    fi
 fi
 
 echo
