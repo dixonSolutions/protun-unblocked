@@ -1,0 +1,21 @@
+[package]
+name = "pvpnd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "pvpn connection daemon: auto-reconnect, ranked initial connect, fast/blocked server tracking."
+
+[[bin]]
+name = "pvpnd"
+path = "src/main.rs"
+
+[dependencies]
+pvpn-core = { path = "../pvpn-core" }
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tokio.workspace = true
+chrono.workspace = true

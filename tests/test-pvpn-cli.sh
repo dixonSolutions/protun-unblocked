@@ -13,7 +13,9 @@ set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(dirname "$HERE")"
-PVPN="$REPO/bin/pvpn"
+# Transition: these tests exercise the deprecated bash implementation.
+# The Rust CLI is covered by tests/test-pvpn-rust.sh.
+PVPN="$REPO/legacy/pvpn.sh"
 
 FIXTURE_DIR="$(mktemp -d)"
 FIXTURE="$FIXTURE_DIR/serverlist.json"
@@ -379,10 +381,37 @@ else
     fail "best-server.py is executable" "chmod +x lib/best-server.py"
 fi
 
-if grep -q 'best-server.py' "$REPO/setup.sh"; then
-    pass "setup.sh installs best-server.py"
+if [[ -x "$REPO/lib/best-server.py" ]]; then
+    pass "best-server.py is kept in lib/ for comparison"
 else
-    fail "setup.sh installs best-server.py" "the helper would be missing after install"
+    fail "best-server.py is kept in lib/ for comparison" "leave it in the checkout"
+fi
+
+if grep -qE 'build --release' "$REPO/setup.sh"; then
+    pass "setup.sh builds the Rust workspace"
+else
+    fail "setup.sh builds the Rust workspace" "the new CLI would be missing after install"
+fi
+
+if grep -qE 'install .+pvpnd\.service' "$REPO/setup.sh"; then
+    fail "setup.sh no longer installs a daemon unit" \
+        "the pvpnd service is gone; nothing should install it"
+else
+    pass "setup.sh no longer installs a daemon unit"
+fi
+
+if grep -q 'remove_old_daemon' "$REPO/setup.sh"; then
+    pass "setup.sh removes a pvpnd left over from an older install"
+else
+    fail "setup.sh removes a pvpnd left over from an older install" \
+        "an orphaned daemon would fight every command"
+fi
+
+if grep -E 'install .+\bbest-server\.py' "$REPO/setup.sh"; then
+    fail "setup.sh no longer installs best-server.py into the shim" \
+        "ranking now lives in pvpn-core; do not copy the helper into ~/.local/share/pvpn"
+else
+    pass "setup.sh no longer installs best-server.py into the shim"
 fi
 
 if grep -q '_patched_find_logical_server' "$REPO/lib/sitecustomize.py"; then

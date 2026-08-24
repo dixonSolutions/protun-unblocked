@@ -1,0 +1,15 @@
+[Unit]
+Description=pvpn connection daemon
+Documentation=file:%h/.local/share/pvpn
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/pvpnd
+Restart=on-failure
+RestartSec=5
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=default.target
