@@ -7,10 +7,11 @@
 //! replacement for them.
 
 use anyhow::Context;
+use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone)]
@@ -69,7 +70,7 @@ pub fn run_with_timeout(
             timed_out = true;
             break None;
         }
-        std::thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(20));
     };
     let _ = stdout_thread.join();
     let _ = stderr_thread.join();
@@ -307,7 +308,16 @@ print("  sudo apt-get -o Acquire::https::Proxy::repo.protonvpn.com=socks5h://127
 
 /// True if Proton's registry has a valid implementation for this protocol.
 pub fn protocol_available(proto: &str) -> bool {
-    Command::new(crate::paths::system_python())
+    static CACHE: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(available) = cache
+        .lock()
+        .ok()
+        .and_then(|values| values.get(proto).copied())
+    {
+        return available;
+    }
+    let available = Command::new(crate::paths::system_python())
         .arg("-")
         .arg(proto)
         .stdin(Stdio::piped())
@@ -322,7 +332,11 @@ pub fn protocol_available(proto: &str) -> bool {
             child.wait()
         })
         .map(|s| s.success())
-        .unwrap_or(false)
+        .unwrap_or(false);
+    if let Ok(mut values) = cache.lock() {
+        values.insert(proto.to_string(), available);
+    }
+    available
 }
 
 pub fn list_protocols() -> anyhow::Result<String> {
@@ -700,6 +714,14 @@ pub fn proton_connection_active() -> bool {
     parse_proton_connection_active(&result.stdout)
 }
 
+/// Positive NetworkManager evidence that a Proton tunnel profile is active.
+///
+/// D-Bus is the fast path. The existing `nmcli` parser remains the fallback
+/// for systems where direct bus access is unavailable.
+pub fn verified_tunnel_active() -> bool {
+    crate::dbus::active_proton_profile().is_some() || proton_connection_active()
+}
+
 /// Server name from a Proton profile activated directly through desktop
 /// Network Settings, even when Proton's own CLI state still says disconnected.
 pub fn active_proton_server() -> Option<String> {
@@ -944,6 +966,34 @@ const CERT_FAILURE_MARKERS: [&str; 2] = ["ExpiredCertificate", "Certificate refr
 /// attempt writes, far less than the whole file.
 const LOG_TAIL_BYTES: u64 = 256 * 1024;
 
+/// One bounded read of Proton's log, reusable for every classification made
+/// during a verification tick.
+#[derive(Debug, Clone, Default)]
+pub struct ProtonLogSnapshot {
+    text: String,
+}
+
+impl ProtonLogSnapshot {
+    pub fn recent() -> Self {
+        Self {
+            text: log_tail(&crate::paths::proton_log_path(), LOG_TAIL_BYTES).unwrap_or_default(),
+        }
+    }
+
+    pub fn cert_failure_since(&self, since: chrono::DateTime<chrono::Utc>) -> bool {
+        self.text.lines().rev().any(|line| {
+            CERT_FAILURE_MARKERS
+                .iter()
+                .any(|marker| line.contains(marker))
+                && line_is_after(line, since)
+        })
+    }
+
+    pub fn session_death_since(&self, since: chrono::DateTime<chrono::Utc>) -> Option<String> {
+        find_session_death(&self.text, since)
+    }
+}
+
 /// Did Proton log a certificate failure since `since`?
 ///
 /// This is the difference between "this server is blocked here" and "no
@@ -958,12 +1008,7 @@ const LOG_TAIL_BYTES: u64 = 256 * 1024;
 /// the attempt it just made, and is not still reading the failure that
 /// prompted the renewal it has since done.
 pub fn cert_failure_since(since: chrono::DateTime<chrono::Utc>) -> bool {
-    let Some(text) = log_tail(&crate::paths::proton_log_path(), LOG_TAIL_BYTES) else {
-        return false;
-    };
-    text.lines().rev().any(|line| {
-        CERT_FAILURE_MARKERS.iter().any(|m| line.contains(m)) && line_is_after(line, since)
-    })
+    ProtonLogSnapshot::recent().cert_failure_since(since)
 }
 
 /// Lines that mean the session this attempt built is over.
@@ -991,8 +1036,7 @@ const SESSION_DEATH_MARKERS: [&str; 2] = ["Reached connection error state:", "Co
 /// letting a cert line through as a session death would put a healthy
 /// server on the blocked list.
 pub fn session_death_since(since: chrono::DateTime<chrono::Utc>) -> Option<String> {
-    let text = log_tail(&crate::paths::proton_log_path(), LOG_TAIL_BYTES)?;
-    find_session_death(&text, since)
+    ProtonLogSnapshot::recent().session_death_since(since)
 }
 
 fn find_session_death(text: &str, since: chrono::DateTime<chrono::Utc>) -> Option<String> {

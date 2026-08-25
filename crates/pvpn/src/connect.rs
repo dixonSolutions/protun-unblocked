@@ -24,7 +24,7 @@ use pvpn_core::paths;
 use pvpn_core::pipeline::{self, RankRequest};
 use pvpn_core::proc;
 use pvpn_core::state::Event;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone)]
 pub struct UpReport {
@@ -41,20 +41,145 @@ const SETTLE_AFTER_TEARDOWN_SECS: u32 = 10;
 /// broken. In particular, a dead local DNS proxy makes every hostname-based
 /// tunnel probe fail even though no VPN server caused that failure.
 async fn local_network_problem() -> Option<String> {
-    if !blocking(net::dns_works).await {
+    let (dns_ok, internet_ok) = tokio::join!(blocking(net::dns_works), blocking(net::net_works));
+    if !dns_ok {
         return Some(
             "Your local DNS resolver is not answering before the VPN starts. \
              No server was tried or blocked. Fix DNS, then retry."
                 .to_string(),
         );
     }
-    if !blocking(net::net_works).await {
+    if !internet_ok {
         return Some(
             "The internet is not reachable before the VPN starts. \
              No server was tried or blocked. Restore the normal connection, then retry."
                 .to_string(),
         );
     }
+    None
+}
+
+async fn wait_for_no_active_tunnel(timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if !blocking(proc::verified_tunnel_active).await {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn wait_for_internet(timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if net::net_works_raced(Duration::from_secs(1)).await {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+async fn disconnect_and_wait() {
+    let _ = blocking(proc::protonvpn_disconnect).await;
+    if !wait_for_no_active_tunnel(Duration::from_secs(2)).await {
+        tracing::warn!(
+            "the previous tunnel is still deactivating; continuing with fallback cleanup"
+        );
+    }
+}
+
+async fn reuse_healthy_tunnel(session: &Session) -> Option<UpReport> {
+    let active = match blocking(pvpn_core::dbus::active_proton_server).await {
+        Some(server) => server,
+        None => blocking(proc::active_proton_server).await?,
+    };
+    let network = session.network().to_string();
+    let started = Utc::now();
+    let verdict = verify::verify(started, Duration::from_secs(2), &network).await;
+    if !verdict.carrying() {
+        return None;
+    }
+    let protocol = blocking(proc::current_protocol).await;
+    tracing::info!("{active} is already carrying tunneled traffic");
+    Some(UpReport {
+        ok: true,
+        message: format!("Already connected via {protocol}; tunnel verified."),
+        server: Some(active),
+    })
+}
+
+async fn activate_saved_fast_path(session: &mut Session) -> Option<UpReport> {
+    let (server, _) = session.state.fastest_working_list().into_iter().next()?;
+    let profile_server = server.clone();
+    let profile = blocking(move || pvpn_core::dbus::find_proton_profile(&profile_server)).await;
+    let started_at = Utc::now();
+    let timer = Instant::now();
+
+    let activated = if let Some(profile) = profile {
+        let timeout = Duration::from_secs(session.config.connect_timeout_secs);
+        blocking(move || {
+            let active_path = pvpn_core::dbus::activate(&profile)?;
+            Ok::<bool, anyhow::Error>(pvpn_core::dbus::await_activation(&active_path, timeout))
+        })
+        .await
+        .unwrap_or(false)
+    } else {
+        let server_name = server.clone();
+        blocking(move || proc::activate_verified_proton_connection(&server_name))
+            .await
+            .unwrap_or(false)
+    };
+    if !activated {
+        return None;
+    }
+
+    let protocol = blocking(proc::current_protocol).await;
+    tracing::info!("activated proven server {server} directly; verifying traffic");
+    let verdict = verify::verify(
+        started_at,
+        Duration::from_secs(session.config.settle_secs),
+        session.network(),
+    )
+    .await;
+    let outcome = outcome_for(&verdict, started_at).await;
+    narrate(&server, &verdict, session.config.settle_secs);
+    let ready_ms = timer.elapsed().as_millis().min(u64::MAX as u128) as u64;
+    record(
+        session,
+        &server,
+        &protocol,
+        outcome,
+        Some(&verdict),
+        verdict.carrying().then_some(ready_ms),
+    )
+    .await;
+
+    if verdict.carrying() {
+        let fix = session.config.fix_apps;
+        blocking(move || apps_hook::enforce_app_routing(fix)).await;
+        return Some(UpReport {
+            ok: true,
+            message: format!(
+                "Connected via {protocol}; proven profile verified in {:.2}s.",
+                ready_ms as f64 / 1000.0
+            ),
+            server: Some(server),
+        });
+    }
+
+    tracing::warn!("saved profile did not verify; rebuilding through Proton's client");
+    if let Some(active) = blocking(pvpn_core::dbus::active_proton_profile).await {
+        let _ = blocking(move || pvpn_core::dbus::deactivate(&active.path)).await;
+    } else {
+        disconnect_and_wait().await;
+    }
+    let _ = wait_for_no_active_tunnel(Duration::from_secs(2)).await;
     None
 }
 
@@ -93,7 +218,7 @@ pub async fn restore() -> bool {
         );
     }
 
-    let back = blocking(|| net::wait_for_net(SETTLE_AFTER_TEARDOWN_SECS)).await;
+    let back = wait_for_internet(Duration::from_secs(SETTLE_AFTER_TEARDOWN_SECS as u64)).await;
     if !back {
         tracing::warn!("nothing is reaching the internet after {SETTLE_AFTER_TEARDOWN_SECS}s");
     }
@@ -262,9 +387,15 @@ async fn record(
     protocol: &str,
     outcome: ConnectOutcome,
     verdict: Option<&Verdict>,
+    ready_ms: Option<u64>,
 ) {
     let now = Utc::now();
     blocklist::apply(&mut session.state, server, outcome, now);
+    if matches!(outcome, ConnectOutcome::TrafficOk) {
+        if let Some(milliseconds) = ready_ms {
+            session.state.record_verified_ready(server, milliseconds);
+        }
+    }
     session.state.record_event(Event {
         at: now,
         server: server.to_string(),
@@ -274,7 +405,10 @@ async fn record(
             Some(Verdict::SessionDied { detail, .. }) => Some(detail.clone()),
             _ => None,
         },
-        seconds: verdict.map(|v| v.seconds()),
+        seconds: ready_ms
+            .map(|milliseconds| milliseconds.div_ceil(1000))
+            .or_else(|| verdict.map(|v| v.seconds())),
+        ready_ms,
     });
     session.save();
     if outcome.blames_the_server() {
@@ -342,19 +476,22 @@ async fn renew_certificate(cfg: &Config) -> bool {
 }
 
 async fn drop_stale_tunnel() {
-    let connected = blocking(|| {
-        proc::protonvpn_status()
-            .ok()
-            .map(|r| proc::is_connected(&r.stdout))
-            .unwrap_or(false)
-    })
-    .await;
+    let connected = if blocking(proc::verified_tunnel_active).await {
+        true
+    } else {
+        blocking(|| {
+            proc::protonvpn_status()
+                .ok()
+                .map(|result| proc::is_connected(&result.stdout))
+                .unwrap_or(false)
+        })
+        .await
+    };
     if !connected {
         return;
     }
     tracing::warn!("something reconnected while we were working — disconnecting");
     restore().await;
-    tokio::time::sleep(Duration::from_secs(2)).await;
 }
 
 /// Fresh sweep+refine rank, persisted as `last_full_rank`, excluding
@@ -408,14 +545,28 @@ pub async fn up(session: &mut Session, protocol: Option<String>) -> UpReport {
     session.sync_network().await;
     let cfg = session.config.clone();
 
-    let status = blocking(|| proc::protonvpn_status().ok()).await;
+    if let Some(report) = reuse_healthy_tunnel(session).await {
+        return report;
+    }
+
+    let dbus_now = blocking(pvpn_core::dbus::active_proton_server).await;
+    let status = if dbus_now.is_none() {
+        blocking(|| proc::protonvpn_status().ok()).await
+    } else {
+        None
+    };
     let stdout = status.as_ref().map(|r| r.stdout.as_str()).unwrap_or("");
     let status_connected = proc::is_connected(stdout);
-    let now = if status_connected {
-        proc::current_server(stdout)
-    } else {
-        blocking(proc::active_proton_server).await
-    };
+    let mut now = dbus_now.or_else(|| {
+        if status_connected {
+            proc::current_server(stdout)
+        } else {
+            None
+        }
+    });
+    if now.is_none() {
+        now = blocking(proc::active_proton_server).await;
+    }
     if status_connected || now.is_some() {
         tracing::info!(
             "disconnecting {} before establishing a fresh connection",
@@ -427,19 +578,27 @@ pub async fn up(session: &mut Session, protocol: Option<String>) -> UpReport {
             }
         }
         restore().await;
-        tokio::time::sleep(Duration::from_secs(2)).await;
     }
+
+    if let Some(problem) = local_network_problem().await {
+        return UpReport {
+            ok: false,
+            message: problem,
+            server: None,
+        };
+    }
+    if let Some(report) = activate_saved_fast_path(session).await {
+        return report;
+    }
+
+    // This check only affects narration, so hide it behind the work that
+    // actually decides and establishes the connection.
+    let api_check = tokio::task::spawn_blocking(net::api_reachable);
 
     let proto = {
         let requested = protocol.clone();
         blocking(move || {
-            if let Some(p) = requested {
-                let _ = proc::set_protocol(&p);
-            } else if proc::protocol_available("protun-tls") {
-                let _ = proc::set_protocol("protun-tls");
-            }
-            let current = proc::current_protocol();
-            proc::ensure_connect_protocol(&current)
+            proc::ensure_connect_protocol(requested.as_deref().unwrap_or("protun-tls"))
         })
         .await
     };
@@ -516,7 +675,7 @@ pub async fn up(session: &mut Session, protocol: Option<String>) -> UpReport {
         drop_stale_tunnel().await;
     }
 
-    let api_ok = blocking(net::api_reachable).await;
+    let api_ok = api_check.await.unwrap_or(false);
     if api_ok {
         tracing::info!("Proton's API is reachable — normal network");
     } else {
@@ -562,20 +721,23 @@ pub async fn up(session: &mut Session, protocol: Option<String>) -> UpReport {
                 }
                 None => tracing::info!("attempt {}/{attempts} — reconnecting", attempt + 1),
             }
-            let _ = blocking(proc::protonvpn_disconnect).await;
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            disconnect_and_wait().await;
         }
-        if let Some(problem) = local_network_problem().await {
+        let current_network = blocking(proc::active_network_key).await;
+        if current_network != network {
             restore().await;
             return UpReport {
                 ok: false,
-                message: problem,
+                message: format!(
+                    "The network changed from {network} to {current_network} while preparing the connection. Run `pvpn up` again so server evidence stays on the correct network."
+                ),
                 server: None,
             };
         }
         attempt += 1;
 
         let attempt_started = Utc::now();
+        let attempt_timer = Instant::now();
         let shim_c = shim.clone();
         let target_c = target.clone();
         let result =
@@ -589,11 +751,16 @@ pub async fn up(session: &mut Session, protocol: Option<String>) -> UpReport {
             }
         };
         let log = format!("{}\n{}", result.stdout, result.stderr);
-        let status = blocking(|| proc::protonvpn_status().ok()).await;
+        let dbus_server = blocking(pvpn_core::dbus::active_proton_server).await;
+        let status = if dbus_server.is_none() {
+            blocking(|| proc::protonvpn_status().ok()).await
+        } else {
+            None
+        };
         let stdout = status.as_ref().map(|r| r.stdout.as_str()).unwrap_or("");
 
-        if result.success && proc::is_connected(stdout) {
-            let got = proc::current_server(stdout);
+        if result.success && (dbus_server.is_some() || proc::is_connected(stdout)) {
+            let got = dbus_server.or_else(|| proc::current_server(stdout));
             if let (Some(want), Some(got_name)) = (target.as_ref(), got.as_ref()) {
                 if want != got_name && n + 1 < attempts {
                     tracing::warn!("landed on {got_name} instead of {want} — retrying");
@@ -635,7 +802,16 @@ pub async fn up(session: &mut Session, protocol: Option<String>) -> UpReport {
                 };
             }
 
-            record(session, &server, &proto, outcome, Some(&verdict)).await;
+            let ready_ms = attempt_timer.elapsed().as_millis().min(u64::MAX as u128) as u64;
+            record(
+                session,
+                &server,
+                &proto,
+                outcome,
+                Some(&verdict),
+                settled.then_some(ready_ms),
+            )
+            .await;
 
             // Our own network, not this server. Walking to the next one
             // would measure the same broken uplink again and write off a
@@ -773,7 +949,7 @@ pub async fn up(session: &mut Session, protocol: Option<String>) -> UpReport {
             };
         }
         if let Some(name) = &target {
-            record(session, name, &proto, outcome, None).await;
+            record(session, name, &proto, outcome, None, None).await;
         }
 
         if blocklist::log_says_missing_backend(&log) {
@@ -1190,6 +1366,7 @@ async fn hop_to_pattern(session: &mut Session, want: String, before: Option<Stri
                         &proto,
                         attempt.outcome,
                         Some(&attempt.verdict),
+                        None,
                     )
                     .await;
                     attempt
@@ -1202,6 +1379,7 @@ async fn hop_to_pattern(session: &mut Session, want: String, before: Option<Stri
                         &proto,
                         attempt.outcome,
                         Some(&attempt.verdict),
+                        None,
                     )
                     .await;
                     attempt
@@ -1216,13 +1394,14 @@ async fn hop_to_pattern(session: &mut Session, want: String, before: Option<Stri
                     &proto,
                     attempt.outcome,
                     Some(&attempt.verdict),
+                    None,
                 )
                 .await;
             }
             attempt
         }
         ConnectAttempt::Failed { outcome, detail } if local_only => {
-            record(session, &want, &proto, outcome, None).await;
+            record(session, &want, &proto, outcome, None, None).await;
             restore().await;
             return UpReport {
                 ok: false,
@@ -1245,7 +1424,7 @@ async fn hop_to_pattern(session: &mut Session, want: String, before: Option<Stri
                     fallback
                 }
                 fallback => {
-                    record(session, &want, &proto, outcome, None).await;
+                    record(session, &want, &proto, outcome, None, None).await;
                     let fallback_detail = match fallback {
                         Ok(None) => "no locally saved profile exists".to_string(),
                         Err(err) => err.to_string(),
@@ -1346,13 +1525,7 @@ async fn hop_to_pattern(session: &mut Session, want: String, before: Option<Stri
 /// Put the connect protocol where it needs to be — Stealth if this install
 /// has it, since that is the only one these networks let through.
 async fn prepare_protocol() -> anyhow::Result<String> {
-    blocking(|| {
-        if proc::protocol_available("protun-tls") {
-            let _ = proc::set_protocol("protun-tls");
-        }
-        proc::ensure_connect_protocol(&proc::current_protocol())
-    })
-    .await
+    blocking(|| proc::ensure_connect_protocol("protun-tls")).await
 }
 
 /// One connect attempt with the full verification behind it, recorded.
@@ -1403,6 +1576,7 @@ async fn verify_connected_server(
     proto: &str,
     network: &str,
     started: DateTime<Utc>,
+    timer: Instant,
     record_result: bool,
 ) -> Attempt {
     let settle_secs = session.config.settle_secs;
@@ -1411,7 +1585,16 @@ async fn verify_connected_server(
     let outcome = outcome_for(&verdict, started).await;
     narrate(&server, &verdict, settle_secs);
     if record_result {
-        record(session, &server, proto, outcome, Some(&verdict)).await;
+        let ready_ms = timer.elapsed().as_millis().min(u64::MAX as u128) as u64;
+        record(
+            session,
+            &server,
+            proto,
+            outcome,
+            Some(&verdict),
+            verdict.carrying().then_some(ready_ms),
+        )
+        .await;
     }
     Attempt {
         server,
@@ -1426,6 +1609,8 @@ async fn activate_saved_and_verify(
     proto: &str,
     network: &str,
 ) -> anyhow::Result<Option<Attempt>> {
+    let started = Utc::now();
+    let timer = Instant::now();
     let server_name = server.to_string();
     let activated =
         blocking(move || proc::activate_verified_proton_connection(&server_name)).await?;
@@ -1436,9 +1621,8 @@ async fn activate_saved_and_verify(
     let Some(active) = active.filter(|active| active.eq_ignore_ascii_case(server)) else {
         anyhow::bail!("NetworkManager activated a different VPN profile");
     };
-    let started = Utc::now();
     Ok(Some(
-        verify_connected_server(session, active, proto, network, started, true).await,
+        verify_connected_server(session, active, proto, network, started, timer, true).await,
     ))
 }
 
@@ -1451,12 +1635,12 @@ async fn connect_and_verify(
     record_result: bool,
 ) -> ConnectAttempt {
     let cfg = session.config.clone();
-    let _ = blocking(proc::protonvpn_disconnect).await;
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    disconnect_and_wait().await;
 
     let shim = paths::shim_dir();
     let timeout = Duration::from_secs(cfg.connect_timeout_secs);
     let started = Utc::now();
+    let timer = Instant::now();
     let target_c = connect_target.cloned();
     let expected = expected_server
         .map(str::to_string)
@@ -1471,7 +1655,7 @@ async fn connect_and_verify(
             let outcome = ConnectOutcome::ClientError;
             if record_result {
                 if let Some(name) = expected.as_deref() {
-                    record(session, name, proto, outcome, None).await;
+                    record(session, name, proto, outcome, None, None).await;
                 }
             }
             return ConnectAttempt::Failed {
@@ -1481,14 +1665,19 @@ async fn connect_and_verify(
         }
     };
 
-    let status = blocking(|| proc::protonvpn_status().ok()).await;
+    let dbus_server = blocking(pvpn_core::dbus::active_proton_server).await;
+    let status = if dbus_server.is_none() {
+        blocking(|| proc::protonvpn_status().ok()).await
+    } else {
+        None
+    };
     let stdout = status.as_ref().map(|r| r.stdout.as_str()).unwrap_or("");
-    if !result.success || !proc::is_connected(stdout) {
+    if !result.success || (dbus_server.is_none() && !proc::is_connected(stdout)) {
         let log = format!("{}\n{}", result.stdout, result.stderr);
         let outcome = diagnose(started, Some(&log)).await;
         if record_result {
             if let Some(name) = expected.as_deref() {
-                record(session, name, proto, outcome, None).await;
+                record(session, name, proto, outcome, None, None).await;
             }
         }
         let detail = connect_failure_detail(&log);
@@ -1499,12 +1688,22 @@ async fn connect_and_verify(
         return ConnectAttempt::Failed { outcome, detail };
     }
 
-    let server = proc::current_server(stdout).unwrap_or_else(|| "unknown".to_string());
+    let server = dbus_server
+        .or_else(|| proc::current_server(stdout))
+        .unwrap_or_else(|| "unknown".to_string());
     if let Some(want) = expected.as_deref() {
         if !selected_server_matches(&server, Some(want)) {
             let detail = format!("Proton selected {server} instead of the requested target {want}");
             if record_result && want.contains('#') {
-                record(session, want, proto, ConnectOutcome::ClientError, None).await;
+                record(
+                    session,
+                    want,
+                    proto,
+                    ConnectOutcome::ClientError,
+                    None,
+                    None,
+                )
+                .await;
             }
             let _ = blocking(proc::protonvpn_disconnect).await;
             tracing::warn!("{detail}");
@@ -1515,7 +1714,16 @@ async fn connect_and_verify(
         }
     }
     ConnectAttempt::Connected(
-        verify_connected_server(session, server, proto, network, started, record_result).await,
+        verify_connected_server(
+            session,
+            server,
+            proto,
+            network,
+            started,
+            timer,
+            record_result,
+        )
+        .await,
     )
 }
 

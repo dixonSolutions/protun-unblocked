@@ -121,7 +121,16 @@ fn parse_uplink(routes: &str, uplinks: &[String]) -> Option<Uplink> {
 fn gateway_answers(link: &Uplink) -> bool {
     run_with_timeout(
         "ping",
-        &["-n", "-c", "1", "-W", "1", "-I", &link.device, &link.gateway],
+        &[
+            "-n",
+            "-c",
+            "1",
+            "-W",
+            "1",
+            "-I",
+            &link.device,
+            &link.gateway,
+        ],
         &[],
         Duration::from_secs(3),
     )
@@ -164,9 +173,12 @@ fn parse_neighbour_health(neigh: &str) -> LinkHealth {
 
 /// Is the network under the tunnel still there?
 pub fn health() -> LinkHealth {
-    decide(uplink().as_ref(), connected_uplinks().is_empty(), |l| {
-        gateway_answers(l)
-    }, neighbour_health)
+    decide(
+        uplink().as_ref(),
+        connected_uplinks().is_empty(),
+        |l| gateway_answers(l),
+        neighbour_health,
+    )
 }
 
 /// The decision, separated from the commands that feed it so it can be
@@ -301,9 +313,7 @@ default via 172.20.10.1 dev wlp0s20f3 proto dhcp src 172.20.10.2 metric 600
     #[test]
     fn a_confirmed_neighbour_is_a_live_link() {
         assert_eq!(
-            parse_neighbour_health(
-                "172.20.10.1 dev wlp0s20f3 lladdr 62:7e:c9:0d:2e:64 REACHABLE"
-            ),
+            parse_neighbour_health("172.20.10.1 dev wlp0s20f3 lladdr 62:7e:c9:0d:2e:64 REACHABLE"),
             LinkHealth::Up
         );
     }

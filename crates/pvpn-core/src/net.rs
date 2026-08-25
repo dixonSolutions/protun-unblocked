@@ -4,6 +4,7 @@
 
 use std::process::{Command, Stdio};
 use std::time::Duration;
+use tokio::task::JoinSet;
 
 /// A hostname that should resolve on any ordinary internet connection.
 const DNS_PROBE_HOST: &str = "connectivitycheck.gstatic.com";
@@ -109,6 +110,61 @@ pub fn net_works_within(timeout_secs: u64) -> bool {
         .any(|url| curl_ok(url, timeout_secs, true))
 }
 
+async fn curl_ok_async(url: String, timeout: Duration, ipv4_only: bool) -> bool {
+    let mut command = tokio::process::Command::new("curl");
+    command
+        .arg("-s")
+        .arg("--noproxy")
+        .arg("*")
+        .arg("-o")
+        .arg("/dev/null")
+        .arg("--max-time")
+        .arg(format!("{:.3}", timeout.as_secs_f64()))
+        .kill_on_drop(true)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if ipv4_only {
+        command.arg("-4");
+    }
+    command.arg(url);
+    let Ok(mut child) = command.spawn() else {
+        return false;
+    };
+    tokio::time::timeout(timeout + Duration::from_millis(250), child.wait())
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .is_some_and(|status| status.success())
+}
+
+async fn first_url_works(urls: &[String], timeout: Duration) -> bool {
+    let mut checks = JoinSet::new();
+    for url in urls {
+        checks.spawn(curl_ok_async(url.clone(), timeout, true));
+    }
+    while let Some(result) = checks.join_next().await {
+        if matches!(result, Ok(true)) {
+            checks.abort_all();
+            return true;
+        }
+    }
+    false
+}
+
+/// Race independent reachability endpoints and return on the first success.
+///
+/// A filtered endpoint can consume its entire timeout. Running the probes in
+/// series made that delay part of every successful verification even when a
+/// second endpoint was immediately reachable.
+pub async fn net_works_raced(timeout: Duration) -> bool {
+    let urls: Vec<String> = NET_PROBE_URLS
+        .iter()
+        .map(|url| (*url).to_string())
+        .collect();
+    first_url_works(&urls, timeout).await
+}
+
 /// Poll `net_works` until `settle` elapses. Returns as soon as traffic
 /// flows. Running out of the window is *not* a reason to tear a tunnel
 /// down — every tunnel written off as dead turned out to be merely slow.
@@ -149,6 +205,10 @@ pub fn wait_for_net(attempts: u32) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::time::{Duration, Instant};
+
     #[test]
     fn the_local_hosts_database_resolves_without_the_internet() {
         assert!(super::resolves_within("localhost", 1));
@@ -162,5 +222,31 @@ mod tests {
         assert!(super::NET_PROBE_URLS
             .iter()
             .any(|u| u.contains("cloudflare.com")));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn raced_probes_return_when_the_fast_endpoint_answers() {
+        let slow = TcpListener::bind("127.0.0.1:0").unwrap();
+        let fast = TcpListener::bind("127.0.0.1:0").unwrap();
+        let slow_url = format!("http://{}", slow.local_addr().unwrap());
+        let fast_url = format!("http://{}", fast.local_addr().unwrap());
+
+        std::thread::spawn(move || {
+            let (mut stream, _) = slow.accept().unwrap();
+            let mut request = [0; 256];
+            let _ = stream.read(&mut request);
+            std::thread::sleep(Duration::from_secs(1));
+            let _ = stream.write_all(b"HTTP/1.1 204 No Content\r\n\r\n");
+        });
+        std::thread::spawn(move || {
+            let (mut stream, _) = fast.accept().unwrap();
+            let mut request = [0; 256];
+            let _ = stream.read(&mut request);
+            let _ = stream.write_all(b"HTTP/1.1 204 No Content\r\n\r\n");
+        });
+
+        let started = Instant::now();
+        assert!(super::first_url_works(&[slow_url, fast_url], Duration::from_secs(2)).await);
+        assert!(started.elapsed() < Duration::from_millis(700));
     }
 }

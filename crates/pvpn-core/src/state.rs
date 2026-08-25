@@ -39,6 +39,14 @@ pub enum ServerStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerStat {
     pub ema_latency_ms: Option<f64>,
+    /// End-to-end time from starting activation until traffic was verified.
+    ///
+    /// Unlike handshake latency, this includes the VPN plugin's internal
+    /// retries and the readiness probe, so it predicts the wait users feel.
+    #[serde(default)]
+    pub ema_ready_ms: Option<f64>,
+    #[serde(default)]
+    pub ready_samples: u32,
     #[serde(default)]
     pub samples: u32,
     pub last_probe_ok: Option<DateTime<Utc>>,
@@ -68,6 +76,8 @@ impl Default for ServerStat {
     fn default() -> Self {
         Self {
             ema_latency_ms: None,
+            ema_ready_ms: None,
+            ready_samples: 0,
             samples: 0,
             last_probe_ok: None,
             status: ServerStatus::Known,
@@ -106,6 +116,9 @@ pub struct Event {
     /// before touching `settle_secs`.
     #[serde(default)]
     pub seconds: Option<u64>,
+    /// Millisecond form used for latency comparisons and machine output.
+    #[serde(default)]
+    pub ready_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -271,11 +284,7 @@ impl State {
     /// that window left the blocked server sitting at the top of the retry
     /// list: the tunnel would fail, the server would be written off, and
     /// the very next attempt went straight back to it.
-    pub fn ranked_targets(
-        &self,
-        retry_after: chrono::Duration,
-        now: DateTime<Utc>,
-    ) -> Vec<String> {
+    pub fn ranked_targets(&self, retry_after: chrono::Duration, now: DateTime<Utc>) -> Vec<String> {
         self.networks
             .get(&self.current)
             .map(|n| {
@@ -327,6 +336,17 @@ impl State {
         if entry.status == ServerStatus::Blocked {
             entry.status = ServerStatus::Known;
         }
+    }
+
+    /// Record end-to-end command latency only after real traffic succeeds.
+    pub fn record_verified_ready(&mut self, name: &str, ready_ms: u64) {
+        let entry = self.here_mut().servers.entry(name.to_string()).or_default();
+        let sample = ready_ms as f64;
+        entry.ema_ready_ms = Some(match entry.ema_ready_ms {
+            Some(previous) => EMA_ALPHA * sample + (1.0 - EMA_ALPHA) * previous,
+            None => sample,
+        });
+        entry.ready_samples += 1;
     }
 
     /// We asked this server for a tunnel and the outcome was nobody's
@@ -465,6 +485,21 @@ impl State {
         out
     }
 
+    /// Proven servers ordered by expected time to verified traffic.
+    ///
+    /// Success rate is folded into the cost so an occasionally quick but
+    /// unreliable server does not outrank one that consistently works.
+    pub fn fastest_working_list(&self) -> Vec<(String, ServerStat)> {
+        let mut out = self.working_list();
+        out.sort_by(|a, b| {
+            ready_cost(&a.1)
+                .partial_cmp(&ready_cost(&b.1))
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.1.last_connect_ok.cmp(&a.1.last_connect_ok))
+        });
+        out
+    }
+
     /// When this server's block lifts, if it is blocked.
     pub fn block_expires_at(
         &self,
@@ -475,7 +510,8 @@ impl State {
         if stat.status != ServerStatus::Blocked {
             return None;
         }
-        stat.blocked_since.map(|since| since + hold_for(stat, retry_after))
+        stat.blocked_since
+            .map(|since| since + hold_for(stat, retry_after))
     }
 
     /// Lift a block by hand. Returns false if there was nothing to lift.
@@ -551,6 +587,16 @@ impl State {
             servers,
         };
     }
+}
+
+fn ready_cost(stat: &ServerStat) -> f64 {
+    let latency = stat.ema_ready_ms.unwrap_or(f64::MAX / 4.0);
+    let success_rate = if stat.connect_attempts == 0 {
+        0.0
+    } else {
+        stat.connect_successes as f64 / stat.connect_attempts as f64
+    };
+    latency * (1.0 + 2.0 * (1.0 - success_rate))
 }
 
 #[cfg(test)]
@@ -847,6 +893,34 @@ mod tests {
     }
 
     #[test]
+    fn fastest_working_list_uses_verified_time_and_reliability() {
+        let mut state = state_here();
+        let now = Utc::now();
+        state.record_connect_success("slow", now);
+        state.record_verified_ready("slow", 12_000);
+        state.record_connect_success("fast", now);
+        state.record_verified_ready("fast", 1_500);
+        state.record_connect_attempt("fast", now);
+
+        let names: Vec<String> = state
+            .fastest_working_list()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(names, vec!["fast", "slow"]);
+    }
+
+    #[test]
+    fn verified_time_uses_an_ema_and_survives_missing_old_fields() {
+        let mut state = state_here();
+        state.record_verified_ready("JP-FREE#11", 1_000);
+        state.record_verified_ready("JP-FREE#11", 2_000);
+        let stat = &state.servers()["JP-FREE#11"];
+        assert_eq!(stat.ready_samples, 2);
+        assert_eq!(stat.ema_ready_ms, Some(1_300.0));
+    }
+
+    #[test]
     fn the_working_list_is_most_recently_proven_first() {
         let mut state = state_here();
         let now = Utc::now();
@@ -895,7 +969,10 @@ mod tests {
             state.block_expires_at("SG-FREE#13", ChronoDuration::hours(24)),
             Some(now + ChronoDuration::hours(48))
         );
-        assert_eq!(state.block_expires_at("JP-FREE#11", ChronoDuration::hours(24)), None);
+        assert_eq!(
+            state.block_expires_at("JP-FREE#11", ChronoDuration::hours(24)),
+            None
+        );
     }
 
     #[test]
@@ -907,7 +984,10 @@ mod tests {
         state.record_connect_blocked("SG-FREE#13", "refused", now);
         state.record_connect_blocked("SG-FREE#13", "refused", now);
         assert!(state.unblock("SG-FREE#13"));
-        assert_eq!(state.servers()["SG-FREE#13"].consecutive_connect_failures, 0);
+        assert_eq!(
+            state.servers()["SG-FREE#13"].consecutive_connect_failures,
+            0
+        );
         assert!(!state.unblock("SG-FREE#13"), "nothing left to lift");
     }
 
@@ -986,6 +1066,7 @@ mod tests {
             outcome: outcome.to_string(),
             detail: None,
             seconds: Some(24),
+            ready_ms: Some(24_000),
         }
     }
 

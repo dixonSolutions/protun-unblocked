@@ -555,6 +555,12 @@ fn latency(stat: &pvpn_core::state::ServerStat) -> String {
         .unwrap_or_else(|| "-".to_string())
 }
 
+fn ready_time(stat: &pvpn_core::state::ServerStat) -> String {
+    stat.ema_ready_ms
+        .map(|milliseconds| format!("{:.2}s", milliseconds / 1000.0))
+        .unwrap_or_else(|| "-".to_string())
+}
+
 async fn cmd_fast() -> anyhow::Result<i32> {
     let session = Session::load()?;
     let servers = session.state.fast_list();
@@ -567,7 +573,7 @@ async fn cmd_fast() -> anyhow::Result<i32> {
     }
     let now = chrono::Utc::now();
     println!(
-        "Fast servers (TLS handshake, measured on {}):",
+        "Fast servers (TLS handshake and verified readiness, measured on {}):",
         session.network()
     );
     for (name, stat) in servers {
@@ -580,7 +586,11 @@ async fn cmd_fast() -> anyhow::Result<i32> {
             (_, Some(at)) => format!("  worked {}", ago(at, now)),
             (_, None) => "  has worked here".to_string(),
         };
-        println!("  {name:<16} {:>7}{proven}", latency(&stat));
+        println!(
+            "  {name:<16} TLS {:>7}  READY {:>7}{proven}",
+            latency(&stat),
+            ready_time(&stat)
+        );
     }
     println!();
     println!("`pvpn working` lists only the ones that carried real traffic.");
@@ -611,8 +621,9 @@ async fn cmd_working() -> anyhow::Result<i32> {
             .map(|at| ago(at, now))
             .unwrap_or_else(|| "-".to_string());
         println!(
-            "  {name:<16} {:>7}  {}/{} connects worked, last {last}",
+            "  {name:<16} TLS {:>7}  READY {:>7}  {}/{} connects worked, last {last}",
             latency(&stat),
+            ready_time(&stat),
             stat.connect_successes,
             stat.connect_attempts
         );
@@ -732,7 +743,7 @@ async fn cmd_servers(all: bool, limit: usize, json: bool) -> anyhow::Result<i32>
         }
         printed = true;
         println!("{net}");
-        println!("  SERVER           STATUS    LATENCY  CONNECTS NOTE");
+        println!("  SERVER           STATUS    TLS      READY    CONNECTS NOTE");
         for (name, stat) in servers {
             let status = match stat.status {
                 pvpn_core::state::ServerStatus::Blocked => "blocked",
@@ -763,8 +774,9 @@ async fn cmd_servers(all: bool, limit: usize, json: bool) -> anyhow::Result<i32>
                 "measured only".to_string()
             };
             println!(
-                "  {name:<16} {status:<9} {:>7}  {connects:<7} {note}",
-                latency(&stat)
+                "  {name:<16} {status:<9} {:>7}  {:>7}  {connects:<7} {note}",
+                latency(&stat),
+                ready_time(&stat)
             );
         }
         if hidden > 0 {
@@ -824,8 +836,9 @@ async fn cmd_history(lines: u32, all: bool, json: bool) -> anyhow::Result<i32> {
     for (net, e) in &entries {
         let when = e.at.with_timezone(&chrono::Local).format("%b %d %H:%M");
         let took = e
-            .seconds
-            .map(|s| format!("{s}s"))
+            .ready_ms
+            .map(|milliseconds| format!("{:.2}s", milliseconds as f64 / 1000.0))
+            .or_else(|| e.seconds.map(|seconds| format!("{seconds}s")))
             .unwrap_or_else(|| "-".to_string());
         let where_ = if all {
             format!("  [{net}]")

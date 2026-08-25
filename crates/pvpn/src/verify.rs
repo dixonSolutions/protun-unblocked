@@ -66,8 +66,9 @@ impl Verdict {
     }
 }
 
-/// How often to ask the questions that cost a subprocess.
-const POLL_INTERVAL: Duration = Duration::from_secs(1);
+const FAST_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const STEADY_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const FAST_POLL_WINDOW: Duration = Duration::from_secs(1);
 
 /// Traffic is checked every poll; the log every poll (it is a file read);
 /// the uplink less often, because it is a ping and an `ip` call and the
@@ -101,10 +102,20 @@ pub async fn verify(started: DateTime<Utc>, settle: Duration, network: &str) -> 
     let mut link_down_seen: u32 = 0;
 
     loop {
+        // Positive NetworkManager evidence gates success. A stale Proton
+        // status plus ordinary internet on the physical uplink must never
+        // be mistaken for verified VPN traffic.
+        let tunnel_active = blocking(proc::verified_tunnel_active).await;
+        let traffic = async {
+            tunnel_active && net::net_works_raced(Duration::from_secs(PROBE_TIMEOUT_SECS)).await
+        };
+        let log = blocking(proc::ProtonLogSnapshot::recent);
+        let (traffic_ok, log) = tokio::join!(traffic, log);
+
         // Traffic first, and it wins outright. A tunnel that is carrying
         // packets is working, whatever anything else has to say — an error
         // logged on the way up does not matter once it came up.
-        if blocking(|| net::net_works_within(PROBE_TIMEOUT_SECS)).await {
+        if traffic_ok {
             return Verdict::Carrying {
                 after: begin.elapsed(),
             };
@@ -114,7 +125,7 @@ pub async fn verify(started: DateTime<Utc>, settle: Duration, network: &str) -> 
         // file, no network at all — which matters, because everything else
         // that could ask a question right now is going through a tunnel
         // that may be dead.
-        if let Some(detail) = blocking(move || proc::session_death_since(started)).await {
+        if let Some(detail) = log.session_death_since(started) {
             return Verdict::SessionDied {
                 after: begin.elapsed(),
                 detail,
@@ -157,7 +168,12 @@ pub async fn verify(started: DateTime<Utc>, settle: Duration, network: &str) -> 
                 after: begin.elapsed(),
             };
         }
-        tokio::time::sleep(POLL_INTERVAL).await;
+        let poll = if begin.elapsed() < FAST_POLL_WINDOW {
+            FAST_POLL_INTERVAL
+        } else {
+            STEADY_POLL_INTERVAL
+        };
+        tokio::time::sleep(poll).await;
     }
 }
 

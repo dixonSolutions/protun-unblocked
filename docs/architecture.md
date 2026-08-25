@@ -78,14 +78,40 @@ with the current Proton credentials while retaining only one entry.
 `pvpn` also recognizes a profile activated from desktop Network Settings,
 even though Proton's own CLI state machine reports that manual activation as
 disconnected. Running `pvpn up` or `pvpn hop` is itself an explicit request
-for a fresh session, so either command preserves a proven profile, disconnects
-the active tunnel, and then establishes and verifies a new one. Hop and
+for a usable session. `pvpn up` first verifies an existing tunnel and returns
+immediately when it is already carrying traffic. Otherwise it preserves a
+proven profile, disconnects the stale tunnel, and establishes and verifies a
+new one. Hop and
 teardown preserve only a profile NetworkManager currently reports as active;
 a stale `protonvpn status` value cannot trigger profile preservation after the
 real tunnel has already disappeared.
 Teardown also remembers the active profile UUID and removes that exact
 transient copy if Proton leaves it beside an existing same-name saved profile;
 the backend can otherwise display both as disconnected for tens of seconds.
+
+### Connection hot path
+
+A server that has already carried traffic on the current network has earned a
+fast path. `pvpn up` orders those servers by observed activation-to-verified
+traffic time and reliability, then activates the best saved NetworkManager
+profile directly over D-Bus. This avoids inventory refresh, server probing,
+Python client startup, and repeated protocol discovery. If D-Bus or the saved
+profile is unavailable, the existing `nmcli` and Proton client path remains the
+fallback.
+
+Success is never inferred from activation alone. NetworkManager must report an
+active Proton tunnel and one of several independent internet probes must pass.
+Those probes race rather than queue, so a filtered endpoint cannot delay a
+healthy endpoint. DNS and ordinary-internet preflight checks likewise run
+concurrently before routes change. Fixed post-disconnect sleeps were replaced
+with bounded readiness polling; the command continues as soon as the old
+tunnel is actually gone.
+
+The latency stored as `ready_ms` starts before activation and ends only when
+traffic is verified. It includes VPN-plugin retries and therefore predicts the
+wait a user experiences better than TLS handshake latency. Older state and
+history files load with this field absent and learn it on their next successful
+connection.
 
 ## There was a daemon; it is gone
 
@@ -124,8 +150,8 @@ The removed source is kept at `legacy/pvpnd/` for reference.
 
 ## State — `~/.local/share/pvpn/state.json`
 
-Two lists, filed **per network**, populated two different ways. A fast TLS
-handshake does not prove a server works — see
+The observations are filed **per network** and populated in different ways. A
+fast TLS handshake does not prove a server works — see
 [transparent-proxy.md](transparent-proxy.md).
 
 - **Fast list** — TLS-handshake latency, written from the measurement pass
@@ -137,6 +163,10 @@ handshake does not prove a server works — see
   Answers "does traffic actually flow?" Entries expire after
   `blocked_retry_after_hours`, and the hold is stretched up to 4× for a
   server that keeps failing.
+- **Verified-ready time** — activation through the first proven traffic,
+  recorded in milliseconds only on success. This drives the repeated-connect
+  hot path, with connect success rate preventing a flaky server from winning
+  on one unusually quick attempt.
 
 ```bash
 pvpn fast       # what this network measured as quick
