@@ -12,11 +12,57 @@ persisted per-network knowledge about servers.
 ## Layout
 
 ```
-crates/pvpn-core/   rank, probe, geo, serverlist, state, config, proc
-crates/pvpn/        the CLI: connect, blocklist, session, narration
+crates/pvpn-core/   rank, probe, geo, serverlist, state, config, proc, link
+crates/pvpn/        the CLI: connect, verify, blocklist, session, narration
 lib/                Python shims loaded into protonvpn via PYTHONPATH
 legacy/             the previous bash tool, and the removed daemon
 ```
+
+Two of those exist only to answer one question — *when a tunnel carries no
+traffic, whose fault is it?* — because getting that wrong is silent and
+compounding:
+
+- **`pvpn-core::link`** asks whether the network *under* the tunnel is
+  still there, by pinging the physical uplink's own gateway. That gateway
+  is reachable outside the tunnel, so it answers while everything else on
+  the machine is routed through a tunnel that may be dead. It returns
+  `Up`/`Down`/**`Unknown`**, and only `Down` — positive evidence — changes
+  any decision.
+- **`pvpn::verify`** watches a fresh tunnel and returns one of four
+  verdicts: carrying, session died, link down, quiet. It ends the attempt
+  the moment any of them is true, so a killed session costs about twenty
+  seconds instead of the full ninety-second settle window — but it never
+  ends one on a clock alone, because every tunnel this tool ever wrote off
+  on a timeout turned out to be merely slow.
+
+Immediately before each `up` attempt, the CLI separately proves that the
+configured local DNS resolver answers and that ordinary HTTPS works without
+the tunnel. If either baseline is already broken, no server is attempted or
+blocked. This prevents a dead local filtering resolver from turning every
+hostname-based tunnel probe into false evidence against the server.
+
+Carrying traffic records success; a dead Proton session or a quiet tunnel
+records a server failure. A confirmed physical-link outage records only the
+attempt. Otherwise, walking out of wifi range could remove a healthy server
+from tomorrow's ranked list for a day, and four days the second time.
+
+### Saved system VPNs
+
+Proton's Linux backend creates a temporary NetworkManager profile for each
+connection and removes it on disconnect. While connected, that live
+`ProtonVPN <server>` profile is the only entry shown. Before `pvpn down` or
+`pvpn hop` tears down a tunnel that carried verified traffic, `pvpn` preserves
+the profile under that same plain name with autoconnect disabled. This avoids
+both a status suffix and a duplicate active/saved pair.
+
+That list follows the same evidence policy as the blocklist. A confirmed
+server failure removes its saved profile; local DNS, certificate, or physical
+network failures do not. A later successful connection refreshes the profile
+with the current Proton credentials while retaining only one entry.
+`pvpn` also recognizes a profile activated from desktop Network Settings,
+even though Proton's own CLI state machine reports that manual activation as
+disconnected, and does not replace the user's selection with its automatic
+rank.
 
 ## There was a daemon; it is gone
 

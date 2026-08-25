@@ -5,6 +5,9 @@
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
+/// A hostname that should resolve on any ordinary internet connection.
+const DNS_PROBE_HOST: &str = "connectivitycheck.gstatic.com";
+
 /// Small, unauthenticated endpoints that answered quickly through a working
 /// tunnel. Deliberately not `1.1.1.1` — on a filtered network that address
 /// burns the full timeout whether or not the tunnel is up.
@@ -64,7 +67,46 @@ fn curl_body(url: &str, timeout_secs: u64) -> Option<String> {
 
 /// Is the internet actually usable right now?
 pub fn net_works() -> bool {
-    NET_PROBE_URLS.iter().any(|url| curl_ok(url, 3, true))
+    net_works_within(NET_PROBE_TIMEOUT_SECS)
+}
+
+/// The default per-probe budget. Three seconds is comfortably more than a
+/// working tunnel needs for a 204 and short enough that all three probes
+/// failing still leaves a poll loop responsive.
+pub const NET_PROBE_TIMEOUT_SECS: u64 = 3;
+
+/// Is the machine's configured resolver answering before a tunnel changes
+/// any routes?
+///
+/// This is deliberately separate from [`net_works`]. A local filtering
+/// resolver can accept queries while all of its upstreams are dead; in that
+/// state every hostname-based traffic probe fails and a VPN server would be
+/// blamed for a problem that existed before it was contacted.
+pub fn dns_works() -> bool {
+    resolves_within(DNS_PROBE_HOST, NET_PROBE_TIMEOUT_SECS)
+}
+
+fn resolves_within(host: &str, timeout_secs: u64) -> bool {
+    crate::proc::run_with_timeout(
+        "getent",
+        &["ahostsv4", host],
+        &[],
+        Duration::from_secs(timeout_secs),
+    )
+    .map(|result| result.success && !result.stdout.trim().is_empty())
+    .unwrap_or(false)
+}
+
+/// `net_works` with the per-probe timeout spelled out.
+///
+/// Returns on the *first* endpoint that answers, so a healthy tunnel costs
+/// one round trip rather than the timeout — this is the fast half of
+/// verifying a connect, and the reason a tunnel that works is confirmed in
+/// about a second instead of after a fixed wait.
+pub fn net_works_within(timeout_secs: u64) -> bool {
+    NET_PROBE_URLS
+        .iter()
+        .any(|url| curl_ok(url, timeout_secs, true))
 }
 
 /// Poll `net_works` until `settle` elapses. Returns as soon as traffic
@@ -107,6 +149,11 @@ pub fn wait_for_net(attempts: u32) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_local_hosts_database_resolves_without_the_internet() {
+        assert!(super::resolves_within("localhost", 1));
+    }
+
     #[test]
     fn probe_url_list_is_the_known_good_set() {
         assert!(super::NET_PROBE_URLS

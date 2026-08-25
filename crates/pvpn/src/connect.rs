@@ -14,13 +14,15 @@
 use crate::apps_hook;
 use crate::blocklist::{self, ConnectOutcome};
 use crate::session::{blocking, Session};
-use chrono::Utc;
+use crate::verify::{self, Verdict};
+use chrono::{DateTime, Utc};
 use pvpn_core::cache::{self, SteerMode};
 use pvpn_core::config::Config;
 use pvpn_core::net;
 use pvpn_core::paths;
 use pvpn_core::pipeline::{self, RankRequest};
 use pvpn_core::proc;
+use pvpn_core::state::Event;
 use std::time::Duration;
 
 #[derive(Debug, Clone)]
@@ -34,6 +36,27 @@ pub struct UpReport {
 /// How long to wait for normal routing after tearing a tunnel down.
 const SETTLE_AFTER_TEARDOWN_SECS: u32 = 10;
 
+/// Refuse to judge VPN servers when the ordinary connection is already
+/// broken. In particular, a dead local DNS proxy makes every hostname-based
+/// tunnel probe fail even though no VPN server caused that failure.
+async fn local_network_problem() -> Option<String> {
+    if !blocking(net::dns_works).await {
+        return Some(
+            "Your local DNS resolver is not answering before the VPN starts. \
+             No server was tried or blocked. Fix DNS, then retry."
+                .to_string(),
+        );
+    }
+    if !blocking(net::net_works).await {
+        return Some(
+            "The internet is not reachable before the VPN starts. \
+             No server was tried or blocked. Restore the normal connection, then retry."
+                .to_string(),
+        );
+    }
+    None
+}
+
 /// Tear down a half-built tunnel and put normal routing back.
 ///
 /// Never tears down a *working* tunnel just because traffic is slow —
@@ -43,6 +66,7 @@ pub async fn restore() -> bool {
     blocking(|| {
         proc::kill_in_flight_connect();
         let _ = proc::protonvpn_disconnect();
+        proc::nmcli_deactivate_proton_connections();
         for (_, uuid) in proc::nmcli_proton_connections() {
             proc::nmcli_clear_autoconnect(&uuid);
         }
@@ -68,9 +92,7 @@ pub async fn restore() -> bool {
 
     let back = blocking(|| net::wait_for_net(SETTLE_AFTER_TEARDOWN_SECS)).await;
     if !back {
-        tracing::warn!(
-            "nothing is reaching the internet after {SETTLE_AFTER_TEARDOWN_SECS}s"
-        );
+        tracing::warn!("nothing is reaching the internet after {SETTLE_AFTER_TEARDOWN_SECS}s");
     }
     back
 }
@@ -133,6 +155,125 @@ const QUIET_TUNNELS_BEFORE_GIVING_UP: u32 = 3;
 /// whichever one we happened to try burns a healthy server off the ranked
 /// list and moves to the next, which fails the same way — a whole
 /// shortlist consumed in three minutes without a single bad server in it.
+/// Turn a [`Verdict`] into who is to blame.
+///
+/// The certificate check comes first and outranks everything, because a
+/// lapsed certificate fails *every* server identically: read as a session
+/// kill it would retire one healthy server per attempt and burn a whole
+/// shortlist in three minutes without a bad server in it.
+async fn outcome_for(verdict: &Verdict, since: DateTime<Utc>) -> ConnectOutcome {
+    match verdict {
+        Verdict::Carrying { .. } => ConnectOutcome::TrafficOk,
+        Verdict::LinkDown { .. } => ConnectOutcome::LocalNetworkDown,
+        Verdict::SessionDied { .. } | Verdict::Quiet { .. } => {
+            if blocking(move || proc::cert_failure_since(since)).await {
+                ConnectOutcome::CertificateExpired
+            } else if matches!(verdict, Verdict::SessionDied { .. }) {
+                ConnectOutcome::SessionKilled
+            } else {
+                ConnectOutcome::ConnectedNoTraffic
+            }
+        }
+    }
+}
+
+/// Say what happened, in the terms the user can act on. A connect on a
+/// hostile network takes minutes, and watching it work is most of how you
+/// tell "slow" from "blocked" — so the distinction this module now draws
+/// has to reach the terminal, not just the state file.
+fn narrate(server: &str, verdict: &Verdict, settle_secs: u64) {
+    let secs = verdict.seconds();
+    match verdict {
+        Verdict::Carrying { .. } => {
+            tracing::info!("{server} is carrying traffic — verified in {secs}s")
+        }
+        Verdict::SessionDied { detail, .. } => tracing::warn!(
+            "{server} connected, then the session was killed after {secs}s — Proton: {detail}"
+        ),
+        Verdict::LinkDown { .. } => tracing::warn!(
+            "your own uplink went away after {secs}s — not {server}'s doing, so nothing is being written off"
+        ),
+        Verdict::Quiet { .. } => {
+            tracing::warn!("{server} carried nothing in {settle_secs}s and said nothing either")
+        }
+    }
+}
+
+async fn maintain_system_profile(server: &str) {
+    let server_name = server.to_string();
+    match blocking(move || proc::reconcile_verified_proton_connection(&server_name)).await {
+        Ok(_) => {}
+        Err(err) => tracing::warn!("could not save {server} in Network Settings: {err}"),
+    }
+}
+
+fn server_is_proven_here(session: &Session, server: &str) -> bool {
+    session
+        .state
+        .servers()
+        .get(server)
+        .is_some_and(|stat| stat.connect_successes > 0)
+        && !session
+            .state
+            .is_blocked(server, session.config.blocked_retry_after(), Utc::now())
+}
+
+fn automatic_connection_is_wrong(
+    proton_cli_connected: bool,
+    current: Option<&str>,
+    ranked: &[String],
+) -> bool {
+    proton_cli_connected && !ranked.is_empty() && current != Some(ranked[0].as_str())
+}
+
+async fn preserve_then_disconnect(server: &str) {
+    let server_name = server.to_string();
+    if let Err(err) =
+        blocking(move || proc::disconnect_preserving_verified_connection(&server_name)).await
+    {
+        tracing::warn!("could not preserve {server} in Network Settings: {err}");
+        let _ = blocking(proc::protonvpn_disconnect).await;
+    }
+}
+
+/// Write one attempt into this network's history, so tomorrow morning can
+/// tell four bad servers from one bad network.
+async fn record(
+    session: &mut Session,
+    server: &str,
+    protocol: &str,
+    outcome: ConnectOutcome,
+    verdict: Option<&Verdict>,
+) {
+    let now = Utc::now();
+    blocklist::apply(&mut session.state, server, outcome, now);
+    session.state.record_event(Event {
+        at: now,
+        server: server.to_string(),
+        protocol: protocol.to_string(),
+        outcome: outcome.tag().to_string(),
+        detail: match verdict {
+            Some(Verdict::SessionDied { detail, .. }) => Some(detail.clone()),
+            _ => None,
+        },
+        seconds: verdict.map(|v| v.seconds()),
+    });
+    session.save();
+    if outcome.blames_the_server() {
+        let server_name = server.to_string();
+        let removed = blocking(move || proc::remove_verified_proton_connection(&server_name)).await;
+        if removed > 0 {
+            tracing::info!("{server}'s saved system VPN was removed");
+        }
+        // Say it out loud. A server quietly disappearing from tomorrow's
+        // ranked list, with nothing in the terminal to say why, is how the
+        // list ends up empty and nobody knows what emptied it.
+        tracing::info!("{server} written off on this network for now — see `pvpn blocked`");
+    } else if matches!(outcome, ConnectOutcome::TrafficOk) {
+        maintain_system_profile(server).await;
+    }
+}
+
 async fn diagnose(since: chrono::DateTime<Utc>, log: Option<&str>) -> ConnectOutcome {
     if blocking(move || proc::cert_failure_since(since)).await {
         return ConnectOutcome::CertificateExpired;
@@ -248,12 +389,20 @@ pub async fn up(session: &mut Session, protocol: Option<String>) -> UpReport {
 
     let status = blocking(|| proc::protonvpn_status().ok()).await;
     let stdout = status.as_ref().map(|r| r.stdout.as_str()).unwrap_or("");
-    if proc::is_connected(stdout) {
-        let now = proc::current_server(stdout);
+    let status_connected = proc::is_connected(stdout);
+    let now = if status_connected {
+        proc::current_server(stdout)
+    } else {
+        blocking(proc::active_proton_server).await
+    };
+    if status_connected || now.is_some() {
         let ranked = session
             .state
             .ranked_targets(cfg.blocked_retry_after(), Utc::now());
-        let wrong_server = !ranked.is_empty() && now.as_deref() != Some(ranked[0].as_str());
+        // A desktop toggle is an explicit user choice. Proton's CLI does not
+        // know about that activation, so do not replace it merely because
+        // today's automatic rank prefers another server.
+        let wrong_server = automatic_connection_is_wrong(status_connected, now.as_deref(), &ranked);
         // "Connected" is Proton's belief, not a fact. On the networks this
         // tool exists for a middlebox kills the session and leaves the
         // status reading Connected, and `pvpn up` answered "Already
@@ -266,8 +415,7 @@ pub async fn up(session: &mut Session, protocol: Option<String>) -> UpReport {
         // client still reporting a server it had lost while every packet
         // went out unencrypted.
         let tunneled = blocking(proc::tunnel_is_real).await;
-        let carries_traffic =
-            !wrong_server && tunneled && blocking(net::net_works).await;
+        let carries_traffic = !wrong_server && tunneled && blocking(net::net_works).await;
         if !tunneled {
             tracing::warn!(
                 "{} reports Connected but nothing is tunneled — rebuilding rather than trusting it",
@@ -293,6 +441,9 @@ pub async fn up(session: &mut Session, protocol: Option<String>) -> UpReport {
         } else {
             let fix = cfg.fix_apps;
             blocking(move || apps_hook::enforce_app_routing(fix)).await;
+            if let Some(server) = now.as_deref() {
+                maintain_system_profile(server).await;
+            }
             return UpReport {
                 ok: true,
                 message: "Already connected.".to_string(),
@@ -417,18 +568,32 @@ pub async fn up(session: &mut Session, protocol: Option<String>) -> UpReport {
     let mut attempt = 0usize;
     let mut renewed_cert = false;
     let mut quiet_tunnels: u32 = 0;
+    // The network these servers were chosen for. If we come back on a
+    // different one, nothing measured belongs to the server we picked.
+    let network = session.network().to_string();
 
     while n < attempts {
         let target = targets.get(n).cloned();
         if attempt > 0 {
             match &target {
                 Some(name) => {
-                    tracing::info!("attempt {}/{attempts} — next best server ({name})", attempt + 1)
+                    tracing::info!(
+                        "attempt {}/{attempts} — next best server ({name})",
+                        attempt + 1
+                    )
                 }
                 None => tracing::info!("attempt {}/{attempts} — reconnecting", attempt + 1),
             }
             let _ = blocking(proc::protonvpn_disconnect).await;
             tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        if let Some(problem) = local_network_problem().await {
+            restore().await;
+            return UpReport {
+                ok: false,
+                message: problem,
+                server: None,
+            };
         }
         attempt += 1;
 
@@ -436,8 +601,7 @@ pub async fn up(session: &mut Session, protocol: Option<String>) -> UpReport {
         let shim_c = shim.clone();
         let target_c = target.clone();
         let result =
-            blocking(move || proc::protonvpn_connect(target_c.as_deref(), &shim_c, timeout))
-                .await;
+            blocking(move || proc::protonvpn_connect(target_c.as_deref(), &shim_c, timeout)).await;
         let result = match result {
             Ok(r) => r,
             Err(err) => {
@@ -463,14 +627,12 @@ pub async fn up(session: &mut Session, protocol: Option<String>) -> UpReport {
                 }
             }
 
-            tracing::info!("tunnel up — checking traffic");
-            let settled = blocking(move || net::net_works_settled(settle)).await;
             let server = got.clone().unwrap_or_else(|| "unknown".to_string());
-            let outcome = if settled {
-                ConnectOutcome::TrafficOk
-            } else {
-                diagnose(attempt_started, None).await
-            };
+            tracing::info!("tunnel up — verifying that {server} carries traffic");
+            let verdict = verify::verify(attempt_started, settle, &network).await;
+            let outcome = outcome_for(&verdict, attempt_started).await;
+            narrate(&server, &verdict, cfg.settle_secs);
+            let settled = verdict.carrying();
 
             // An expired certificate is ours, not this server's. Renew it
             // and try the same server again rather than working down the
@@ -495,30 +657,73 @@ pub async fn up(session: &mut Session, protocol: Option<String>) -> UpReport {
                 };
             }
 
-            blocklist::apply(&mut session.state, &server, outcome, Utc::now());
-            session.save();
+            record(session, &server, &proto, outcome, Some(&verdict)).await;
+
+            // Our own network, not this server. Walking to the next one
+            // would measure the same broken uplink again and write off a
+            // healthy server for every attempt it takes to run out of list.
+            if matches!(outcome, ConnectOutcome::LocalNetworkDown) {
+                restore().await;
+                return UpReport {
+                    ok: false,
+                    message: format!(
+                        "Your own network went away {}s into the connect, so there is nothing \
+                         to say about {server}.\n\
+                         No server was written off. Run `pvpn up` again once the wifi is back.",
+                        verdict.seconds()
+                    ),
+                    server: None,
+                };
+            }
 
             // Just written off as blocked, so do not then settle for it
             // while another ranked server is still untried. Rule 1 — never
             // tear a tunnel down merely because traffic is slow — was
-            // learned before there *was* a settle window; now
-            // `net_works_settled` has polled for the whole of it and
-            // returns the moment anything gets through, so "still nothing
-            // after 90s" is a verdict, not impatience. Keeping it anyway
-            // meant `pvpn up` reported success on a dead tunnel.
+            // learned before there *was* a settle window; `verify` polls
+            // for the whole of it and returns the moment anything gets
+            // through, so "still nothing, and Proton says the session is
+            // over" is a verdict, not impatience. Keeping it anyway meant
+            // `pvpn up` reported success on a dead tunnel.
             if !settled {
                 quiet_tunnels += 1;
                 if quiet_tunnels < QUIET_TUNNELS_BEFORE_GIVING_UP
                     && n + 1 < attempts
                     && !targets.is_empty()
                 {
-                    tracing::warn!(
-                        "{server} carried nothing in {}s — moving on to the next ranked server",
-                        cfg.settle_secs
-                    );
+                    tracing::warn!("moving on to the next ranked server");
                     n += 1;
                     continue;
                 }
+            }
+
+            // Out of servers, or out of patience — but *why* decides
+            // whether the tunnel stays. Rule 1 — never tear a tunnel down
+            // merely because traffic is slow — is about not knowing. A
+            // session Proton has declared over is not slow, it is
+            // finished, and keeping it means leaving the routing table
+            // pointed into a hole while telling the user to go and check
+            // `pvpn status`. So that one comes down, before the apps hook
+            // spends any effort on a tunnel nothing is going to use.
+            if matches!(outcome, ConnectOutcome::SessionKilled) {
+                let killed = quiet_tunnels >= QUIET_TUNNELS_BEFORE_GIVING_UP;
+                let restored = restore().await;
+                return UpReport {
+                    ok: false,
+                    message: format!(
+                        "{}\n{}",
+                        if killed {
+                            format!("{quiet_tunnels} servers in a row connected and had their sessions killed — it is this network doing that, not the servers.")
+                        } else {
+                            format!("{server}'s session was killed and there was no other server worth trying here.")
+                        },
+                        if restored {
+                            "Internet restored. `pvpn blocked` lists what has been written off here."
+                        } else {
+                            "Internet still down — try: pvpn down"
+                        }
+                    ),
+                    server: None,
+                };
             }
 
             let fix = cfg.fix_apps;
@@ -531,16 +736,16 @@ pub async fn up(session: &mut Session, protocol: Option<String>) -> UpReport {
                     server: got,
                 };
             }
-            // Out of servers, or out of patience. A tunnel that might yet
-            // come good beats no tunnel, so it stays — but say plainly that
-            // it is a last resort, and say which of the two answers this
-            // is: one dead server, or a network killing all of them.
-            //
-            // And say what happens next, which is nothing: no supervisor
-            // is going to notice this and try again. Reporting "keeping the
-            // tunnel" without that reads as a promise nobody is left to
-            // keep.
-            let verdict = if quiet_tunnels >= QUIET_TUNNELS_BEFORE_GIVING_UP {
+
+            // Nothing declared this one dead — it is simply quiet. A tunnel
+            // that might yet come good beats no tunnel, so it stays, but
+            // say plainly that it is a last resort, and which of the two
+            // answers this is: one dead server, or a network killing all of
+            // them. And say what happens next, which is nothing: no
+            // supervisor is going to notice this and try again. Reporting
+            // "keeping the tunnel" without that reads as a promise nobody
+            // is left to keep.
+            let summary = if quiet_tunnels >= QUIET_TUNNELS_BEFORE_GIVING_UP {
                 format!(
                     "{quiet_tunnels} servers in a row connected and carried nothing — it is this network killing the sessions, not the servers"
                 )
@@ -550,7 +755,7 @@ pub async fn up(session: &mut Session, protocol: Option<String>) -> UpReport {
             return UpReport {
                 ok: true,
                 message: format!(
-                    "No traffic after {}s. {verdict}.\n\
+                    "No traffic after {}s, and nothing declared it dead. {summary}.\n\
                      Keeping the tunnel in case it comes good — check with `pvpn status`, \
                      then `pvpn hop` or `pvpn down`.",
                     cfg.settle_secs
@@ -590,9 +795,8 @@ pub async fn up(session: &mut Session, protocol: Option<String>) -> UpReport {
             };
         }
         if let Some(name) = &target {
-            blocklist::apply(&mut session.state, name, outcome, Utc::now());
+            record(session, name, &proto, outcome, None).await;
         }
-        session.save();
 
         if blocklist::log_says_missing_backend(&log) {
             return UpReport {
@@ -631,6 +835,19 @@ pub async fn up(session: &mut Session, protocol: Option<String>) -> UpReport {
 }
 
 pub async fn down() -> UpReport {
+    let current = blocking(|| {
+        proc::protonvpn_status()
+            .ok()
+            .and_then(|status| proc::current_server(&status.stdout))
+            .or_else(proc::active_proton_server)
+    })
+    .await;
+    if let (Some(server), Ok(mut session)) = (current.as_deref(), Session::load()) {
+        session.sync_network().await;
+        if server_is_proven_here(&session, server) {
+            preserve_then_disconnect(server).await;
+        }
+    }
     let restored = restore().await;
     let stray = blocking(proc::stray_leak_route).await;
     if let Some(dev) = stray {
@@ -653,11 +870,44 @@ pub async fn down() -> UpReport {
         }
     } else {
         UpReport {
-            ok: true,
-            message: "Disconnected, but the network looks down.".to_string(),
+            ok: false,
+            message: "Disconnected, but the network is still down. Run `pvpn fix`; \
+                      if only DNS fails, restart your local DNS service."
+                .to_string(),
             server: None,
         }
     }
+}
+
+/// How many servers a single `pvpn hop` will work through.
+///
+/// Fewer than `up`'s eight on purpose: `hop` is what you type when the
+/// tunnel you have is bad and you want a different one *now*, so it should
+/// come back with an answer rather than spend twelve minutes proving the
+/// network is hostile. `pvpn up` is the command for that.
+const HOP_ATTEMPTS: usize = 4;
+
+/// Where to hop, best first: servers that have actually carried traffic on
+/// this network, then the measured rank.
+///
+/// The order is the point. Latency says how quickly something answered a
+/// handshake — on a network with a transparent proxy, how quickly the
+/// *proxy* answered. A server that carried real traffic here yesterday is
+/// evidence, and evidence goes first. This is also what makes the lists
+/// worth maintaining: every connect writes to them, and every hop reads
+/// them back.
+fn hop_candidates(session: &Session, exclude: Option<&str>) -> Vec<String> {
+    let retry_after = session.config.blocked_retry_after();
+    let now = Utc::now();
+    let mut out: Vec<String> = Vec::new();
+    let proven = session.state.working_list().into_iter().map(|(n, _)| n);
+    for name in proven.chain(session.state.ranked_targets(retry_after, now)) {
+        if Some(name.as_str()) == exclude || out.contains(&name) {
+            continue;
+        }
+        out.push(name);
+    }
+    out
 }
 
 pub async fn hop(session: &mut Session, pattern: Option<String>) -> UpReport {
@@ -665,80 +915,196 @@ pub async fn hop(session: &mut Session, pattern: Option<String>) -> UpReport {
     // What we know about servers is filed per network; make sure we are
     // reading the right set before ranking or connecting.
     session.sync_network().await;
-    let cfg = session.config.clone();
-    let serverlist = paths::serverlist_path();
 
     let before = blocking(|| {
         proc::protonvpn_status()
             .ok()
             .and_then(|r| proc::current_server(&r.stdout))
+            .or_else(proc::active_proton_server)
     })
     .await;
 
-    let steered = {
-        let serverlist = serverlist.clone();
-        let pattern = pattern.clone();
-        let before = before.clone();
-        blocking(move || -> Result<cache::SteerResult, String> {
-            match pattern {
-                Some(want) => cache::steer_cache(&serverlist, SteerMode::Only, &want)
-                    .map_err(|e| e.to_string()),
-                None => {
-                    let Some(current) = before else {
-                        return Err("not-connected".to_string());
-                    };
-                    cache::steer_cache(&serverlist, SteerMode::Exclude, &current)
-                        .map_err(|e| e.to_string())
-                }
-            }
-        })
-        .await
-    };
-
-    let steered = match steered {
-        Ok(s) => s,
-        Err(msg) if msg == "not-connected" => {
-            tracing::info!("not connected — just connecting");
-            return up(session, None).await;
-        }
-        Err(err) => {
+    // A named hop can also be the first connect. Guard that path just like
+    // `up`; otherwise a dead local resolver would be recorded against the
+    // named server before any healthy baseline had been established.
+    if pattern.is_some() && before.is_none() {
+        if let Some(problem) = local_network_problem().await {
             return UpReport {
                 ok: false,
-                message: err,
+                message: problem,
                 server: None,
             };
         }
-    };
-
-    let proto = blocking(|| {
-        if proc::protocol_available("protun-tls") {
-            let _ = proc::set_protocol("protun-tls");
+    }
+    if let Some(server) = before.as_deref() {
+        if server_is_proven_here(session, server) {
+            preserve_then_disconnect(server).await;
         }
-        proc::ensure_connect_protocol(&proc::current_protocol())
-    })
-    .await;
-    if let Err(err) = proto {
-        cache::restore_cache(&steered.backup, &serverlist);
+    }
+
+    match pattern {
+        Some(want) => hop_to_pattern(session, want, before).await,
+        None => hop_to_next_best(session, before).await,
+    }
+}
+
+/// `pvpn hop` with nothing named: go to the best server that is not this
+/// one, and if that does not work, the next, without being asked again.
+///
+/// This used to hand the choice back to Proton — steer the cache to
+/// "anything but the current server" and take whatever came out — and then
+/// accept the result after a single attempt. On a network that kills most
+/// sessions that is one roll of the dice against a list this tool has
+/// already measured and written down.
+async fn hop_to_next_best(session: &mut Session, before: Option<String>) -> UpReport {
+    let Some(current) = before.clone() else {
+        tracing::info!("not connected — just connecting");
+        return up(session, None).await;
+    };
+    let cfg = session.config.clone();
+
+    let mut candidates = hop_candidates(session, Some(&current));
+    if candidates.is_empty() {
+        tracing::info!("nothing measured on this network yet — ranking servers first");
+        if let Err(err) =
+            compute_full_rank(session, cfg.country.clone(), false, 8, cfg.free_only).await
+        {
+            return UpReport {
+                ok: false,
+                message: format!("Nowhere to hop to: {err}"),
+                server: None,
+            };
+        }
+        candidates = hop_candidates(session, Some(&current));
+    }
+    if candidates.is_empty() {
         return UpReport {
             ok: false,
-            message: err.to_string(),
+            message: "No server to hop to here — everything known on this network is blocked.\n\
+                      See why with `pvpn blocked`, or clear it with `pvpn forget --all`."
+                .to_string(),
             server: None,
         };
     }
 
-    let _ = blocking(proc::protonvpn_disconnect).await;
-    tokio::time::sleep(Duration::from_secs(2)).await;
-
-    let shim = paths::shim_dir();
-    let timeout = Duration::from_secs(cfg.connect_timeout_secs);
-    let attempt_started = Utc::now();
-    let result = blocking(move || proc::protonvpn_connect(None, &shim, timeout)).await;
-    cache::restore_cache(&steered.backup, &serverlist);
-
-    let result = match result {
-        Ok(r) => r,
+    let proto = match prepare_protocol().await {
+        Ok(p) => p,
         Err(err) => {
-            restore().await;
+            return UpReport {
+                ok: false,
+                message: err.to_string(),
+                server: None,
+            }
+        }
+    };
+    let network = session.network().to_string();
+    let attempts = candidates.len().min(HOP_ATTEMPTS);
+    tracing::info!(
+        "hopping off {current} — {} to try, best first ({})",
+        attempts,
+        candidates[..attempts].join(", ")
+    );
+
+    for (i, target) in candidates.iter().take(attempts).enumerate() {
+        tracing::info!("attempt {}/{attempts} — {target}", i + 1);
+        let attempt = match connect_and_verify(session, Some(target), &proto, &network).await {
+            Some(a) => a,
+            None => continue,
+        };
+        match attempt.outcome {
+            ConnectOutcome::TrafficOk => {
+                let fix = cfg.fix_apps;
+                blocking(move || apps_hook::enforce_app_routing(fix)).await;
+                let landed = attempt.server;
+                return UpReport {
+                    ok: true,
+                    message: format!("Hopped: {current} -> {landed}"),
+                    server: Some(landed),
+                };
+            }
+            ConnectOutcome::LocalNetworkDown => {
+                restore().await;
+                return UpReport {
+                    ok: false,
+                    message: "Your own network went away mid-hop, so nothing here is any \
+                              server's doing.\nNothing was written off. Try again once the \
+                              wifi is back."
+                        .to_string(),
+                    server: None,
+                };
+            }
+            ConnectOutcome::CertificateExpired => {
+                restore().await;
+                return UpReport {
+                    ok: false,
+                    message: "The client certificate has expired — every server will fail the \
+                              same way until it is renewed.\nStart Tor and run `pvpn up`, or \
+                              connect to another network."
+                        .to_string(),
+                    server: None,
+                };
+            }
+            _ => {}
+        }
+    }
+
+    let restored = restore().await;
+    UpReport {
+        ok: false,
+        message: format!(
+            "Tried {attempts} servers and none of them carried traffic — on this network that \
+             is the network's answer, not the servers'.\n{}",
+            if restored {
+                "Internet restored. `pvpn blocked` lists what has been written off here."
+            } else {
+                "Internet still down — try: pvpn down"
+            }
+        ),
+        server: None,
+    }
+}
+
+/// `pvpn hop JP`, `pvpn hop SG-FREE#12`: you named it, so you get it — one
+/// attempt, and the same verification everything else gets.
+async fn hop_to_pattern(session: &mut Session, want: String, before: Option<String>) -> UpReport {
+    let cfg = session.config.clone();
+    // Unlike the ranked hop path, this reads Proton's raw account cache
+    // directly. Refresh it first so "not found" means the server is absent
+    // from this account's inventory, not merely that the cache predates it.
+    if let Err(err) = ensure_fresh_data(&cfg, true).await {
+        tracing::warn!("could not refresh the server inventory: {err}");
+    }
+    let serverlist = paths::serverlist_path();
+    let steered = {
+        let serverlist = serverlist.clone();
+        let want = want.clone();
+        blocking(move || cache::steer_cache(&serverlist, SteerMode::Only, &want)).await
+    };
+    let steered = match steered {
+        Ok(s) => s,
+        Err(cache::SteerError::NoMatch) => {
+            return UpReport {
+                ok: false,
+                message: format!(
+                    "{want} is not in this account's Proton server inventory. \
+                     Free accounts can receive different server pools; `pvpn best` lists yours."
+                ),
+                server: None,
+            }
+        }
+        Err(err) => {
+            return UpReport {
+                ok: false,
+                message: err.to_string(),
+                server: None,
+            }
+        }
+    };
+
+    let proto = match prepare_protocol().await {
+        Ok(p) => p,
+        Err(err) => {
+            cache::restore_cache(&steered.backup, &serverlist);
             return UpReport {
                 ok: false,
                 message: err.to_string(),
@@ -746,56 +1112,153 @@ pub async fn hop(session: &mut Session, pattern: Option<String>) -> UpReport {
             };
         }
     };
-    let status = blocking(|| proc::protonvpn_status().ok()).await;
-    let stdout = status.as_ref().map(|r| r.stdout.as_str()).unwrap_or("");
-    if !result.success || !proc::is_connected(stdout) {
+
+    let network = session.network().to_string();
+    let attempt = connect_and_verify(session, None, &proto, &network).await;
+    cache::restore_cache(&steered.backup, &serverlist);
+
+    let Some(attempt) = attempt else {
         restore().await;
         return UpReport {
             ok: false,
-            message: "Hop failed to connect.".to_string(),
+            message: format!("Nothing matching {want} would connect."),
             server: None,
         };
-    }
-
-    let after = proc::current_server(stdout);
-    let settle = Duration::from_secs(cfg.settle_secs);
-    let settled = blocking(move || net::net_works_settled(settle)).await;
-    let outcome = if settled {
-        ConnectOutcome::TrafficOk
-    } else {
-        diagnose(attempt_started, None).await
     };
-    if matches!(outcome, ConnectOutcome::CertificateExpired) {
-        tracing::warn!("the hop landed but our certificate has expired — not the server's fault");
-    }
-    if let Some(name) = &after {
-        blocklist::apply(&mut session.state, name, outcome, Utc::now());
-    }
-    session.save();
+
     let fix = cfg.fix_apps;
     blocking(move || apps_hook::enforce_app_routing(fix)).await;
 
     let from = before.unwrap_or_default();
-    let to = after.clone().unwrap_or_default();
-    if settled {
-        UpReport {
+    let to = attempt.server;
+    if attempt.verdict.carrying() {
+        return UpReport {
             ok: true,
             message: if from.is_empty() {
                 format!("Hopped to {to}")
             } else {
                 format!("Hopped: {from} -> {to}")
             },
-            server: after,
-        }
-    } else {
-        UpReport {
-            ok: true,
+            server: Some(to),
+        };
+    }
+    if matches!(attempt.outcome, ConnectOutcome::LocalNetworkDown) {
+        restore().await;
+        return UpReport {
+            ok: false,
+            message: "Your own network went away mid-hop, so nothing here is the server's \
+                      doing. Nothing was written off."
+                .to_string(),
+            server: None,
+        };
+    }
+    if matches!(attempt.outcome, ConnectOutcome::SessionKilled) {
+        let restored = restore().await;
+        return UpReport {
+            ok: false,
             message: format!(
-                "{to} has not passed traffic yet after {}s. Keeping it.",
-                cfg.settle_secs
+                "{to}'s session was killed {}s in. {}",
+                attempt.verdict.seconds(),
+                if restored {
+                    "Internet restored."
+                } else {
+                    "Internet still down — try: pvpn down"
+                }
             ),
-            server: after,
-        }
+            server: None,
+        };
+    }
+    UpReport {
+        ok: true,
+        message: format!(
+            "{to} has not passed traffic yet after {}s. Keeping it — it may still come good.",
+            cfg.settle_secs
+        ),
+        server: Some(to),
     }
 }
 
+/// Put the connect protocol where it needs to be — Stealth if this install
+/// has it, since that is the only one these networks let through.
+async fn prepare_protocol() -> anyhow::Result<String> {
+    blocking(|| {
+        if proc::protocol_available("protun-tls") {
+            let _ = proc::set_protocol("protun-tls");
+        }
+        proc::ensure_connect_protocol(&proc::current_protocol())
+    })
+    .await
+}
+
+/// One connect attempt with the full verification behind it, recorded.
+/// `None` means the tunnel never came up at all.
+struct Attempt {
+    server: String,
+    outcome: ConnectOutcome,
+    verdict: Verdict,
+}
+
+async fn connect_and_verify(
+    session: &mut Session,
+    target: Option<&String>,
+    proto: &str,
+    network: &str,
+) -> Option<Attempt> {
+    let cfg = session.config.clone();
+    let _ = blocking(proc::protonvpn_disconnect).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let shim = paths::shim_dir();
+    let timeout = Duration::from_secs(cfg.connect_timeout_secs);
+    let started = Utc::now();
+    let target_c = target.cloned();
+    let result = blocking(move || proc::protonvpn_connect(target_c.as_deref(), &shim, timeout))
+        .await
+        .ok()?;
+
+    let status = blocking(|| proc::protonvpn_status().ok()).await;
+    let stdout = status.as_ref().map(|r| r.stdout.as_str()).unwrap_or("");
+    if !result.success || !proc::is_connected(stdout) {
+        let log = format!("{}\n{}", result.stdout, result.stderr);
+        let outcome = diagnose(started, Some(&log)).await;
+        if let Some(name) = target {
+            record(session, name, proto, outcome, None).await;
+        }
+        tracing::warn!(
+            "{} did not connect",
+            target.map(String::as_str).unwrap_or("that server")
+        );
+        return None;
+    }
+
+    let server = proc::current_server(stdout).unwrap_or_else(|| "unknown".to_string());
+    tracing::info!("tunnel up — verifying that {server} carries traffic");
+    let settle = Duration::from_secs(cfg.settle_secs);
+    let verdict = verify::verify(started, settle, network).await;
+    let outcome = outcome_for(&verdict, started).await;
+    narrate(&server, &verdict, cfg.settle_secs);
+    record(session, &server, proto, outcome, Some(&verdict)).await;
+    Some(Attempt {
+        server,
+        outcome,
+        verdict,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_desktop_selected_server_is_not_replaced_by_the_automatic_rank() {
+        let ranked = vec!["SG-FREE#2".to_string()];
+        assert!(!super::automatic_connection_is_wrong(
+            false,
+            Some("JP-FREE#33"),
+            &ranked
+        ));
+        assert!(super::automatic_connection_is_wrong(
+            true,
+            Some("JP-FREE#33"),
+            &ranked
+        ));
+    }
+}

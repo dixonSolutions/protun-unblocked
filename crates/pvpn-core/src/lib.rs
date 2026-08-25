@@ -11,6 +11,7 @@ pub mod cache;
 pub mod config;
 pub mod display;
 pub mod geo;
+pub mod link;
 pub mod net;
 pub mod paths;
 pub mod pipeline;

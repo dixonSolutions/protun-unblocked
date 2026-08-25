@@ -448,17 +448,147 @@ pub fn nmcli_proton_connections() -> Vec<(String, String)> {
     let Ok(result) = run("nmcli", &["-t", "-f", "NAME,UUID", "con", "show"]) else {
         return Vec::new();
     };
-    result
-        .stdout
+    parse_connections(&result.stdout)
+        .into_iter()
+        .filter(|(name, _)| name.starts_with("ProtonVPN "))
+        .collect()
+}
+
+fn parse_connections(output: &str) -> Vec<(String, String)> {
+    output
         .lines()
         .filter_map(|line| {
             let mut parts = line.splitn(2, ':');
             let name = parts.next()?;
             let uuid = parts.next()?;
-            name.starts_with("ProtonVPN ")
-                .then(|| (name.to_string(), uuid.to_string()))
+            (!name.is_empty() && !uuid.is_empty()).then(|| (name.to_string(), uuid.to_string()))
         })
         .collect()
+}
+
+fn proton_profile_name(server: &str) -> String {
+    format!("ProtonVPN {server}")
+}
+
+fn active_connection_uuids() -> anyhow::Result<Vec<String>> {
+    let result = run(
+        "nmcli",
+        &["-t", "-f", "NAME,UUID", "con", "show", "--active"],
+    )?;
+    Ok(parse_connections(&result.stdout)
+        .into_iter()
+        .map(|(_, uuid)| uuid)
+        .collect())
+}
+
+fn is_profile_for_server(name: &str, server: &str) -> bool {
+    name == proton_profile_name(server) || name == format!("ProtonVPN {server} (verified)")
+}
+
+/// Keep the live Proton profile as the sole Network Settings entry while it
+/// is active. This also cleans up tagged profiles created by older `pvpn`
+/// builds.
+pub fn reconcile_verified_proton_connection(server: &str) -> anyhow::Result<usize> {
+    let active = active_connection_uuids()?;
+    let stale: Vec<String> = nmcli_proton_connections()
+        .into_iter()
+        .filter_map(|(name, uuid)| {
+            (is_profile_for_server(&name, server) && !active.contains(&uuid)).then_some(uuid)
+        })
+        .collect();
+    let removed = stale.len();
+    for uuid in stale {
+        nmcli_delete_connection(&uuid);
+    }
+    Ok(removed)
+}
+
+/// Disconnect a proven tunnel while retaining one plain-name, manual-toggle
+/// profile. The clone uses a temporary name only during the teardown, then
+/// replaces Proton's deleted transient profile without leaving a duplicate.
+pub fn disconnect_preserving_verified_connection(server: &str) -> anyhow::Result<bool> {
+    let active = run(
+        "nmcli",
+        &["-t", "-f", "NAME,UUID", "con", "show", "--active"],
+    )?;
+    let expected_name = proton_profile_name(server);
+    let source_uuid = parse_connections(&active.stdout)
+        .into_iter()
+        .find_map(|(name, uuid)| (name == expected_name).then_some(uuid))
+        .with_context(|| format!("no active Proton profile for {server}"))?;
+
+    let existing: Vec<String> = nmcli_proton_connections()
+        .into_iter()
+        .filter_map(|(name, uuid)| {
+            (is_profile_for_server(&name, server) && uuid != source_uuid).then_some(uuid)
+        })
+        .collect();
+    let temporary_name = format!("ProtonVPN pvpn-preserve-{}", std::process::id());
+    let cloned = run("nmcli", &["con", "clone", &source_uuid, &temporary_name])?;
+    if !cloned.success {
+        anyhow::bail!("NetworkManager could not preserve {server}'s profile");
+    }
+
+    let temporary_uuid = nmcli_proton_connections()
+        .into_iter()
+        .find_map(|(name, uuid)| (name == temporary_name).then_some(uuid))
+        .context("NetworkManager cloned the profile but did not list it")?;
+    let configured = run(
+        "nmcli",
+        &[
+            "con",
+            "modify",
+            &temporary_uuid,
+            "connection.autoconnect",
+            "no",
+        ],
+    )?;
+    if !configured.success {
+        nmcli_delete_connection(&temporary_uuid);
+        anyhow::bail!("NetworkManager could not configure {server}'s saved profile");
+    }
+
+    let disconnected = protonvpn_disconnect()?;
+    if !disconnected.success {
+        nmcli_delete_connection(&temporary_uuid);
+        anyhow::bail!("Proton could not disconnect {server}");
+    }
+    let renamed = run(
+        "nmcli",
+        &[
+            "con",
+            "modify",
+            &temporary_uuid,
+            "connection.id",
+            &expected_name,
+        ],
+    )?;
+    if !renamed.success {
+        nmcli_delete_connection(&temporary_uuid);
+        anyhow::bail!("NetworkManager could not name {server}'s saved profile");
+    }
+
+    for uuid in existing {
+        nmcli_delete_connection(&uuid);
+    }
+    Ok(true)
+}
+
+/// Remove inactive maintained copies after a real connection proves the
+/// server unusable. Never delete the active transient profile here.
+pub fn remove_verified_proton_connection(server: &str) -> usize {
+    let active = active_connection_uuids().unwrap_or_default();
+    let uuids: Vec<String> = nmcli_proton_connections()
+        .into_iter()
+        .filter_map(|(name, uuid)| {
+            (is_profile_for_server(&name, server) && !active.contains(&uuid)).then_some(uuid)
+        })
+        .collect();
+    let removed = uuids.len();
+    for uuid in uuids {
+        nmcli_delete_connection(&uuid);
+    }
+    removed
 }
 
 /// Stop NetworkManager from putting a disconnected tunnel straight back:
@@ -497,11 +627,54 @@ pub fn nmcli_killswitch_connections() -> Vec<String> {
 /// always has an active profile, and the absence of one while the client
 /// claims `Connected` is a contradiction.
 pub fn proton_connection_active() -> bool {
-    let Ok(result) = run("nmcli", &["-t", "-f", "NAME,TYPE", "con", "show", "--active"]) else {
+    let Ok(result) = run(
+        "nmcli",
+        &["-t", "-f", "NAME,TYPE", "con", "show", "--active"],
+    ) else {
         // Cannot tell — assume the tunnel is fine. See `tunnel_is_real`.
         return true;
     };
     parse_proton_connection_active(&result.stdout)
+}
+
+/// Server name from a Proton profile activated directly through desktop
+/// Network Settings, even when Proton's own CLI state still says disconnected.
+pub fn active_proton_server() -> Option<String> {
+    let result = run(
+        "nmcli",
+        &["-t", "-f", "NAME,UUID", "con", "show", "--active"],
+    )
+    .ok()?;
+    parse_active_proton_server(&result.stdout)
+}
+
+fn parse_active_proton_server(output: &str) -> Option<String> {
+    parse_connections(output).into_iter().find_map(|(name, _)| {
+        name.strip_prefix("ProtonVPN ")
+            .filter(|server| !server.starts_with("pvpn-preserve-"))
+            .map(|server| {
+                server
+                    .strip_suffix(" (verified)")
+                    .unwrap_or(server)
+                    .to_string()
+            })
+    })
+}
+
+/// Ensure `pvpn down` also stops a profile enabled directly in desktop
+/// Network Settings, which Proton's CLI state machine does not own.
+pub fn nmcli_deactivate_proton_connections() {
+    let Ok(result) = run(
+        "nmcli",
+        &["-t", "-f", "NAME,UUID", "con", "show", "--active"],
+    ) else {
+        return;
+    };
+    for (name, uuid) in parse_connections(&result.stdout) {
+        if name.starts_with("ProtonVPN ") {
+            let _ = run("nmcli", &["con", "down", &uuid]);
+        }
+    }
 }
 
 fn parse_proton_connection_active(active: &str) -> bool {
@@ -606,11 +779,7 @@ pub fn tunnel_is_real() -> bool {
     )
 }
 
-fn decide_tunnel_is_real(
-    proton_active: bool,
-    route_dev: Option<&str>,
-    uplinks: &[String],
-) -> bool {
+fn decide_tunnel_is_real(proton_active: bool, route_dev: Option<&str>, uplinks: &[String]) -> bool {
     if proton_active {
         return true;
     }
@@ -672,6 +841,16 @@ pub fn active_wifi_ssid() -> Option<String> {
 /// two sets of observations cannot overwrite each other — see
 /// [`crate::state::State::set_network`].
 pub fn active_network_key() -> String {
+    // An override, for two reasons. Tests need a network key that does not
+    // depend on which wifi the machine building the code happens to be on;
+    // and a docked laptop that reaches the same filtered network by cable
+    // one day and by wifi the next can pin both to one key rather than
+    // learning it twice.
+    if let Ok(key) = std::env::var("PVPN_NETWORK") {
+        if !key.is_empty() {
+            return key;
+        }
+    }
     if let Some(ssid) = active_wifi_ssid() {
         return format!("wifi:{ssid}");
     }
@@ -724,6 +903,57 @@ pub fn cert_failure_since(since: chrono::DateTime<chrono::Utc>) -> bool {
     })
 }
 
+/// Lines that mean the session this attempt built is over.
+///
+/// Both are written by Proton itself, and both are the *far end's* verdict
+/// rather than ours. `Connect timeout` comes from the local agent — the
+/// tunnel device came up, the agent's TLS session to the node opened, and
+/// no status ever came back through it. That is the exact signature of a
+/// middlebox that terminates TLS locally and drops the session a moment
+/// later (`docs/transparent-proxy.md`).
+const SESSION_DEATH_MARKERS: [&str; 2] = ["Reached connection error state:", "Connect timeout"];
+
+/// Did Proton declare this attempt's session dead since `since`? Returns
+/// the line's own words, for the user, or `None` if it has not.
+///
+/// This is what turns a fixed ninety-second wait into an answer that
+/// arrives when the answer exists. Measured on `wifi:detnsw`: the tunnel
+/// device came up at 22:09:22, the local agent gave up at **22:09:46**,
+/// and `pvpn` — polling only for traffic — kept waiting until 22:11:36.
+/// Proton had written the verdict down a hundred and ten seconds before
+/// anything read it.
+///
+/// Certificate failures are deliberately not reported here. They are ours,
+/// not the server's, and [`cert_failure_since`] already owns that path;
+/// letting a cert line through as a session death would put a healthy
+/// server on the blocked list.
+pub fn session_death_since(since: chrono::DateTime<chrono::Utc>) -> Option<String> {
+    let text = log_tail(&crate::paths::proton_log_path(), LOG_TAIL_BYTES)?;
+    find_session_death(&text, since)
+}
+
+fn find_session_death(text: &str, since: chrono::DateTime<chrono::Utc>) -> Option<String> {
+    text.lines()
+        .rev()
+        .find(|line| {
+            SESSION_DEATH_MARKERS.iter().any(|m| line.contains(m))
+                && !CERT_FAILURE_MARKERS.iter().any(|m| line.contains(m))
+                && line_is_after(line, since)
+        })
+        .map(summarise_log_line)
+}
+
+/// The human-readable tail of a pipe-delimited Proton log line, without the
+/// timestamp and module noise.
+fn summarise_log_line(line: &str) -> String {
+    line.rsplit('|')
+        .next()
+        .unwrap_or(line)
+        .trim()
+        .trim_end_matches(" (None)")
+        .to_string()
+}
+
 /// Proton's log lines start `2026-08-23T22:17:11.152816+00:00 | ...`.
 fn line_is_after(line: &str, cutoff: chrono::DateTime<chrono::Utc>) -> bool {
     line.split_whitespace()
@@ -765,6 +995,80 @@ pub const PROTON_API_HOST: &str = "vpn-api.proton.me";
 
 #[cfg(test)]
 mod tests {
+    /// Verbatim from `~/.cache/Proton/VPN/logs/vpn-cli.log` for the
+    /// `SG-FREE#13` attempt on `wifi:detnsw`. The shape of the whole
+    /// problem is in these six lines: connected in 0.3s, agent never
+    /// answered, Proton gave up at 22:09:46 — and nothing read it.
+    const DETNSW_ATTEMPT: &str = "\
+2026-08-24T22:09:22.418760+00:00 | proton.vpn.core.vpnconnector:479 | INFO | CONN:STATE_CHANGED | Connecting
+2026-08-24T22:09:22.562144+00:00 | proton.vpn.backend.networkmanager.core.networkmanager:85 | INFO | VPN server REACHABLE.
+2026-08-24T22:09:22.714487+00:00 | proton.vpn.backend.networkmanager.core.localagent_mixin:71 | INFO | Waiting for agent status from node-sg-37.protonvpn.net...
+2026-08-24T22:09:22.723040+00:00 | proton.vpn.core.vpnconnector:479 | INFO | CONN:STATE_CHANGED | Connected
+2026-08-24T22:09:46.594518+00:00 | proton.vpn.backend.networkmanager.core.localagent_mixin:228 | INFO | Connect timeout
+2026-08-24T22:09:46.595073+00:00 | proton.vpn.connection.states:401 | WARNING | Reached connection error state: Timeout (None)
+";
+
+    fn at(ts: &str) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339(ts)
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
+    #[test]
+    fn the_agent_giving_up_is_read_as_the_session_dying() {
+        let started = at("2026-08-24T22:09:04+00:00");
+        assert_eq!(
+            super::find_session_death(DETNSW_ATTEMPT, started).as_deref(),
+            Some("Reached connection error state: Timeout"),
+            "the newest verdict, in Proton's own words"
+        );
+    }
+
+    #[test]
+    fn a_verdict_from_the_previous_attempt_is_not_read_as_this_ones() {
+        // `up` walks a list; each attempt asks about itself. Reading the
+        // last server's failure would block this one for the last one's sins.
+        let started = at("2026-08-24T22:10:00+00:00");
+        assert!(super::find_session_death(DETNSW_ATTEMPT, started).is_none());
+    }
+
+    #[test]
+    fn a_healthy_connect_produces_no_verdict() {
+        let healthy = "\
+2026-08-24T22:09:22.418760+00:00 | proton.vpn.core.vpnconnector:479 | INFO | CONN:STATE_CHANGED | Connecting
+2026-08-24T22:09:22.723040+00:00 | proton.vpn.core.vpnconnector:479 | INFO | CONN:STATE_CHANGED | Connected
+";
+        assert!(super::find_session_death(healthy, at("2026-08-24T22:09:00+00:00")).is_none());
+    }
+
+    #[test]
+    fn an_expired_certificate_is_never_reported_as_the_servers_fault() {
+        // It fails every server identically. Letting it through here would
+        // retire a healthy server per attempt — the exact bug
+        // `cert_failure_since` exists to prevent, reintroduced by a
+        // second reader of the same log.
+        let cert = "\
+2026-08-24T22:09:40.000000+00:00 | proton.vpn.core.refresher:74 | WARNING | Certificate refresh failed: No working transports found
+2026-08-24T22:09:46.595073+00:00 | proton.vpn.connection.states:401 | WARNING | Reached connection error state: ExpiredCertificate (None)
+";
+        let started = at("2026-08-24T22:09:00+00:00");
+        assert!(super::find_session_death(cert, started).is_none());
+        assert!(
+            super::CERT_FAILURE_MARKERS.iter().any(|m| cert.contains(m)),
+            "and the certificate path still sees it"
+        );
+    }
+
+    #[test]
+    fn a_log_line_is_summarised_down_to_what_it_says() {
+        assert_eq!(
+            super::summarise_log_line(
+                "2026-08-24T22:09:46+00:00 | proton.vpn.connection.states:401 | WARNING | Reached connection error state: Timeout (None)"
+            ),
+            "Reached connection error state: Timeout"
+        );
+    }
+
     #[test]
     fn a_leak_guard_holding_the_default_route_is_recognised() {
         // Verbatim from the machine, seven minutes after the tunnel died.
@@ -832,6 +1136,42 @@ enp2s0:ethernet:unavailable
     }
 
     #[test]
+    fn networkmanager_rows_keep_names_and_uuids_together() {
+        let rows = super::parse_connections(
+            "ProtonVPN SG-FREE#21:11111111-1111-1111-1111-111111111111\n\
+             malformed\n\
+             ProtonVPN SG-FREE#21 (verified):22222222-2222-2222-2222-222222222222\n",
+        );
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].0, "ProtonVPN SG-FREE#21 (verified)");
+        assert_eq!(rows[1].1, "22222222-2222-2222-2222-222222222222");
+    }
+
+    #[test]
+    fn saved_profiles_keep_protons_plain_server_name() {
+        assert_eq!(
+            super::proton_profile_name("JP-FREE#33"),
+            "ProtonVPN JP-FREE#33"
+        );
+        assert!(super::is_profile_for_server(
+            "ProtonVPN JP-FREE#33 (verified)",
+            "JP-FREE#33"
+        ));
+    }
+
+    #[test]
+    fn a_desktop_activated_profile_still_identifies_its_server() {
+        assert_eq!(
+            super::parse_active_proton_server(
+                "detnsw:11111111-1111-1111-1111-111111111111\n\
+                 ProtonVPN JP-FREE#33:22222222-2222-2222-2222-222222222222\n"
+            )
+            .as_deref(),
+            Some("JP-FREE#33")
+        );
+    }
+
+    #[test]
     fn a_default_route_off_the_uplink_counts_as_tunneled() {
         assert!(super::decide_tunnel_is_real(
             false,
@@ -843,7 +1183,11 @@ enp2s0:ethernet:unavailable
     #[test]
     fn anything_we_cannot_read_is_given_the_benefit_of_the_doubt() {
         // Never tear down a working tunnel over a command that failed.
-        assert!(super::decide_tunnel_is_real(false, None, &["wlp0s20f3".to_string()]));
+        assert!(super::decide_tunnel_is_real(
+            false,
+            None,
+            &["wlp0s20f3".to_string()]
+        ));
         assert!(super::decide_tunnel_is_real(false, Some("wlp0s20f3"), &[]));
     }
 
