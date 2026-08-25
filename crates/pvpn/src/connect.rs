@@ -18,6 +18,7 @@ use crate::verify::{self, Verdict};
 use chrono::{DateTime, Utc};
 use pvpn_core::cache::{self, SteerMode};
 use pvpn_core::config::Config;
+use pvpn_core::link::{self, LinkHealth};
 use pvpn_core::net;
 use pvpn_core::paths;
 use pvpn_core::pipeline::{self, RankRequest};
@@ -65,8 +66,10 @@ async fn local_network_problem() -> Option<String> {
 pub async fn restore() -> bool {
     blocking(|| {
         proc::kill_in_flight_connect();
+        let former_active = proc::active_proton_connection_uuids().unwrap_or_default();
         let _ = proc::protonvpn_disconnect();
         proc::nmcli_deactivate_proton_connections();
+        proc::remove_former_active_proton_duplicates(&former_active);
         for (_, uuid) in proc::nmcli_proton_connections() {
             proc::nmcli_clear_autoconnect(&uuid);
         }
@@ -102,10 +105,27 @@ pub async fn restore() -> bool {
 /// not a hard failure — `best` can still rank a stale list.
 pub async fn ensure_fresh_data(cfg: &Config, optional: bool) -> anyhow::Result<()> {
     let path = paths::serverlist_path();
-    let age = proc::file_age_hours(&path).unwrap_or(99999);
-    if age < cfg.stale_hours {
-        tracing::info!("server list is {age}h old — no refresh needed");
-        return Ok(());
+    if let Some(valid_for) = cache::inventory_valid_for_secs(&path) {
+        if valid_for > 0 {
+            let minutes = (valid_for + 59) / 60;
+            tracing::info!(
+                "Proton's server inventory is valid for {minutes} more minute{}",
+                if minutes == 1 { "" } else { "s" }
+            );
+            return Ok(());
+        }
+    } else {
+        let age = proc::file_age_hours(&path).unwrap_or(99999);
+        if age < cfg.stale_hours {
+            tracing::info!("server inventory has no expiry metadata and is {age}h old");
+            return Ok(());
+        }
+    }
+
+    if !path.is_file() {
+        tracing::info!("no cached Proton server inventory");
+    } else {
+        tracing::info!("Proton's cached server inventory has expired");
     }
 
     let tor_ok = blocking(proc::tor_available).await;
@@ -218,21 +238,19 @@ fn server_is_proven_here(session: &Session, server: &str) -> bool {
             .is_blocked(server, session.config.blocked_retry_after(), Utc::now())
 }
 
-fn automatic_connection_is_wrong(
-    proton_cli_connected: bool,
-    current: Option<&str>,
-    ranked: &[String],
-) -> bool {
-    proton_cli_connected && !ranked.is_empty() && current != Some(ranked[0].as_str())
-}
-
 async fn preserve_then_disconnect(server: &str) {
     let server_name = server.to_string();
-    if let Err(err) =
-        blocking(move || proc::disconnect_preserving_verified_connection(&server_name)).await
-    {
-        tracing::warn!("could not preserve {server} in Network Settings: {err}");
-        let _ = blocking(proc::protonvpn_disconnect).await;
+    match blocking(move || proc::disconnect_preserving_verified_connection(&server_name)).await {
+        Ok(true) => {}
+        Ok(false) => {
+            // NetworkManager already removed the tunnel; only Proton's stale
+            // internal state may remain.
+            let _ = blocking(proc::protonvpn_disconnect).await;
+        }
+        Err(err) => {
+            tracing::warn!("could not preserve {server} in Network Settings: {err}");
+            let _ = blocking(proc::protonvpn_disconnect).await;
+        }
     }
 }
 
@@ -277,6 +295,9 @@ async fn record(
 async fn diagnose(since: chrono::DateTime<Utc>, log: Option<&str>) -> ConnectOutcome {
     if blocking(move || proc::cert_failure_since(since)).await {
         return ConnectOutcome::CertificateExpired;
+    }
+    if matches!(blocking(link::health).await, LinkHealth::Down) {
+        return ConnectOutcome::LocalNetworkDown;
     }
     match log {
         Some(text) => blocklist::classify_failure(text),
@@ -396,60 +417,17 @@ pub async fn up(session: &mut Session, protocol: Option<String>) -> UpReport {
         blocking(proc::active_proton_server).await
     };
     if status_connected || now.is_some() {
-        let ranked = session
-            .state
-            .ranked_targets(cfg.blocked_retry_after(), Utc::now());
-        // A desktop toggle is an explicit user choice. Proton's CLI does not
-        // know about that activation, so do not replace it merely because
-        // today's automatic rank prefers another server.
-        let wrong_server = automatic_connection_is_wrong(status_connected, now.as_deref(), &ranked);
-        // "Connected" is Proton's belief, not a fact. On the networks this
-        // tool exists for a middlebox kills the session and leaves the
-        // status reading Connected, and `pvpn up` answered "Already
-        // connected." about exactly that. Nothing is watching in the
-        // background any more, so if this command does not spend one probe
-        // on the question, nothing ever will — and it costs nothing on a
-        // tunnel that works.
-        // Two questions, not one: is anything tunneled at all, and does
-        // traffic flow through it. The first is the one that caught a
-        // client still reporting a server it had lost while every packet
-        // went out unencrypted.
-        let tunneled = blocking(proc::tunnel_is_real).await;
-        let carries_traffic = !wrong_server && tunneled && blocking(net::net_works).await;
-        if !tunneled {
-            tracing::warn!(
-                "{} reports Connected but nothing is tunneled — rebuilding rather than trusting it",
-                now.as_deref().unwrap_or("the client")
-            );
-            restore().await;
-            tokio::time::sleep(Duration::from_secs(2)).await;
-        } else if wrong_server {
-            tracing::warn!(
-                "something reconnected to {} — moving to {}",
-                now.as_deref().unwrap_or("another server"),
-                ranked[0]
-            );
-            restore().await;
-            tokio::time::sleep(Duration::from_secs(2)).await;
-        } else if !carries_traffic {
-            tracing::warn!(
-                "{} says it is connected but carries no traffic — rebuilding the tunnel",
-                now.as_deref().unwrap_or("the existing tunnel")
-            );
-            restore().await;
-            tokio::time::sleep(Duration::from_secs(2)).await;
-        } else {
-            let fix = cfg.fix_apps;
-            blocking(move || apps_hook::enforce_app_routing(fix)).await;
-            if let Some(server) = now.as_deref() {
-                maintain_system_profile(server).await;
+        tracing::info!(
+            "disconnecting {} before establishing a fresh connection",
+            now.as_deref().unwrap_or("the active VPN")
+        );
+        if let Some(server) = now.as_deref() {
+            if server_is_proven_here(session, server) {
+                preserve_then_disconnect(server).await;
             }
-            return UpReport {
-                ok: true,
-                message: "Already connected.".to_string(),
-                server: now,
-            };
         }
+        restore().await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
     }
 
     let proto = {
@@ -835,13 +813,9 @@ pub async fn up(session: &mut Session, protocol: Option<String>) -> UpReport {
 }
 
 pub async fn down() -> UpReport {
-    let current = blocking(|| {
-        proc::protonvpn_status()
-            .ok()
-            .and_then(|status| proc::current_server(&status.stdout))
-            .or_else(proc::active_proton_server)
-    })
-    .await;
+    // NetworkManager owns the actual tunnel. Proton's status can remain
+    // "Connected" after that profile has already disappeared.
+    let current = blocking(proc::active_proton_server).await;
     if let (Some(server), Ok(mut session)) = (current.as_deref(), Session::load()) {
         session.sync_network().await;
         if server_is_proven_here(&session, server) {
@@ -916,13 +890,9 @@ pub async fn hop(session: &mut Session, pattern: Option<String>) -> UpReport {
     // reading the right set before ranking or connecting.
     session.sync_network().await;
 
-    let before = blocking(|| {
-        proc::protonvpn_status()
-            .ok()
-            .and_then(|r| proc::current_server(&r.stdout))
-            .or_else(proc::active_proton_server)
-    })
-    .await;
+    // Preserve only a profile that NetworkManager says is active. Proton's
+    // status is advisory and commonly lags behind a failed tunnel.
+    let before = blocking(proc::active_proton_server).await;
 
     // A named hop can also be the first connect. Guard that path just like
     // `up`; otherwise a dead local resolver would be recorded against the
@@ -936,9 +906,11 @@ pub async fn hop(session: &mut Session, pattern: Option<String>) -> UpReport {
             };
         }
     }
-    if let Some(server) = before.as_deref() {
-        if server_is_proven_here(session, server) {
-            preserve_then_disconnect(server).await;
+    if pattern.is_none() {
+        if let Some(server) = before.as_deref() {
+            if server_is_proven_here(session, server) {
+                preserve_then_disconnect(server).await;
+            }
         }
     }
 
@@ -1007,9 +979,18 @@ async fn hop_to_next_best(session: &mut Session, before: Option<String>) -> UpRe
 
     for (i, target) in candidates.iter().take(attempts).enumerate() {
         tracing::info!("attempt {}/{attempts} — {target}", i + 1);
-        let attempt = match connect_and_verify(session, Some(target), &proto, &network).await {
-            Some(a) => a,
-            None => continue,
+        let attempt = match connect_and_verify(
+            session,
+            Some(target),
+            Some(target.as_str()),
+            &proto,
+            &network,
+            true,
+        )
+        .await
+        {
+            ConnectAttempt::Connected(attempt) => attempt,
+            ConnectAttempt::Failed { .. } => continue,
         };
         match attempt.outcome {
             ConnectOutcome::TrafficOk => {
@@ -1080,8 +1061,15 @@ async fn hop_to_pattern(session: &mut Session, want: String, before: Option<Stri
         let want = want.clone();
         blocking(move || cache::steer_cache(&serverlist, SteerMode::Only, &want)).await
     };
-    let steered = match steered {
-        Ok(s) => s,
+    let (steered, forced_unavailable, local_only) = match steered {
+        Ok(s) => (Some(s), false, false),
+        Err(cache::SteerError::NoMatch) if want.contains('#') => {
+            tracing::warn!(
+                "{want} is absent from Proton's current inventory; trying the locally saved \
+                 verified profile"
+            );
+            (None, true, true)
+        }
         Err(cache::SteerError::NoMatch) => {
             return UpReport {
                 ok: false,
@@ -1090,6 +1078,37 @@ async fn hop_to_pattern(session: &mut Session, want: String, before: Option<Stri
                      Free accounts can receive different server pools; `pvpn best` lists yours."
                 ),
                 server: None,
+            }
+        }
+        Err(cache::SteerError::Unavailable) => {
+            let forced = {
+                let serverlist = serverlist.clone();
+                let want = want.clone();
+                blocking(move || cache::steer_cache(&serverlist, SteerMode::ForceOnly, &want)).await
+            };
+            match forced {
+                Ok(steered) => {
+                    tracing::warn!(
+                        "Proton marks {want} unavailable; trying its current cached endpoint {} \
+                         anyway, then the locally saved profile if needed",
+                        steered.endpoint.as_deref().unwrap_or("unknown")
+                    );
+                    (Some(steered), true, false)
+                }
+                Err(cache::SteerError::NoEndpoint) => {
+                    tracing::warn!(
+                        "{want} has no endpoint in Proton's current inventory; trying the locally \
+                         saved verified profile"
+                    );
+                    (None, true, true)
+                }
+                Err(err) => {
+                    return UpReport {
+                        ok: false,
+                        message: err.to_string(),
+                        server: before,
+                    }
+                }
             }
         }
         Err(err) => {
@@ -1104,7 +1123,9 @@ async fn hop_to_pattern(session: &mut Session, want: String, before: Option<Stri
     let proto = match prepare_protocol().await {
         Ok(p) => p,
         Err(err) => {
-            cache::restore_cache(&steered.backup, &serverlist);
+            if let Some(steered) = &steered {
+                cache::restore_cache(&steered.backup, &serverlist);
+            }
             return UpReport {
                 ok: false,
                 message: err.to_string(),
@@ -1113,17 +1134,154 @@ async fn hop_to_pattern(session: &mut Session, want: String, before: Option<Stri
         }
     };
 
-    let network = session.network().to_string();
-    let attempt = connect_and_verify(session, None, &proto, &network).await;
-    cache::restore_cache(&steered.backup, &serverlist);
+    if let Some(server) = before.as_deref() {
+        if server_is_proven_here(session, server) {
+            preserve_then_disconnect(server).await;
+        }
+    }
 
-    let Some(attempt) = attempt else {
-        restore().await;
-        return UpReport {
-            ok: false,
-            message: format!("Nothing matching {want} would connect."),
-            server: None,
-        };
+    let network = session.network().to_string();
+    let primary = if local_only {
+        match activate_saved_and_verify(session, &want, &proto, &network).await {
+            Ok(Some(attempt)) => ConnectAttempt::Connected(attempt),
+            Ok(None) => ConnectAttempt::Failed {
+                outcome: ConnectOutcome::ClientError,
+                detail: "no locally saved verified profile exists".to_string(),
+            },
+            Err(err) => ConnectAttempt::Failed {
+                outcome: ConnectOutcome::ClientError,
+                detail: err.to_string(),
+            },
+        }
+    } else {
+        connect_and_verify(
+            session,
+            None,
+            Some(&want),
+            &proto,
+            &network,
+            !forced_unavailable,
+        )
+        .await
+    };
+    if let Some(steered) = &steered {
+        cache::restore_cache(&steered.backup, &serverlist);
+    }
+
+    let mut used_local_fallback = local_only;
+    let attempt = match primary {
+        ConnectAttempt::Connected(attempt)
+            if forced_unavailable && !local_only && !attempt.verdict.carrying() =>
+        {
+            restore().await;
+            tracing::warn!(
+                "Proton's current endpoint for {want} did not carry traffic; trying the locally \
+                 saved verified profile"
+            );
+            match activate_saved_and_verify(session, &want, &proto, &network).await {
+                Ok(Some(fallback)) => {
+                    used_local_fallback = true;
+                    fallback
+                }
+                Ok(None) => {
+                    record(
+                        session,
+                        &attempt.server,
+                        &proto,
+                        attempt.outcome,
+                        Some(&attempt.verdict),
+                    )
+                    .await;
+                    attempt
+                }
+                Err(err) => {
+                    tracing::warn!("local profile fallback failed: {err}");
+                    record(
+                        session,
+                        &attempt.server,
+                        &proto,
+                        attempt.outcome,
+                        Some(&attempt.verdict),
+                    )
+                    .await;
+                    attempt
+                }
+            }
+        }
+        ConnectAttempt::Connected(attempt) => {
+            if forced_unavailable && !local_only {
+                record(
+                    session,
+                    &attempt.server,
+                    &proto,
+                    attempt.outcome,
+                    Some(&attempt.verdict),
+                )
+                .await;
+            }
+            attempt
+        }
+        ConnectAttempt::Failed { outcome, detail } if local_only => {
+            record(session, &want, &proto, outcome, None).await;
+            restore().await;
+            return UpReport {
+                ok: false,
+                message: format!(
+                    "Proton's current inventory had no endpoint for {want}, and the local saved \
+                     profile could not connect: {detail}"
+                ),
+                server: None,
+            };
+        }
+        ConnectAttempt::Failed { outcome, detail } if forced_unavailable && !local_only => {
+            restore().await;
+            tracing::warn!(
+                "Proton's current endpoint could not start {want}; trying the locally saved \
+                 verified profile"
+            );
+            match activate_saved_and_verify(session, &want, &proto, &network).await {
+                Ok(Some(fallback)) => {
+                    used_local_fallback = true;
+                    fallback
+                }
+                fallback => {
+                    record(session, &want, &proto, outcome, None).await;
+                    let fallback_detail = match fallback {
+                        Ok(None) => "no locally saved profile exists".to_string(),
+                        Err(err) => err.to_string(),
+                        Ok(Some(_)) => unreachable!(),
+                    };
+                    return UpReport {
+                        ok: false,
+                        message: format!(
+                            "Proton marks {want} unavailable. Its current endpoint failed: \
+                             {detail}\nLocal fallback also failed: {fallback_detail}"
+                        ),
+                        server: None,
+                    };
+                }
+            }
+        }
+        ConnectAttempt::Failed { outcome, detail } => {
+            restore().await;
+            return UpReport {
+                ok: false,
+                message: if outcome.blames_the_server() {
+                    format!(
+                        "{want} was found in the account inventory, but its connection failed: \
+                         {detail}\nIt was blocked here and its saved system VPN was removed."
+                    )
+                } else {
+                    format!(
+                        "{want} was found in the account inventory, but Proton could not start \
+                         its tunnel: {detail}\nThis was classified as {}, so the server was not \
+                         blocked and its saved system VPN was kept.",
+                        outcome.tag()
+                    )
+                },
+                server: None,
+            };
+        }
     };
 
     let fix = cfg.fix_apps;
@@ -1132,12 +1290,19 @@ async fn hop_to_pattern(session: &mut Session, want: String, before: Option<Stri
     let from = before.unwrap_or_default();
     let to = attempt.server;
     if attempt.verdict.carrying() {
+        let source = if used_local_fallback {
+            " using the locally saved profile"
+        } else if forced_unavailable {
+            " using Proton's current cached endpoint despite its unavailable flag"
+        } else {
+            ""
+        };
         return UpReport {
             ok: true,
             message: if from.is_empty() {
-                format!("Hopped to {to}")
+                format!("Hopped to {to}{source}")
             } else {
-                format!("Hopped: {from} -> {to}")
+                format!("Hopped: {from} -> {to}{source}")
             },
             server: Some(to),
         };
@@ -1198,12 +1363,93 @@ struct Attempt {
     verdict: Verdict,
 }
 
-async fn connect_and_verify(
+enum ConnectAttempt {
+    Connected(Attempt),
+    Failed {
+        outcome: ConnectOutcome,
+        detail: String,
+    },
+}
+
+fn connect_failure_detail(log: &str) -> String {
+    let lines: Vec<&str> = log
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    lines
+        .iter()
+        .find(|line| {
+            let lower = line.to_lowercase();
+            lower.contains("error")
+                || lower.contains("failed")
+                || lower.contains("not available")
+                || lower.contains("not allowed")
+                || lower.contains("unable")
+        })
+        .or_else(|| lines.last())
+        .copied()
+        .unwrap_or("Proton exited before creating a tunnel")
+        .to_string()
+}
+
+fn selected_server_matches(actual: &str, expected: Option<&str>) -> bool {
+    expected.is_none_or(|want| cache::name_matches(actual, want))
+}
+
+async fn verify_connected_server(
     session: &mut Session,
-    target: Option<&String>,
+    server: String,
     proto: &str,
     network: &str,
-) -> Option<Attempt> {
+    started: DateTime<Utc>,
+    record_result: bool,
+) -> Attempt {
+    let settle_secs = session.config.settle_secs;
+    tracing::info!("tunnel up — verifying that {server} carries traffic");
+    let verdict = verify::verify(started, Duration::from_secs(settle_secs), network).await;
+    let outcome = outcome_for(&verdict, started).await;
+    narrate(&server, &verdict, settle_secs);
+    if record_result {
+        record(session, &server, proto, outcome, Some(&verdict)).await;
+    }
+    Attempt {
+        server,
+        outcome,
+        verdict,
+    }
+}
+
+async fn activate_saved_and_verify(
+    session: &mut Session,
+    server: &str,
+    proto: &str,
+    network: &str,
+) -> anyhow::Result<Option<Attempt>> {
+    let server_name = server.to_string();
+    let activated =
+        blocking(move || proc::activate_verified_proton_connection(&server_name)).await?;
+    if !activated {
+        return Ok(None);
+    }
+    let active = blocking(proc::active_proton_server).await;
+    let Some(active) = active.filter(|active| active.eq_ignore_ascii_case(server)) else {
+        anyhow::bail!("NetworkManager activated a different VPN profile");
+    };
+    let started = Utc::now();
+    Ok(Some(
+        verify_connected_server(session, active, proto, network, started, true).await,
+    ))
+}
+
+async fn connect_and_verify(
+    session: &mut Session,
+    connect_target: Option<&String>,
+    expected_server: Option<&str>,
+    proto: &str,
+    network: &str,
+    record_result: bool,
+) -> ConnectAttempt {
     let cfg = session.config.clone();
     let _ = blocking(proc::protonvpn_disconnect).await;
     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -1211,54 +1457,95 @@ async fn connect_and_verify(
     let shim = paths::shim_dir();
     let timeout = Duration::from_secs(cfg.connect_timeout_secs);
     let started = Utc::now();
-    let target_c = target.cloned();
-    let result = blocking(move || proc::protonvpn_connect(target_c.as_deref(), &shim, timeout))
-        .await
-        .ok()?;
+    let target_c = connect_target.cloned();
+    let expected = expected_server
+        .map(str::to_string)
+        .or_else(|| connect_target.cloned());
+    let result = match blocking(move || {
+        proc::protonvpn_connect(target_c.as_deref(), &shim, timeout)
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(err) => {
+            let outcome = ConnectOutcome::ClientError;
+            if record_result {
+                if let Some(name) = expected.as_deref() {
+                    record(session, name, proto, outcome, None).await;
+                }
+            }
+            return ConnectAttempt::Failed {
+                outcome,
+                detail: err.to_string(),
+            };
+        }
+    };
 
     let status = blocking(|| proc::protonvpn_status().ok()).await;
     let stdout = status.as_ref().map(|r| r.stdout.as_str()).unwrap_or("");
     if !result.success || !proc::is_connected(stdout) {
         let log = format!("{}\n{}", result.stdout, result.stderr);
         let outcome = diagnose(started, Some(&log)).await;
-        if let Some(name) = target {
-            record(session, name, proto, outcome, None).await;
+        if record_result {
+            if let Some(name) = expected.as_deref() {
+                record(session, name, proto, outcome, None).await;
+            }
         }
+        let detail = connect_failure_detail(&log);
         tracing::warn!(
-            "{} did not connect",
-            target.map(String::as_str).unwrap_or("that server")
+            "{} did not connect: {detail}",
+            expected.as_deref().unwrap_or("that server")
         );
-        return None;
+        return ConnectAttempt::Failed { outcome, detail };
     }
 
     let server = proc::current_server(stdout).unwrap_or_else(|| "unknown".to_string());
-    tracing::info!("tunnel up — verifying that {server} carries traffic");
-    let settle = Duration::from_secs(cfg.settle_secs);
-    let verdict = verify::verify(started, settle, network).await;
-    let outcome = outcome_for(&verdict, started).await;
-    narrate(&server, &verdict, cfg.settle_secs);
-    record(session, &server, proto, outcome, Some(&verdict)).await;
-    Some(Attempt {
-        server,
-        outcome,
-        verdict,
-    })
+    if let Some(want) = expected.as_deref() {
+        if !selected_server_matches(&server, Some(want)) {
+            let detail = format!("Proton selected {server} instead of the requested target {want}");
+            if record_result && want.contains('#') {
+                record(session, want, proto, ConnectOutcome::ClientError, None).await;
+            }
+            let _ = blocking(proc::protonvpn_disconnect).await;
+            tracing::warn!("{detail}");
+            return ConnectAttempt::Failed {
+                outcome: ConnectOutcome::ClientError,
+                detail,
+            };
+        }
+    }
+    ConnectAttempt::Connected(
+        verify_connected_server(session, server, proto, network, started, record_result).await,
+    )
 }
 
 #[cfg(test)]
 mod tests {
     #[test]
-    fn a_desktop_selected_server_is_not_replaced_by_the_automatic_rank() {
-        let ranked = vec!["SG-FREE#2".to_string()];
-        assert!(!super::automatic_connection_is_wrong(
-            false,
-            Some("JP-FREE#33"),
-            &ranked
+    fn a_pre_tunnel_error_keeps_the_useful_proton_explanation() {
+        assert_eq!(
+            super::connect_failure_detail(
+                "noise\nError: server selection is not available for this account\nmore noise"
+            ),
+            "Error: server selection is not available for this account"
+        );
+    }
+
+    #[test]
+    fn a_different_server_never_satisfies_an_exact_hop() {
+        assert!(!super::selected_server_matches(
+            "JP-FREE#11",
+            Some("JP-FREE#33")
         ));
-        assert!(super::automatic_connection_is_wrong(
-            true,
-            Some("JP-FREE#33"),
-            &ranked
+        assert!(super::selected_server_matches(
+            "JP-FREE#33",
+            Some("JP-FREE#33")
         ));
+    }
+
+    #[test]
+    fn a_country_hop_accepts_a_server_in_that_country() {
+        assert!(super::selected_server_matches("JP-FREE#11", Some("JP")));
+        assert!(!super::selected_server_matches("SG-FREE#11", Some("JP")));
     }
 }

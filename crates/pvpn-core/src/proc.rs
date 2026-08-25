@@ -470,14 +470,14 @@ fn proton_profile_name(server: &str) -> String {
     format!("ProtonVPN {server}")
 }
 
-fn active_connection_uuids() -> anyhow::Result<Vec<String>> {
+pub fn active_proton_connection_uuids() -> anyhow::Result<Vec<String>> {
     let result = run(
         "nmcli",
         &["-t", "-f", "NAME,UUID", "con", "show", "--active"],
     )?;
     Ok(parse_connections(&result.stdout)
         .into_iter()
-        .map(|(_, uuid)| uuid)
+        .filter_map(|(name, uuid)| name.starts_with("ProtonVPN ").then_some(uuid))
         .collect())
 }
 
@@ -489,7 +489,7 @@ fn is_profile_for_server(name: &str, server: &str) -> bool {
 /// is active. This also cleans up tagged profiles created by older `pvpn`
 /// builds.
 pub fn reconcile_verified_proton_connection(server: &str) -> anyhow::Result<usize> {
-    let active = active_connection_uuids()?;
+    let active = active_proton_connection_uuids()?;
     let stale: Vec<String> = nmcli_proton_connections()
         .into_iter()
         .filter_map(|(name, uuid)| {
@@ -514,8 +514,12 @@ pub fn disconnect_preserving_verified_connection(server: &str) -> anyhow::Result
     let expected_name = proton_profile_name(server);
     let source_uuid = parse_connections(&active.stdout)
         .into_iter()
-        .find_map(|(name, uuid)| (name == expected_name).then_some(uuid))
-        .with_context(|| format!("no active Proton profile for {server}"))?;
+        .find_map(|(name, uuid)| (name == expected_name).then_some(uuid));
+    let Some(source_uuid) = source_uuid else {
+        // Proton's status can lag behind NetworkManager after a tunnel dies.
+        // There is no live profile left to preserve in that race.
+        return Ok(false);
+    };
 
     let existing: Vec<String> = nmcli_proton_connections()
         .into_iter()
@@ -577,7 +581,7 @@ pub fn disconnect_preserving_verified_connection(server: &str) -> anyhow::Result
 /// Remove inactive maintained copies after a real connection proves the
 /// server unusable. Never delete the active transient profile here.
 pub fn remove_verified_proton_connection(server: &str) -> usize {
-    let active = active_connection_uuids().unwrap_or_default();
+    let active = active_proton_connection_uuids().unwrap_or_default();
     let uuids: Vec<String> = nmcli_proton_connections()
         .into_iter()
         .filter_map(|(name, uuid)| {
@@ -586,6 +590,65 @@ pub fn remove_verified_proton_connection(server: &str) -> usize {
         .collect();
     let removed = uuids.len();
     for uuid in uuids {
+        nmcli_delete_connection(&uuid);
+    }
+    removed
+}
+
+/// Activate the locally saved profile for a previously verified server.
+///
+/// This is the fallback when Proton's current inventory endpoint cannot be
+/// started. `false` means there is no maintained profile for that server.
+pub fn activate_verified_proton_connection(server: &str) -> anyhow::Result<bool> {
+    if active_proton_server().as_deref() == Some(server) {
+        return Ok(true);
+    }
+    let Some(uuid) = nmcli_proton_connections()
+        .into_iter()
+        .find_map(|(name, uuid)| is_profile_for_server(&name, server).then_some(uuid))
+    else {
+        return Ok(false);
+    };
+    let result = run("nmcli", &["con", "up", "uuid", &uuid])?;
+    if result.success || active_proton_server().as_deref() == Some(server) {
+        return Ok(true);
+    }
+    let detail = if result.stderr.trim().is_empty() {
+        result.stdout.trim()
+    } else {
+        result.stderr.trim()
+    };
+    anyhow::bail!("NetworkManager could not activate {server}: {detail}")
+}
+
+fn former_active_duplicates(
+    connections: &[(String, String)],
+    former_active: &[String],
+) -> Vec<String> {
+    former_active
+        .iter()
+        .filter_map(|active_uuid| {
+            let name = connections
+                .iter()
+                .find_map(|(name, uuid)| (uuid == active_uuid).then_some(name))?;
+            (connections
+                .iter()
+                .filter(|(other, _)| other == name)
+                .count()
+                > 1)
+            .then_some(active_uuid.clone())
+        })
+        .collect()
+}
+
+/// Proton may leave its just-deactivated transient profile around for tens of
+/// seconds. If a saved profile with the same display name already exists,
+/// remove only that former active UUID immediately.
+pub fn remove_former_active_proton_duplicates(former_active: &[String]) -> usize {
+    let connections = nmcli_proton_connections();
+    let duplicates = former_active_duplicates(&connections, former_active);
+    let removed = duplicates.len();
+    for uuid in duplicates {
         nmcli_delete_connection(&uuid);
     }
     removed
@@ -1145,6 +1208,25 @@ enp2s0:ethernet:unavailable
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[1].0, "ProtonVPN SG-FREE#21 (verified)");
         assert_eq!(rows[1].1, "22222222-2222-2222-2222-222222222222");
+    }
+
+    #[test]
+    fn teardown_removes_only_the_transient_half_of_a_duplicate() {
+        let connections = vec![
+            ("ProtonVPN JP-FREE#11".to_string(), "saved-uuid".to_string()),
+            (
+                "ProtonVPN JP-FREE#11".to_string(),
+                "transient-uuid".to_string(),
+            ),
+            ("ProtonVPN JP-FREE#33".to_string(), "other-uuid".to_string()),
+        ];
+        assert_eq!(
+            super::former_active_duplicates(&connections, &["transient-uuid".to_string()]),
+            vec!["transient-uuid"]
+        );
+        assert!(
+            super::former_active_duplicates(&connections, &["other-uuid".to_string()]).is_empty()
+        );
     }
 
     #[test]

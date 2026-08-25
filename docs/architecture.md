@@ -45,6 +45,22 @@ Carrying traffic records success; a dead Proton session or a quiet tunnel
 records a server failure. A confirmed physical-link outage records only the
 attempt. Otherwise, walking out of wifi range could remove a healthy server
 from tomorrow's ranked list for a day, and four days the second time.
+Pre-tunnel failures default to `client-error`, which records the attempt but
+does not block the requested server or remove its saved profile. Only explicit
+refusal, TLS-handshake, or session-death evidence can attribute such a failure
+to the server; account restrictions, authentication, certificate, unknown
+client errors, and local-link failures cannot.
+
+An explicit `pvpn hop <server>` prefers Proton's current inventory. If Proton
+marks that exact server unavailable but still supplies an endpoint, `pvpn`
+warns, temporarily enables only that endpoint in the cache, and verifies the
+result rather than assuming the flag means the server is dead. If that current
+endpoint cannot carry traffic—or Proton no longer supplies one—the maintained
+local NetworkManager profile is the fallback. Only failure of both paths is
+recorded. If Proton starts a different server, `pvpn` disconnects it instead of
+verifying or blocking it as though it were the requested target. Inventory
+freshness comes from Proton's embedded expiration time; load-only updates also
+rewrite the file, so its modification time is not evidence of freshness.
 
 ### Saved system VPNs
 
@@ -61,8 +77,15 @@ network failures do not. A later successful connection refreshes the profile
 with the current Proton credentials while retaining only one entry.
 `pvpn` also recognizes a profile activated from desktop Network Settings,
 even though Proton's own CLI state machine reports that manual activation as
-disconnected, and does not replace the user's selection with its automatic
-rank.
+disconnected. Running `pvpn up` or `pvpn hop` is itself an explicit request
+for a fresh session, so either command preserves a proven profile, disconnects
+the active tunnel, and then establishes and verifies a new one. Hop and
+teardown preserve only a profile NetworkManager currently reports as active;
+a stale `protonvpn status` value cannot trigger profile preservation after the
+real tunnel has already disappeared.
+Teardown also remembers the active profile UUID and removes that exact
+transient copy if Proton leaves it beside an existing same-name saved profile;
+the backend can otherwise display both as disconnected for tens of seconds.
 
 ## There was a daemon; it is gone
 

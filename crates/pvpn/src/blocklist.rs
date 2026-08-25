@@ -30,6 +30,11 @@ pub enum ConnectOutcome {
     /// retires healthy servers one after another and teaches the ranker
     /// exactly the wrong thing.
     CertificateExpired,
+    /// Proton's client could not select or start the requested connection.
+    ///
+    /// Account restrictions, stale inventory, authentication failures and
+    /// unknown client errors say nothing reliable about the server itself.
+    ClientError,
     /// *Our own* uplink went away mid-attempt — the wifi dropped, or the
     /// machine roamed to another network.
     ///
@@ -48,6 +53,7 @@ impl ConnectOutcome {
         match self {
             ConnectOutcome::TrafficOk
             | ConnectOutcome::CertificateExpired
+            | ConnectOutcome::ClientError
             | ConnectOutcome::LocalNetworkDown => None,
             ConnectOutcome::ConnectedNoTraffic => Some("no-traffic-after-settle"),
             ConnectOutcome::Refused => Some("refused"),
@@ -68,6 +74,7 @@ impl ConnectOutcome {
             ConnectOutcome::HandshakeClosedEarly => "handshake-closed",
             ConnectOutcome::SessionKilled => "session-killed",
             ConnectOutcome::CertificateExpired => "cert-expired",
+            ConnectOutcome::ClientError => "client-error",
             ConnectOutcome::LocalNetworkDown => "link-down",
         }
     }
@@ -85,9 +92,9 @@ pub fn apply(state: &mut State, name: &str, outcome: ConnectOutcome, now: DateTi
         // exactly as it was — but the attempt still happened, and a
         // history that does not show it is a history that lies about the
         // evening you go looking at.
-        ConnectOutcome::CertificateExpired | ConnectOutcome::LocalNetworkDown => {
-            state.record_connect_attempt(name, now)
-        }
+        ConnectOutcome::CertificateExpired
+        | ConnectOutcome::ClientError
+        | ConnectOutcome::LocalNetworkDown => state.record_connect_attempt(name, now),
         other => {
             if let Some(reason) = other.reason() {
                 state.record_connect_blocked(name, reason, now);
@@ -113,8 +120,10 @@ pub fn classify_failure(log: &str) -> ConnectOutcome {
         // The local agent opened its session to the node and never heard
         // back. Not a refusal — something answered, then stopped.
         ConnectOutcome::SessionKilled
-    } else {
+    } else if lower.contains("connection refused") || lower.contains("actively refused") {
         ConnectOutcome::Refused
+    } else {
+        ConnectOutcome::ClientError
     }
 }
 
@@ -221,6 +230,7 @@ mod tests {
             ConnectOutcome::HandshakeClosedEarly,
             ConnectOutcome::SessionKilled,
             ConnectOutcome::CertificateExpired,
+            ConnectOutcome::ClientError,
             ConnectOutcome::LocalNetworkDown,
         ] {
             assert!(!outcome.tag().is_empty());
@@ -228,6 +238,7 @@ mod tests {
         assert!(ConnectOutcome::SessionKilled.blames_the_server());
         assert!(!ConnectOutcome::LocalNetworkDown.blames_the_server());
         assert!(!ConnectOutcome::CertificateExpired.blames_the_server());
+        assert!(!ConnectOutcome::ClientError.blames_the_server());
         assert!(!ConnectOutcome::TrafficOk.blames_the_server());
     }
 
@@ -298,6 +309,18 @@ mod tests {
         assert!(matches!(
             classify_failure("connection refused"),
             ConnectOutcome::Refused
+        ));
+    }
+
+    #[test]
+    fn an_unknown_client_or_account_error_never_blames_the_server() {
+        assert!(matches!(
+            classify_failure("Unable to select a server for this account"),
+            ConnectOutcome::ClientError
+        ));
+        assert!(matches!(
+            classify_failure("unexpected proton client failure"),
+            ConnectOutcome::ClientError
         ));
     }
 }
