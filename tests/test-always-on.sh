@@ -241,6 +241,22 @@ run_ac --on >/dev/null
 
 # --- shipped unit files ------------------------------------------------
 
+printf '\n  -- installer safety --\n'
+
+# Restarting logind ends the GNOME desktop session: it drops and re-creates
+# its seat, and GDM replaces your session with a fresh greeter. Learned the
+# hard way. The installer must reload in place instead.
+if grep -qE 'systemctl.*restart.*systemd-logind' "$REPO/setup.sh"; then
+    fail "setup.sh never restarts systemd-logind" "found a restart"
+else
+    pass "setup.sh never restarts systemd-logind"
+fi
+if grep -q 'systemctl reload systemd-logind' "$REPO/setup.sh"; then
+    pass "setup.sh reloads logind in place"
+else
+    fail "setup.sh reloads logind in place" "no reload found"
+fi
+
 printf '\n  -- unit files --\n'
 
 for unit in system/pvpn-recover.service system/pvpn-autoconnect.user.service; do

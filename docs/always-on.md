@@ -54,7 +54,12 @@ structural mismatch, not a bug in the extension — it is why the tunnel
 still drops with caffeine enabled.
 
 `--always-on` offers a `logind` drop-in that makes a lid close lock instead
-of suspend. It is a real trade-off — a closed laptop then stays fully
+of suspend. It is applied with `systemctl reload systemd-logind`, never a
+restart: restarting logind drops and re-creates its seat, GDM replaces your
+desktop with a fresh greeter, and everything you had open is gone. `logind`
+is `Type=notify-reload`, so a reload re-reads `logind.conf` in place via
+SIGHUP without disturbing a single session. On a systemd too old for that,
+the policy waits for a reboot — do not restart logind to hurry it along. It is a real trade-off — a closed laptop then stays fully
 awake, with the heat and battery drain that implies — so it is asked about
 separately, and skipped by default when the installer is not interactive.
 Force it either way with `--lid-lock` / `--no-lid-lock`.

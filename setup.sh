@@ -569,15 +569,26 @@ install_lid_lock() {
     sudo install -m644 -o root -g root "$SRC/system/10-pvpn-lid-lock.conf" \
         /etc/systemd/logind.conf.d/10-pvpn-lid-lock.conf
     ok "/etc/systemd/logind.conf.d/10-pvpn-lid-lock.conf"
-    # Restarting logind keeps sessions alive from systemd 246 on; older
-    # versions could drop the graphical session, so those are told to reboot.
-    sdver="$(systemctl --version | awk 'NR==1{print $2}')"
-    if [[ "$sdver" =~ ^[0-9]+$ ]] && (( sdver >= 246 )); then
-        sudo systemctl restart systemd-logind
-        ok "logind restarted — the lid policy is live now"
+    # Never restart logind. Doing that under GNOME ends the desktop session:
+    # logind drops and re-creates its seat, GDM puts up a fresh greeter, and
+    # whatever you had open is gone. Measured here on systemd 259 — the
+    # restart at 12:59:39 was followed one second later by a new gdm-greeter
+    # session. A version check does not save you from this; no version of
+    # logind can hand a live seat to a new process.
+    #
+    # `Type=notify-reload` (systemd 253+) re-reads logind.conf in place via
+    # SIGHUP and never touches sessions, so use that where it exists and
+    # otherwise ask for a reboot.
+    if [[ "$(systemctl show systemd-logind -p CanReload --value 2>/dev/null)" == "yes" ]]; then
+        if sudo systemctl reload systemd-logind; then
+            ok "logind reloaded in place — lid policy live, session untouched"
+        else
+            warn "logind reload failed — the lid policy applies after a reboot"
+        fi
     else
-        warn "reboot to apply the lid policy (systemd $sdver is too old to"
-        note "restart logind without risking your session)"
+        warn "this systemd cannot reload logind in place"
+        note "the lid policy applies after a reboot. Do not restart logind by"
+        note "hand to hurry it along — that ends your desktop session."
     fi
     warn "a closed lid now stays awake — heat in a bag, and battery drain"
 }
