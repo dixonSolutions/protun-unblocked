@@ -2,9 +2,11 @@
 #
 # pvpn installer.
 #
-#   ./setup.sh              install deps + pvpn, then guided setup
-#   ./setup.sh --uninstall  remove everything this script installed
-#   ./setup.sh --no-wizard  install only (skip login / vpn-check prompts)
+#   ./setup.sh                 install deps + pvpn, then guided setup
+#   ./setup.sh --uninstall     remove everything this script installed
+#   ./setup.sh --no-wizard     install only (skip login / vpn-check prompts)
+#   ./setup.sh --always-on     also recover the tunnel after suspend/link change
+#   ./setup.sh --no-always-on  remove those recovery hooks again
 #
 # Auto-installs proton-vpn-cli via apt (Debian/Ubuntu) or dnf (Fedora).
 # If repo.protonvpn.com is blocked, downloads and refreshes that repo
@@ -15,6 +17,10 @@
 #   ~/.local/bin/pvpn          the CLI (one binary, nothing runs in the background)
 #   ~/.local/bin/vpn-check
 #   ~/.local/share/pvpn/       Python shims (sitecustomize, sign-in)
+#
+# --always-on is the one exception: it needs sudo and writes root-owned files
+# under /etc and /usr/local/sbin. It is opt-in and never runs by default.
+# See docs/always-on.md.
 #
 set -euo pipefail
 
@@ -31,13 +37,20 @@ DEB_RELEASE_SHA256="0b14e71586b22e498eb20926c48c7b434b751149b1f2af9902ef1cfe6b03
 RPM_RELEASE_VER="1.0.4-1"
 
 NO_WIZARD=0
+ALWAYS_ON=0
+NO_ALWAYS_ON=0
+LID_LOCK=ask
 for arg in "$@"; do
     case "$arg" in
         --uninstall)   # handled below
             ;;
         --no-wizard)   NO_WIZARD=1 ;;
+        --always-on)   ALWAYS_ON=1 ;;
+        --no-always-on) NO_ALWAYS_ON=1 ;;
+        --lid-lock)    LID_LOCK=yes ;;
+        --no-lid-lock) LID_LOCK=no ;;
         -h|--help)
-            sed -n '3,16p' "$0" | sed 's/^# \?//'
+            sed -n '3,24p' "$0" | sed 's/^# \?//'
             exit 0
             ;;
         *)
@@ -523,6 +536,128 @@ fix_flatpak_routing() {
     fi
 }
 
+# --- always-on: surviving suspend and link changes ---------------------
+
+# Opt-in, and deliberately not the default. These are the only files this
+# installer puts outside $HOME, and the lid drop-in changes what the machine
+# does when you close it.
+#
+# This is not pvpnd coming back. Nothing polls, nothing holds a `want_up`,
+# and nothing is running between events: a resume or a physical link coming
+# up starts one bounded attempt, which gives up rather than fighting a
+# network that refuses. See docs/always-on.md.
+
+always_on_installed() {
+    [[ -f /etc/systemd/system/pvpn-recover.service ]]
+}
+
+install_lid_lock() {
+    local want="$LID_LOCK" sdver
+    if [[ "$want" == ask ]]; then
+        if ask_yes "Also stop the lid from suspending (it will lock instead)?"; then
+            want=yes
+        else
+            want=no
+        fi
+    fi
+    if [[ "$want" != yes ]]; then
+        note "lid left alone — closing it still suspends and still drops the"
+        note "tunnel, but the resume hook now puts both back."
+        return 0
+    fi
+    sudo install -d -m755 /etc/systemd/logind.conf.d
+    sudo install -m644 -o root -g root "$SRC/system/10-pvpn-lid-lock.conf" \
+        /etc/systemd/logind.conf.d/10-pvpn-lid-lock.conf
+    ok "/etc/systemd/logind.conf.d/10-pvpn-lid-lock.conf"
+    # Restarting logind keeps sessions alive from systemd 246 on; older
+    # versions could drop the graphical session, so those are told to reboot.
+    sdver="$(systemctl --version | awk 'NR==1{print $2}')"
+    if [[ "$sdver" =~ ^[0-9]+$ ]] && (( sdver >= 246 )); then
+        sudo systemctl restart systemd-logind
+        ok "logind restarted — the lid policy is live now"
+    else
+        warn "reboot to apply the lid policy (systemd $sdver is too old to"
+        note "restart logind without risking your session)"
+    fi
+    warn "a closed lid now stays awake — heat in a bag, and battery drain"
+}
+
+install_always_on() {
+    head_ "Always-on: recovering after suspend and link changes"
+
+    if ! sudo -v; then
+        bad "needs sudo — skipped. Re-run: ./setup.sh --always-on"
+        return 1
+    fi
+
+    # The reconnect runs as you: pvpn reads Proton's session from your
+    # keyring, so it needs your session bus and cannot work as root.
+    install -m755 "$SRC/bin/pvpn-autoconnect" "$BIN/pvpn-autoconnect"
+    ok "$BIN/pvpn-autoconnect"
+    mkdir -p "$HOME/.config/systemd/user"
+    install -m644 "$SRC/system/pvpn-autoconnect.user.service" \
+        "$HOME/.config/systemd/user/pvpn-autoconnect.service"
+    ok "$HOME/.config/systemd/user/pvpn-autoconnect.service"
+    systemctl --user daemon-reload 2>/dev/null || true
+
+    # Root half: the DNS repair, the resume hook, and the link-up trigger.
+    sudo install -m755 -o root -g root "$SRC/system/pvpn-dns-unsnap" \
+        /usr/local/sbin/pvpn-dns-unsnap
+    ok "/usr/local/sbin/pvpn-dns-unsnap"
+    sudo install -m755 -o root -g root "$SRC/system/pvpn-kick-user" \
+        /usr/local/sbin/pvpn-kick-user
+    ok "/usr/local/sbin/pvpn-kick-user"
+    sudo install -m644 -o root -g root "$SRC/system/pvpn-recover.service" \
+        /etc/systemd/system/pvpn-recover.service
+    ok "/etc/systemd/system/pvpn-recover.service"
+    # NetworkManager refuses dispatcher scripts that are not root-owned or are
+    # group/world writable, so these modes are load-bearing.
+    sudo install -d -m755 /etc/NetworkManager/dispatcher.d
+    sudo install -m755 -o root -g root "$SRC/system/90-pvpn-autoconnect" \
+        /etc/NetworkManager/dispatcher.d/90-pvpn-autoconnect
+    ok "/etc/NetworkManager/dispatcher.d/90-pvpn-autoconnect"
+
+    sudo systemctl daemon-reload
+    if sudo systemctl enable pvpn-recover.service >/dev/null 2>&1; then
+        ok "pvpn-recover.service enabled on every resume path"
+    else
+        warn "could not enable pvpn-recover.service"
+    fi
+
+    install_lid_lock
+    echo
+    note "Stop it reconnecting for you at any time:  pvpn-autoconnect --off"
+    note "What it does and why:                      docs/always-on.md"
+}
+
+remove_always_on() {
+    head_ "Removing the always-on hooks"
+    systemctl --user stop pvpn-autoconnect.service 2>/dev/null || true
+    rm -f "$HOME/.config/systemd/user/pvpn-autoconnect.service" \
+          "$BIN/pvpn-autoconnect"
+    systemctl --user daemon-reload 2>/dev/null || true
+    ok "user reconnect removed"
+
+    if sudo -v 2>/dev/null; then
+        sudo systemctl disable --now pvpn-recover.service 2>/dev/null || true
+        sudo rm -f /etc/systemd/system/pvpn-recover.service \
+                   /usr/local/sbin/pvpn-dns-unsnap \
+                   /usr/local/sbin/pvpn-kick-user \
+                   /etc/NetworkManager/dispatcher.d/90-pvpn-autoconnect \
+                   /etc/systemd/logind.conf.d/10-pvpn-lid-lock.conf
+        sudo systemctl daemon-reload
+        ok "recovery hooks and lid policy removed"
+        note "closing the lid suspends again — logind's default is back"
+    else
+        warn "no sudo — these root-owned files were left in place:"
+        note "/etc/systemd/system/pvpn-recover.service"
+        note "/usr/local/sbin/pvpn-dns-unsnap"
+        note "/usr/local/sbin/pvpn-kick-user"
+        note "/etc/NetworkManager/dispatcher.d/90-pvpn-autoconnect"
+        note "/etc/systemd/logind.conf.d/10-pvpn-lid-lock.conf"
+    fi
+}
+
 # --- guided next steps ------------------------------------------------
 
 already_signed_in() {
@@ -730,6 +865,9 @@ PY
 # --- uninstall --------------------------------------------------------
 
 if [[ "${1:-}" == "--uninstall" ]]; then
+    # Hooks outside $HOME go first — an uninstall that left a dispatcher
+    # script calling a deleted binary would be worse than not uninstalling.
+    always_on_installed && remove_always_on
     # The unit and the daemon binary are from older installs; remove them
     # here too so an uninstall does not leave one behind.
     systemctl --user disable --now pvpnd 2>/dev/null || true
@@ -746,6 +884,11 @@ if [[ "${1:-}" == "--uninstall" ]]; then
         apt) echo "  sudo apt autoremove --purge proton-vpn-cli protonvpn-stable-release" ;;
         dnf) echo "  sudo dnf remove proton-vpn-cli protonvpn-stable-release" ;;
     esac
+    exit 0
+fi
+
+if (( NO_ALWAYS_ON )) && (( ! ALWAYS_ON )); then
+    remove_always_on
     exit 0
 fi
 
@@ -769,6 +912,9 @@ if everything_ready; then
     install_proton
     install_pvpn >/dev/null   # refresh scripts from this checkout
     fix_flatpak_routing
+    if (( ALWAYS_ON )) || always_on_installed; then
+        install_always_on || true
+    fi
     run_wizard
     exit 0
 fi
@@ -791,6 +937,9 @@ fi
 
 install_pvpn
 fix_flatpak_routing
+if (( ALWAYS_ON )) || always_on_installed; then
+    install_always_on || true
+fi
 
 echo
 head_ "Done installing"
@@ -804,5 +953,8 @@ cat <<'EOF'
   pvpn apps          are my Flatpak apps really on the tunnel?
   pvpn blocked       which servers this network has refused
 EOF
+if always_on_installed; then
+    echo "  pvpn-autoconnect --status   is the tunnel rebuilt for you after a resume?"
+fi
 
 run_wizard

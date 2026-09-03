@@ -1,0 +1,16 @@
+# Installed as ~/.config/systemd/user/pvpn-autoconnect.service — a *user* unit,
+# because pvpn reads Proton's session from the SSO keyring and needs the user
+# bus. Started only by pvpn-recover.service (resume, or a link coming up);
+# there is no [Install] section, no timer, and nothing enables it to run on
+# its own.
+[Unit]
+Description=Reconnect the Proton tunnel after the network returns
+Documentation=https://github.com/dixonSolutions/protun-unblocked
+
+[Service]
+Type=oneshot
+# No Restart=. The script does its own bounded retries; a systemd restart loop
+# would relaunch pvpn while a previous connect was still finishing, and
+# overlapping connects are what strand the kill switch.
+ExecStart=%h/.local/bin/pvpn-autoconnect
+TimeoutStartSec=600

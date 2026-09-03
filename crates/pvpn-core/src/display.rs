@@ -137,6 +137,7 @@ mod tests {
             distance_km: distance,
             latency_ms: latency,
             rating: Some(100.0),
+            carry: None,
         }
     }
 

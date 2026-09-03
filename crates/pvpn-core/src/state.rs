@@ -200,6 +200,13 @@ fn hold_for(stat: &ServerStat, base: chrono::Duration) -> chrono::Duration {
 /// into something worth parsing lazily.
 const MAX_EVENTS: usize = 200;
 
+/// How many recent successes [`State::proven_protocol`] weighs.
+///
+/// Small enough that a protocol which stops working here falls out of the
+/// window within an evening's use, large enough that one unlucky slow
+/// connect does not unseat a protocol with a good record.
+const RECENT_SUCCESSES: usize = 10;
+
 impl State {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         if !path.exists() {
@@ -560,6 +567,71 @@ impl State {
             .get(&self.current)
             .map(|n| n.events.iter().rev().cloned().collect())
             .unwrap_or_default()
+    }
+
+    /// The protocol that carries traffic on this network *fastest*.
+    ///
+    /// The default guess for a filtered network is Stealth-over-TLS, and it
+    /// is a good guess right up until it is wrong: detnsw passes TCP 443 and
+    /// drops VPN UDP, so every OpenVPN and WireGuard option dies at the
+    /// transport — but its TLS proxy also terminates anything presenting as
+    /// TLS, which lets `protun-tls` build a tunnel that then takes the better
+    /// part of a minute to pass its first packet. `protun-tcp` is the one
+    /// that threads it, and nothing about the network says so in advance.
+    /// Only a connect that carried traffic does.
+    ///
+    /// This used to read the record as "newest success wins", which is the
+    /// wrong question. Both protocols succeed here. On 2026-09-02 the newest
+    /// success was `protun-tls`, so every connect that morning chose it and
+    /// took 60s to verify, while `protun-tcp` sat in the same history at 7s.
+    /// Recency cannot tell those apart; the recorded `ready_ms` can, and it
+    /// was already being written down.
+    ///
+    /// So: among the last [`RECENT_SUCCESSES`] successes, the protocol with
+    /// the best median time to verified traffic. Capping at the recent ones
+    /// keeps what made recency worth using in the first place — a protocol
+    /// that stops working here stops being chosen once it falls out of the
+    /// window, rather than being defended forever by one fast night months
+    /// ago. Successes with no recorded time still count as evidence that a
+    /// protocol works; they just cannot argue that it is quick, so they lose
+    /// to any protocol that has actually been timed.
+    pub fn proven_protocol(&self) -> Option<String> {
+        let recent: Vec<Event> = self
+            .events()
+            .into_iter()
+            .filter(|e| e.outcome == "ok" && !e.protocol.is_empty())
+            .take(RECENT_SUCCESSES)
+            .collect();
+
+        let mut names: Vec<String> = recent.iter().map(|e| e.protocol.clone()).collect();
+        names.sort();
+        names.dedup();
+
+        let mut protocols: Vec<(String, Option<u64>, DateTime<Utc>)> = names
+            .into_iter()
+            .filter_map(|name| {
+                let mine: Vec<&Event> = recent.iter().filter(|e| e.protocol == name).collect();
+                let mut times: Vec<u64> = mine.iter().filter_map(|e| e.ready_ms).collect();
+                times.sort_unstable();
+                let median = times.get(times.len() / 2).copied();
+                let newest = mine.iter().map(|e| e.at).max()?;
+                Some((name, median, newest))
+            })
+            .collect();
+
+        protocols.sort_by(|a, b| {
+            // An untimed protocol is not "infinitely slow" — it is unproven
+            // as fast. Sorting `None` last says exactly that, and lets
+            // recency settle it among equals.
+            match (a.1, b.1) {
+                (Some(x), Some(y)) => x.cmp(&y),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => std::cmp::Ordering::Equal,
+            }
+            .then_with(|| b.2.cmp(&a.2))
+        });
+        protocols.into_iter().next().map(|(name, _, _)| name)
     }
 
     /// Every network's connect history, newest first, tagged with which
@@ -1056,6 +1128,174 @@ mod tests {
         let mut state = State::default();
         state.set_network("wifi:detnsw");
         state
+    }
+
+    fn event_proto(server: &str, outcome: &str, proto: &str, at: DateTime<Utc>) -> Event {
+        Event {
+            protocol: proto.to_string(),
+            ..event(server, outcome, at)
+        }
+    }
+
+    #[test]
+    fn a_protocol_that_only_ever_failed_is_never_proven() {
+        let mut state = State::default();
+        state.set_network("wifi:detnsw");
+        let t0 = Utc::now();
+        // The real detnsw shape: the default builds a tunnel that never
+        // carries, and a protocol nothing would have guessed does.
+        state.record_event(event_proto("SG-FREE#2", "no-traffic", "protun-tls", t0));
+        state.record_event(event_proto(
+            "SG-FREE#2",
+            "ok",
+            "protun-tcp",
+            t0 + chrono::Duration::seconds(60),
+        ));
+        assert_eq!(state.proven_protocol().as_deref(), Some("protun-tcp"));
+    }
+
+    fn event_timed(
+        server: &str,
+        proto: &str,
+        at: DateTime<Utc>,
+        ready_ms: u64,
+    ) -> Event {
+        Event {
+            ready_ms: Some(ready_ms),
+            seconds: Some(ready_ms.div_ceil(1000)),
+            ..event_proto(server, "ok", proto, at)
+        }
+    }
+
+    #[test]
+    fn the_proven_protocol_is_the_quickest_one_not_the_newest() {
+        // 2026-09-02 on wifi:detnsw, exactly. Both protocols carry traffic
+        // here, so "newest success" cannot tell them apart — and the newest
+        // happened to be the one that takes a minute. Every connect that
+        // morning inherited it and waited out 55s of verification while
+        // protun-tcp sat in the same history at 7s.
+        let mut state = State::default();
+        state.set_network("wifi:detnsw");
+        let t0 = Utc::now();
+        for n in 0..4 {
+            state.record_event(event_timed(
+                "SG-FREE#2",
+                "protun-tcp",
+                t0 + chrono::Duration::minutes(n),
+                6_800,
+            ));
+        }
+        state.record_event(event_timed(
+            "SG-FREE#2",
+            "protun-tls",
+            t0 + chrono::Duration::hours(9),
+            60_141,
+        ));
+        assert_eq!(
+            state.proven_protocol().as_deref(),
+            Some("protun-tcp"),
+            "the newest success is not the same question as the fastest"
+        );
+    }
+
+    #[test]
+    fn a_protocol_that_stops_working_still_falls_out_of_the_window() {
+        // What recency was worth keeping: once the quick protocol stops
+        // succeeding, enough newer successes push it out of the recent
+        // window and the slower one that does work takes over.
+        let mut state = State::default();
+        state.set_network("wifi:detnsw");
+        let t0 = Utc::now();
+        state.record_event(event_timed("SG-FREE#2", "protun-tcp", t0, 6_800));
+        for n in 1..=RECENT_SUCCESSES {
+            state.record_event(event_timed(
+                "SG-FREE#2",
+                "protun-tls",
+                t0 + chrono::Duration::minutes(n as i64),
+                60_000,
+            ));
+        }
+        assert_eq!(state.proven_protocol().as_deref(), Some("protun-tls"));
+    }
+
+    #[test]
+    fn an_untimed_success_loses_to_a_timed_one() {
+        // A saved-profile activation records no protocol at all now, but an
+        // older history still holds successes with no `ready_ms`. They prove
+        // a protocol works; they cannot argue that it is quick.
+        let mut state = State::default();
+        state.set_network("wifi:detnsw");
+        let t0 = Utc::now();
+        state.record_event(event_timed("SG-FREE#2", "protun-tcp", t0, 6_800));
+        state.record_event(event_proto(
+            "SG-FREE#2",
+            "ok",
+            "openvpn-udp",
+            t0 + chrono::Duration::hours(1),
+        ));
+        assert_eq!(state.proven_protocol().as_deref(), Some("protun-tcp"));
+    }
+
+    #[test]
+    fn an_event_with_no_protocol_never_chooses_one() {
+        // The fast path records an empty protocol when it cannot read one
+        // off the profile it activated. That must stay invisible here rather
+        // than becoming a vote for whatever `settings.json` last held.
+        let mut state = State::default();
+        state.set_network("wifi:detnsw");
+        let t0 = Utc::now();
+        state.record_event(event_timed("SG-FREE#2", "protun-tcp", t0, 6_800));
+        state.record_event(event_timed(
+            "SG-FREE#2",
+            "",
+            t0 + chrono::Duration::hours(1),
+            1_064,
+        ));
+        assert_eq!(
+            state.proven_protocol().as_deref(),
+            Some("protun-tcp"),
+            "a 1s activation of an already-up tunnel is not a protocol result"
+        );
+    }
+
+    #[test]
+    fn a_later_success_supersedes_an_earlier_one() {
+        let mut state = State::default();
+        state.set_network("wifi:detnsw");
+        let t0 = Utc::now();
+        state.record_event(event_proto("A#1", "ok", "protun-tcp", t0));
+        state.record_event(event_proto(
+            "A#1",
+            "ok",
+            "openvpn-udp",
+            t0 + chrono::Duration::seconds(60),
+        ));
+        assert_eq!(
+            state.proven_protocol().as_deref(),
+            Some("openvpn-udp"),
+            "self-correcting when the network changes under us"
+        );
+    }
+
+    #[test]
+    fn a_network_with_no_success_yet_keeps_the_callers_default() {
+        let mut state = State::default();
+        state.set_network("wifi:new");
+        state.record_event(event_proto("A#1", "session-killed", "protun-tls", Utc::now()));
+        assert_eq!(state.proven_protocol(), None);
+    }
+
+    #[test]
+    fn what_worked_on_one_network_does_not_choose_for_another() {
+        let mut state = State::default();
+        state.set_network("wifi:detnsw");
+        state.record_event(event_proto("SG-FREE#2", "ok", "protun-tcp", Utc::now()));
+        state.set_network("wifi:cafe");
+        assert_eq!(
+            state.proven_protocol(),
+            None,
+            "detnsw's answer is not the cafe's"
+        );
     }
 
     fn event(server: &str, outcome: &str, at: DateTime<Utc>) -> Event {

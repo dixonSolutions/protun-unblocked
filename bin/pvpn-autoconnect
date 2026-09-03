@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+#
+# pvpn-autoconnect — put the tunnel back after the network moved under it.
+#
+#   pvpn-autoconnect            reconnect, if the network is up and no tunnel is
+#   pvpn-autoconnect --off      stop reconnecting automatically
+#   pvpn-autoconnect --on       resume reconnecting automatically
+#   pvpn-autoconnect --status   report which of those is in effect
+#
+# A deliberate `pvpn down` is never undone: it leaves a marker that survives
+# a suspend, and only `pvpn up` or `pvpn hop` clears it.
+#
+# This is not the old pvpnd. It does not poll, it holds no `want_up`, and it
+# is not running right now. Something that already happened starts it — a
+# resume, or a physical link coming up — and it makes a few attempts and
+# exits. On a network that refuses every connect it gives up and stays quiet
+# instead of fighting you forever. See docs/always-on.md.
+#
+set -u
+
+MARKER_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/pvpn"
+MARKER="$MARKER_DIR/autoconnect-off"
+# Written by `pvpn down` and cleared by `pvpn up` / `pvpn hop`. Two separate
+# facts: this one is "the tunnel is off because I asked just now", the marker
+# above is "never reconnect for me at all". `pvpn up` must clear the first
+# without quietly undoing the second.
+DOWN_MARKER="${XDG_DATA_HOME:-$HOME/.local/share}/pvpn/down-by-user"
+ATTEMPTS="${PVPN_AUTOCONNECT_ATTEMPTS:-3}"
+LINK_WAIT="${PVPN_AUTOCONNECT_LINK_WAIT:-60}"
+
+case "${1:-}" in
+    --off)
+        mkdir -p "$MARKER_DIR" && : > "$MARKER"
+        echo "autoconnect off — nothing will rebuild the tunnel for you."
+        exit 0
+        ;;
+    --on)
+        rm -f "$MARKER"
+        echo "autoconnect on — the tunnel comes back after a resume or a link change."
+        exit 0
+        ;;
+    --status)
+        if [[ -e "$MARKER" ]]; then
+            echo "off  (remove $MARKER, or run: pvpn-autoconnect --on)"
+        elif [[ -e "$DOWN_MARKER" ]]; then
+            echo "on   but holding: you ran \`pvpn down\`, so a resume will"
+            echo "     leave the tunnel down. \`pvpn up\` releases the hold."
+        else
+            echo "on   (disable with: pvpn-autoconnect --off)"
+        fi
+        exit 0
+        ;;
+    -h|--help)
+        sed -n '3,11p' "$0" | sed 's/^# \?//'
+        exit 0
+        ;;
+    "") ;;
+    *)
+        echo "Unknown option: $1 (try --help)" >&2
+        exit 1
+        ;;
+esac
+
+# Never reconnect at all.
+[[ -e "$MARKER" ]] && exit 0
+
+# A deliberate `pvpn down` should stick, including across a suspend. This is
+# the whole reason the marker exists: without it, locking the laptop after
+# turning the VPN off would turn it back on again.
+[[ -e "$DOWN_MARKER" ]] && exit 0
+
+# One connect at a time — pvpn has no inter-process lock of its own, and two
+# overlapping connects are what strand the kill switch.
+runtime="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+exec 9>"$runtime/pvpn-autoconnect.lock" || exit 0
+flock -n 9 || exit 0
+
+# Only a route through the tunnel proves a tunnel. NetworkManager reporting
+# "activated", and `pvpn status` reporting connected, are both true of a
+# tunnel that is carrying nothing.
+tunnel_up() {
+    ip route get 1.1.1.1 2>/dev/null | grep -qE 'dev proton[0-9]*'
+}
+
+# A default route that is not the tunnel's own — i.e. something real to
+# build a tunnel over.
+underlay_up() {
+    ip route show default 2>/dev/null \
+        | grep -qv ' dev \(proton[0-9]*\|ipv6leakintrf0\|pvpnksintrf0\)'
+}
+
+# On resume NetworkManager reassociates several seconds after the kernel
+# comes back, so wait for the link rather than failing a connect against a
+# network that is not there yet.
+for ((i = 0; i < LINK_WAIT; i++)); do
+    tunnel_up && exit 0
+    underlay_up && break
+    sleep 1
+done
+underlay_up || exit 0
+tunnel_up && exit 0
+
+pvpn_bin="$(command -v pvpn || echo "$HOME/.local/bin/pvpn")"
+[[ -x "$pvpn_bin" ]] || { echo "pvpn not found on PATH" >&2; exit 1; }
+
+# Bounded. protun-tcp lands in seconds on a friendly network and protun-tls
+# can take a minute and a half on a filtered one, so pvpn is never given a
+# deadline here — killing it mid-connect is what strands the kill switch and
+# takes all internet with it.
+for ((attempt = 1; attempt <= ATTEMPTS; attempt++)); do
+    tunnel_up && exit 0
+    "$pvpn_bin" up && tunnel_up && exit 0
+    [[ $attempt -lt $ATTEMPTS ]] && sleep $((attempt * 20))
+done
+exit 1

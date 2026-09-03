@@ -170,16 +170,78 @@ pub fn protonvpn_signout() -> anyhow::Result<RunResult> {
     run("protonvpn", &["signout"])
 }
 
+/// API budget for a request sent over Tor.
+///
+/// The shim clamps `TRANSPORT_TIMEOUT` to [`API_TIMEOUT_BLOCKED_SECS`] by
+/// default, which is right for a connect on a filtered network — the
+/// refresh cannot land, so learning that quickly is the whole point. Over
+/// Tor it is simply wrong. Measured from `wifi:detnsw`, 2026-08-31:
+/// `api.protonvpn.ch/vpn/logicals` answers over Tor in 2.5s, twice in a
+/// row, and a full certificate renewal completes in 3.5s. Two seconds cuts
+/// every attempt off half a second before the answer arrives.
+/// `legacy/pvpn.sh:1099` passed its helpers a real budget; the rewrite
+/// dropped it on the Tor path.
+///
+/// Generous rather than tight, because the alternative to waiting is a
+/// certificate nobody can renew until the user finds a different network.
+pub const API_TIMEOUT_TOR_SECS: u64 = 60;
+
 /// Refresh the cached server list through Tor. Routing is untouched, so
 /// this is slow but safe — the caller's internet keeps working.
+///
+/// Note what this does *not* do: renew the client certificate. It looked as
+/// though it should, since booting Proton's client schedules all three of
+/// its refreshers — but `protonvpn servers` in CLI 1.0.3 prints an account
+/// URL and exits in 0.7s, long before any of them can finish. See
+/// `cert::renew`, which asks the API itself.
 pub fn protonvpn_servers_via_tor(shim: &Path, timeout: Duration) -> anyhow::Result<RunResult> {
+    let args = tor_refresh_args(shim);
+    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    run_with_timeout("torsocks", &argv, &[], timeout)
+}
+
+/// `torsocks`'s argv for a refresh, split out so the API budget it carries
+/// can be asserted on. Losing that budget is not a hypothetical: it is what
+/// silently disabled certificate renewal on every filtered network.
+fn tor_refresh_args(shim: &Path) -> Vec<String> {
+    vec![
+        "env".to_string(),
+        format!("PYTHONPATH={}", shim.to_string_lossy()),
+        "PVPN_DEBUG=0".to_string(),
+        format!("PVPN_API_TIMEOUT={API_TIMEOUT_TOR_SECS}"),
+        "protonvpn".to_string(),
+        "servers".to_string(),
+    ]
+}
+
+/// Refresh the server list over whatever route this machine already has.
+///
+/// Tor is the fallback for a network that blocks Proton by name, not the
+/// preferred path: whenever the API can actually be reached — most usefully
+/// once a tunnel is already up, which routes around the very block Tor was
+/// there to dodge — going direct is faster and needs nothing else running.
+///
+/// This used to say Proton does not serve its VPN API to Tor exits at all,
+/// on the evidence of `000` after 60s over Tor against a clean `200`
+/// direct. That was a misreading of a real measurement. Proton serves Tor
+/// exits perfectly well — `api.protonvpn.ch/vpn/logicals` answers in 2.5s
+/// and a full certificate renewal completes in 3.5s, both measured on
+/// `wifi:detnsw`, 2026-08-31. What fails is `torsocks`, whose LD_PRELOAD
+/// cannot carry Proton's aiohttp transport; the `000` was its IPv6 fan-out
+/// timing out. See the shim's patch 5, which proxies at the transport
+/// instead and works.
+pub fn protonvpn_servers_direct(shim: &Path, timeout: Duration) -> anyhow::Result<RunResult> {
     let shim_str = shim.to_string_lossy().to_string();
     run_with_timeout(
-        "torsocks",
+        "env",
         &[
-            "env",
             &format!("PYTHONPATH={shim_str}"),
             "PVPN_DEBUG=0",
+            // The caller has already established that the API answers here,
+            // so the shim's two-second fast-fail is measuring nothing but
+            // its own impatience — and the logicals payload is well over a
+            // megabyte.
+            &format!("PVPN_API_TIMEOUT={API_TIMEOUT_REACHABLE_SECS}"),
             "protonvpn",
             "servers",
         ],
@@ -424,6 +486,21 @@ pub fn blackhole_api_hosts() -> anyhow::Result<bool> {
     Ok(status.success())
 }
 
+/// Is *our own* `/etc/hosts` blackhole currently installed?
+///
+/// This has to be asked before an unreachable Proton API is blamed on the
+/// network, because once the blackhole is in place it is the reason the API
+/// is unreachable. Without the check the advice to install it survives
+/// installing it, and `pvpn fix --hosts` reports itself as still needed
+/// forever.
+pub fn api_hosts_blackholed() -> bool {
+    hosts_file_blackholed(&std::fs::read_to_string("/etc/hosts").unwrap_or_default())
+}
+
+fn hosts_file_blackholed(text: &str) -> bool {
+    text.lines().any(|line| line.trim() == HOSTS_MARK)
+}
+
 pub fn unblackhole_api_hosts() -> anyhow::Result<bool> {
     let script = "sed -i '/pvpn-temporary-api-blackhole/,+3d' /etc/hosts; \
         sed -i '/127\\.0\\.0\\.1 vpn-api\\.proton\\.me/d;/127\\.0\\.0\\.1 api\\.protonvpn\\.ch/d;/127\\.0\\.0\\.1 account\\.proton\\.me/d' /etc/hosts";
@@ -446,14 +523,37 @@ pub fn protonvpn_connect(
     target: Option<&str>,
     shim: &Path,
     timeout: Duration,
+    api_timeout_secs: u64,
 ) -> anyhow::Result<RunResult> {
     let shim_str = shim.to_string_lossy().to_string();
-    let envs = [("PYTHONPATH", shim_str.as_str()), ("PVPN_DEBUG", "0")];
+    let api_timeout = api_timeout_secs.to_string();
+    let envs = [
+        ("PYTHONPATH", shim_str.as_str()),
+        ("PVPN_DEBUG", "0"),
+        ("PVPN_API_TIMEOUT", api_timeout.as_str()),
+    ];
     match target {
         Some(name) => run_with_timeout("protonvpn", &["connect", name], &envs, timeout),
         None => run_with_timeout("protonvpn", &["connect"], &envs, timeout),
     }
 }
+
+/// API budget for a connect on a network that blocks Proton.
+///
+/// The shim clamps `TRANSPORT_TIMEOUT` to two seconds by default, and on a
+/// filtered network that is exactly right: the refresh cannot succeed, and
+/// waiting fifteen seconds to learn so delays every connect behind it.
+pub const API_TIMEOUT_BLOCKED_SECS: u64 = 2;
+
+/// API budget for a connect where the API actually answers.
+///
+/// `protonvpn connect` is the *only* command in CLI 1.0.3 that refreshes the
+/// server list — `protonvpn servers` merely prints a URL. So the connect's
+/// own refresher is the one chance the cache gets to be renewed, and the
+/// two-second fast-fail above kills it before it can land even when the API
+/// is healthy. Given room, that refresh is what stops the cache going stale
+/// and needing its expiry extended in the first place.
+pub const API_TIMEOUT_REACHABLE_SECS: u64 = 15;
 
 // --- NetworkManager cleanup -----------------------------------------------
 
@@ -499,6 +599,96 @@ fn is_profile_for_server(name: &str, server: &str) -> bool {
     name == proton_profile_name(server) || name == format!("ProtonVPN {server} (verified)")
 }
 
+/// The protocol a saved NetworkManager profile will actually use, or `None`
+/// when the profile does not say plainly enough to be worth recording.
+///
+/// `None` is the important half. The obvious alternative — reporting
+/// Proton's *configured* protocol out of `settings.json` — is how activating
+/// a saved profile came to be filed as a `protun-tls` success it had nothing
+/// to do with: `settings.json` says what the next Proton connect would use,
+/// not what this profile is. One such event then became the newest success
+/// on the network and every later connect chose its protocol from it. An
+/// honest gap in the record costs nothing, because
+/// [`State::proven_protocol`](crate::state::State::proven_protocol) already
+/// skips events with no protocol. A confident wrong answer costs the next
+/// fifty connects.
+pub fn profile_protocol(uuid: &str) -> Option<String> {
+    let result = run("nmcli", &["-t", "-f", "vpn.service-type,vpn.data", "con", "show", uuid]).ok()?;
+    profile_protocol_from_fields(&result.stdout)
+}
+
+fn profile_protocol_from_fields(fields: &str) -> Option<String> {
+    let value = |key: &str| {
+        fields
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{key}:")))
+            .map(str::trim)
+    };
+    let service = value("vpn.service-type")?;
+    let data = value("vpn.data").unwrap_or_default();
+    let kind = service.rsplit('.').next()?;
+    match kind {
+        "openvpn" => Some(
+            // NetworkManager's OpenVPN plugin is UDP unless told otherwise,
+            // and which one it is decides whether this profile can work at
+            // all on a network that drops VPN UDP.
+            if data.contains("proto-tcp = yes") {
+                "openvpn-tcp".to_string()
+            } else {
+                "openvpn-udp".to_string()
+            },
+        ),
+        "wireguard" => Some("wireguard".to_string()),
+        // Proton's Stealth backends do not distinguish their transport in
+        // anything readable here, and guessing between `protun-tls` and
+        // `protun-tcp` is exactly the guess that caused the damage above.
+        _ => None,
+    }
+}
+
+/// The protocol the currently-active Proton profile is actually using.
+///
+/// The question to ask after activating a saved profile, in place of
+/// [`current_protocol`] — which reads Proton's `settings.json` and therefore
+/// answers "what would the next Proton connect use", not "what is this".
+pub fn active_profile_protocol() -> Option<String> {
+    let uuid = active_proton_connection_uuids().ok()?.into_iter().next()?;
+    profile_protocol(&uuid)
+}
+
+/// Delete duplicate `ProtonVPN <server>` profiles, keeping one of each name.
+///
+/// Duplicates come from an interrupted teardown: preserving a proven tunnel
+/// means cloning its profile and then deleting the original, so a Ctrl-C
+/// between the two leaves both. The old cleanup only ever ran for the server
+/// being connected, so every *other* server's duplicates stayed — which is
+/// how Network Settings grows two `ProtonVPN JP-FREE#10` entries that nothing
+/// will ever tidy, because nothing connects to JP-FREE#10 again.
+///
+/// Active profiles are never touched, and one copy of every name always
+/// survives: this removes redundancy, never a server.
+pub fn dedupe_proton_connections() -> usize {
+    let active = active_proton_connection_uuids().unwrap_or_default();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Keep whatever is active first, so the survivor is the live one.
+    let all = nmcli_proton_connections();
+    for (name, _) in all.iter().filter(|(_, u)| active.contains(u)) {
+        seen.insert(name.clone());
+    }
+    let mut removed = 0;
+    for (name, uuid) in all {
+        if active.contains(&uuid) {
+            continue;
+        }
+        if seen.insert(name) {
+            continue;
+        }
+        nmcli_delete_connection(&uuid);
+        removed += 1;
+    }
+    removed
+}
+
 /// Keep the live Proton profile as the sole Network Settings entry while it
 /// is active. This also cleans up tagged profiles created by older `pvpn`
 /// builds.
@@ -535,12 +725,15 @@ pub fn disconnect_preserving_verified_connection(server: &str) -> anyhow::Result
         return Ok(false);
     };
 
-    let existing: Vec<String> = nmcli_proton_connections()
-        .into_iter()
-        .filter_map(|(name, uuid)| {
-            (is_profile_for_server(&name, server) && uuid != source_uuid).then_some(uuid)
-        })
-        .collect();
+    // Delete the stale copies *before* cloning, not after. Doing it after
+    // meant every teardown spent its whole duration holding two profiles for
+    // one server, and a Ctrl-C anywhere in that window — which is most of the
+    // window — left both behind permanently.
+    for (name, uuid) in nmcli_proton_connections() {
+        if is_profile_for_server(&name, server) && uuid != source_uuid {
+            nmcli_delete_connection(&uuid);
+        }
+    }
     let temporary_name = format!("ProtonVPN pvpn-preserve-{}", std::process::id());
     let cloned = run("nmcli", &["con", "clone", &source_uuid, &temporary_name])?;
     if !cloned.success {
@@ -586,9 +779,6 @@ pub fn disconnect_preserving_verified_connection(server: &str) -> anyhow::Result
         anyhow::bail!("NetworkManager could not name {server}'s saved profile");
     }
 
-    for uuid in existing {
-        nmcli_delete_connection(&uuid);
-    }
     Ok(true)
 }
 
@@ -714,11 +904,42 @@ pub fn proton_connection_active() -> bool {
     parse_proton_connection_active(&result.stdout)
 }
 
-/// Positive NetworkManager evidence that a Proton tunnel profile is active.
+/// Is a Proton tunnel actually carrying this machine's traffic?
 ///
-/// D-Bus is the fast path. The existing `nmcli` parser remains the fallback
-/// for systems where direct bus access is unavailable.
+/// Two questions, and both have to answer yes. NetworkManager is asked
+/// whether a Proton profile is active — D-Bus as the fast path, the `nmcli`
+/// parser as the fallback where direct bus access is unavailable.
+///
+/// Then the kernel is asked where packets really go, because NetworkManager
+/// answering "activated" is not the same claim. A profile can sit activated
+/// against the *physical* device with no tunnel interface up and the default
+/// route untouched — seen in the wild as two `ProtonVPN` profiles activated
+/// at once, `tun0` and `tun1` both DOWN, and every packet leaving over the
+/// wifi in the clear. On NetworkManager's word alone that state passes this
+/// gate, the traffic probe then succeeds *over the leak*, and the connect is
+/// reported as verified. The routing table cannot be fooled that way: it
+/// names the device traffic leaves by, for free and while the tunnel is
+/// dead, which also means a tunnel that never came up is rejected in a
+/// millisecond instead of after a settle window.
+///
+/// Only [`EgressPath::Bypassed`] — positive evidence — withholds the yes. An
+/// unreadable route table decides nothing, so a machine where `ip` cannot be
+/// run behaves exactly as it did before.
 pub fn verified_tunnel_active() -> bool {
+    proton_profile_active() && !crate::link::egress_path().is_bypassed()
+}
+
+/// Is one of Proton's NetworkManager profiles attached, whether or not it
+/// carries anything?
+///
+/// The question teardown wants, and deliberately not the one
+/// [`verified_tunnel_active`] answers. A profile that is activated while
+/// traffic bypasses it is still a profile: something has to remove it, and
+/// something has to wait for it to go. Asking the stricter question there
+/// would report a leaking profile as already gone and start the next connect
+/// on top of it — which is how two `ProtonVPN` profiles end up activated at
+/// once.
+pub fn proton_profile_active() -> bool {
     crate::dbus::active_proton_profile().is_some() || proton_connection_active()
 }
 
@@ -857,6 +1078,33 @@ pub fn stray_leak_route() -> Option<String> {
 /// tearing down a healthy tunnel is worse than being slow to spot a dead
 /// one, and both were unambiguously true in the case above.
 pub fn tunnel_is_real() -> bool {
+    // The kernel first, because it outranks the pair below. The two-signal
+    // rule leads with `proton_active -> true`, and that short-circuit is
+    // what a profile activated against the *physical* device walks straight
+    // through: NetworkManager says yes, the conjunction never gets to look
+    // at the route, and `pvpn status` calls a leak a tunnel. Seen in the
+    // wild with two `ProtonVPN` profiles activated at once and no tunnel
+    // device up at all.
+    //
+    // This does not loosen the conservatism the pair exists for. It is
+    // strictly better evidence than "a default route on an uplink device":
+    // it names the device traffic actually leaves by, and only
+    // `Bypassed` — a route table that was read successfully and named
+    // something that is not a tunnel — overrides anything. `Unknown` falls
+    // through to exactly the old behaviour.
+    match crate::link::egress_path() {
+        // Positive proof, and decisive in both directions. The pair below
+        // cannot supply it: Proton routes by policy rule, not by replacing
+        // the main-table default, so on a perfectly healthy tunnel
+        // `default_route_device` still names the wifi — measured as
+        // `default via 10.177.200.1 dev wlp0s20f3` while `ip route get`
+        // resolved the same traffic to `dev proton0 table 245447468`. Left
+        // to fall through, a live tunnel is judged by evidence that is
+        // wrong about it.
+        crate::link::EgressPath::Tunnelled(_) => return true,
+        crate::link::EgressPath::Bypassed(_) => return false,
+        crate::link::EgressPath::Unknown => {}
+    }
     decide_tunnel_is_real(
         proton_connection_active(),
         default_route_device().as_deref(),
@@ -1102,6 +1350,53 @@ pub const PROTON_API_HOST: &str = "vpn-api.proton.me";
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn our_own_hosts_blackhole_is_recognised() {
+        let installed = format!(
+            "127.0.0.1 localhost\n{HOSTS_MARK}\n127.0.0.1 vpn-api.proton.me\n"
+        );
+        assert!(hosts_file_blackholed(&installed));
+        assert!(
+            !hosts_file_blackholed("127.0.0.1 localhost\n"),
+            "a normal hosts file is not our doing"
+        );
+        assert!(
+            !hosts_file_blackholed("127.0.0.1 vpn-api.proton.me\n"),
+            "someone else's entry is not ours to claim or to undo"
+        );
+    }
+
+    #[test]
+    fn a_profiles_protocol_comes_from_the_profile_not_from_a_guess() {
+        let udp = "vpn.service-type:org.freedesktop.NetworkManager.openvpn\n\
+                   vpn.data:cipher = AES-256-GCM, dev = tun, remote = 1.2.3.4:1194\n";
+        assert_eq!(
+            profile_protocol_from_fields(udp).as_deref(),
+            Some("openvpn-udp")
+        );
+
+        let tcp = "vpn.service-type:org.freedesktop.NetworkManager.openvpn\n\
+                   vpn.data:dev = tun, proto-tcp = yes, remote = 1.2.3.4:443\n";
+        assert_eq!(
+            profile_protocol_from_fields(tcp).as_deref(),
+            Some("openvpn-tcp")
+        );
+
+        // The one that matters: Proton's Stealth backends do not say which
+        // transport they are, and guessing between protun-tls and protun-tcp
+        // is what filed a profile activation as a protun-tls success and made
+        // every later connect take a minute.
+        let protun = "vpn.service-type:org.freedesktop.NetworkManager.protun\n\
+                      vpn.data:remote = 1.2.3.4:443\n";
+        assert_eq!(
+            profile_protocol_from_fields(protun),
+            None,
+            "no answer beats a confident wrong one"
+        );
+        assert_eq!(profile_protocol_from_fields(""), None);
+    }
+
     /// Verbatim from `~/.cache/Proton/VPN/logs/vpn-cli.log` for the
     /// `SG-FREE#13` attempt on `wifi:detnsw`. The shape of the whole
     /// problem is in these six lines: connected in 0.3s, agent never
@@ -1298,6 +1593,35 @@ enp2s0:ethernet:unavailable
     }
 
     #[test]
+    fn a_live_tunnel_is_misjudged_by_the_route_pair_alone() {
+        // Proton routes by policy rule, so the main-table default still
+        // names the wifi while traffic goes down proton0. Measured on a
+        // working tunnel: `ip route show default` -> wlp0s20f3, while
+        // `ip route get` -> proton0. Judged on the pair alone a healthy
+        // tunnel reads as no tunnel, which is why `tunnel_is_real` decides
+        // on the kernel lookup before consulting this.
+        assert!(
+            !super::decide_tunnel_is_real(false, Some("wlp0s20f3"), &["wlp0s20f3".to_string()]),
+            "the pair says 'no tunnel' about a tunnel that is carrying traffic"
+        );
+    }
+
+    #[test]
+    fn an_active_profile_short_circuits_the_two_signal_rule() {
+        // Why `tunnel_is_real` cannot rely on this pair alone. The leak of
+        // 2026-08-27 had a ProtonVPN profile activated against the physical
+        // device with no tunnel up, so the route evidence below was never
+        // consulted and a leak was reported as a tunnel. The kernel egress
+        // check in `tunnel_is_real` is what catches that state; this asserts
+        // the hole it covers is still exactly here.
+        assert!(super::decide_tunnel_is_real(
+            true,
+            Some("wlp0s20f3"),
+            &["wlp0s20f3".to_string()]
+        ));
+    }
+
+    #[test]
     fn a_default_route_off_the_uplink_counts_as_tunneled() {
         assert!(super::decide_tunnel_is_real(
             false,
@@ -1416,6 +1740,29 @@ enp2s0:ethernet:unavailable
     #[test]
     fn current_server_is_none_when_disconnected() {
         assert_eq!(current_server("Status: Disconnected\n"), None);
+    }
+
+    /// Tor answers Proton's API in about 2.5s from a filtered network. The
+    /// shim's default budget is 2s, so a refresh sent without an explicit
+    /// one is cut off just before the answer arrives — and the only thing
+    /// that renews the client certificate on such a network is this call.
+    /// It reported "could not renew over Tor" for a working Tor until the
+    /// budget came back; do not let it go missing again.
+    #[test]
+    fn the_tor_refresh_carries_a_budget_tor_can_meet() {
+        let args = tor_refresh_args(Path::new("/home/u/.local/share/pvpn"));
+        let budget = args
+            .iter()
+            .find_map(|a| a.strip_prefix("PVPN_API_TIMEOUT="))
+            .expect("the Tor refresh must set an API budget")
+            .parse::<u64>()
+            .expect("a number of seconds");
+        assert!(
+            budget > API_TIMEOUT_BLOCKED_SECS,
+            "{budget}s is the fast-fail budget, not a Tor budget"
+        );
+        assert!(budget >= 10, "{budget}s leaves no room for a Tor circuit");
+        assert!(args.ends_with(&["protonvpn".to_string(), "servers".to_string()]));
     }
 
     #[test]

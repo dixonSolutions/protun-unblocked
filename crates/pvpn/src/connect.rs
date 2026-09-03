@@ -17,7 +17,9 @@ use crate::session::{blocking, Session};
 use crate::verify::{self, Verdict};
 use chrono::{DateTime, Utc};
 use pvpn_core::cache::{self, SteerMode};
+use pvpn_core::cert;
 use pvpn_core::config::Config;
+use pvpn_core::intent;
 use pvpn_core::link::{self, LinkHealth};
 use pvpn_core::net;
 use pvpn_core::paths;
@@ -62,7 +64,7 @@ async fn local_network_problem() -> Option<String> {
 async fn wait_for_no_active_tunnel(timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     loop {
-        if !blocking(proc::verified_tunnel_active).await {
+        if !blocking(proc::proton_profile_active).await {
             return true;
         }
         if Instant::now() >= deadline {
@@ -139,7 +141,15 @@ async fn activate_saved_fast_path(session: &mut Session) -> Option<UpReport> {
         return None;
     }
 
-    let protocol = blocking(proc::current_protocol).await;
+    // What the profile we just activated actually is, not what Proton's
+    // settings say the next connect would use. Reading `settings.json` here
+    // is what filed a profile activation as a `protun-tls` success it had no
+    // part in, which then became the protocol every later connect chose. An
+    // empty string is the honest answer when the profile does not say, and
+    // `State::proven_protocol` skips events that give one.
+    let protocol = blocking(proc::active_profile_protocol)
+        .await
+        .unwrap_or_default();
     tracing::info!("activated proven server {server} directly; verifying traffic");
     let verdict = verify::verify(
         started_at,
@@ -230,6 +240,25 @@ pub async fn restore() -> bool {
 /// not a hard failure — `best` can still rank a stale list.
 pub async fn ensure_fresh_data(cfg: &Config, optional: bool) -> anyhow::Result<()> {
     let path = paths::serverlist_path();
+    // Before anything reads the inventory: a steer left behind by a killed
+    // hop makes this account look like it owns one server, and every ranked
+    // connect then fails with "no servers available" until that one is
+    // written off — after which there is nothing left to try at all.
+    match cache::heal_stranded_steer(&path) {
+        Ok(Some(cache::Healed::FromBackup)) => {
+            tracing::warn!(
+                "an interrupted `pvpn hop` had left Proton's server list steered — restored it"
+            );
+        }
+        Ok(Some(cache::Healed::Reenabled(n))) => {
+            tracing::warn!(
+                "Proton's cached list had {n} free servers switched off and no backup to \
+                 restore — re-enabled them; the next refresh will fetch the real statuses"
+            );
+        }
+        Ok(None) => {}
+        Err(err) => tracing::warn!("could not check the server list for a stranded steer: {err}"),
+    }
     if let Some(valid_for) = cache::inventory_valid_for_secs(&path) {
         if valid_for > 0 {
             let minutes = (valid_for + 59) / 60;
@@ -253,13 +282,24 @@ pub async fn ensure_fresh_data(cfg: &Config, optional: bool) -> anyhow::Result<(
         tracing::info!("Proton's cached server inventory has expired");
     }
 
+    // Ask where the API can be reached *before* reaching for Tor. Tor is
+    // the workaround for a network that blocks Proton by name; it is not a
+    // better path, and Proton does not answer its VPN API to Tor exits at
+    // all — a refresh sent that way waits out the whole timeout and returns
+    // nothing even while the API is healthy. Once a tunnel is up the block
+    // Tor existed to dodge is already gone, so direct is the route that
+    // works.
+    let direct = blocking(|| net::proton_api_health(6)).await;
+    let go_direct = matches!(direct, net::ApiHealth::Answering(_));
     let tor_ok = blocking(proc::tor_available).await;
-    if optional && !tor_ok {
-        tracing::warn!("server list is stale and Tor is not running — using what we have");
-        return Ok(());
-    }
-    if !tor_ok {
-        anyhow::bail!("Tor is not running — Proton's API is blocked without it. Start it with: sudo systemctl start tor");
+    if !go_direct {
+        if optional && !tor_ok {
+            tracing::warn!("server list is stale and Tor is not running — using what we have");
+            return Ok(());
+        }
+        if !tor_ok {
+            anyhow::bail!("Tor is not running — Proton's API is blocked without it. Start it with: sudo systemctl start tor");
+        }
     }
 
     let shim = match paths::ensure_shim() {
@@ -270,15 +310,62 @@ pub async fn ensure_fresh_data(cfg: &Config, optional: bool) -> anyhow::Result<(
         }
     };
     let timeout = Duration::from_secs(cfg.refresh_timeout_secs);
-    tracing::info!("server list is stale; refreshing over Tor (routing untouched)");
-    let result = blocking(move || proc::protonvpn_servers_via_tor(&shim, timeout)).await;
+    let result = if go_direct {
+        tracing::info!("server list is stale; Proton's API is reachable, refreshing directly");
+        blocking(move || proc::protonvpn_servers_direct(&shim, timeout)).await
+    } else {
+        tracing::info!("server list is stale; refreshing over Tor (routing untouched)");
+        blocking(move || proc::protonvpn_servers_via_tor(&shim, timeout)).await
+    };
+    // `protonvpn servers` exits 0 whether or not it reached the API — on a
+    // filtered network it logs "Server list refresh failed: No working
+    // transports found" and returns success. Proton stamps a new expiry only
+    // when a fetch actually lands, so that, not the exit code, is the test.
+    let landed = cache::inventory_valid_for_secs(&path).unwrap_or(-1) > 0;
     match result {
-        Ok(r) if r.success && path.is_file() => {
+        Ok(r) if r.success && landed => {
             tracing::info!("server list cached");
+        }
+        Ok(r) if r.success => {
+            // Do not guess at the reason. The refresh not landing says only
+            // that it did not land: Tor being unusable and Proton's own API
+            // being down produce byte-identical evidence here, and blaming
+            // Tor for the second sends the user to debug a working Tor
+            // while Proton is 503ing for everybody. So ask.
+            match blocking(|| net::proton_api_health(8)).await {
+                net::ApiHealth::Down(code) => tracing::warn!(
+                    "Proton's own API is answering {code} — their outage, not this network \
+                     and not Tor; connecting with the cached list"
+                ),
+                net::ApiHealth::Unreachable => tracing::warn!(
+                    "nothing answered at Proton's API, over Tor or directly — connecting with \
+                     the cached list"
+                ),
+                net::ApiHealth::Answering(code) => tracing::warn!(
+                    "Proton's API answered {code} but the refresh still did not land; \
+                     connecting with the cached list"
+                ),
+                net::ApiHealth::Intercepted(code) => tracing::warn!(
+                    "something answered {code} for Proton's API but it was not Proton — \
+                     this network is intercepting it; connecting with the cached list"
+                ),
+            }
         }
         Ok(_) | Err(_) => {
             tracing::warn!("refresh failed or timed out; connecting with what we have");
         }
+    }
+    // The refresh has now been tried and did not land. If the cache is also
+    // past its expiry, Proton will refuse to connect with it at all — so
+    // "connecting with what we have" above is a promise this has to keep.
+    let stale_for = cfg.stale_hours.max(1) as i64;
+    match blocking(move || cache::extend_inventory_expiry(&path, stale_for)).await {
+        Ok(true) => tracing::warn!(
+            "Proton would have refused to connect with an expired list; marked the cached \
+             inventory usable for another {stale_for}h — its server data is unchanged"
+        ),
+        Ok(false) => {}
+        Err(err) => tracing::warn!("could not extend the cached inventory's expiry: {err}"),
     }
     Ok(())
 }
@@ -311,7 +398,7 @@ async fn outcome_for(verdict: &Verdict, since: DateTime<Utc>) -> ConnectOutcome 
         Verdict::Carrying { .. } => ConnectOutcome::TrafficOk,
         Verdict::LinkDown { .. } => ConnectOutcome::LocalNetworkDown,
         Verdict::SessionDied { .. } | Verdict::Quiet { .. } => {
-            if blocking(move || proc::cert_failure_since(since)).await {
+            if certificate_is_to_blame(since).await {
                 ConnectOutcome::CertificateExpired
             } else if matches!(verdict, Verdict::SessionDied { .. }) {
                 ConnectOutcome::SessionKilled
@@ -320,6 +407,27 @@ async fn outcome_for(verdict: &Verdict, since: DateTime<Utc>) -> ConnectOutcome 
             }
         }
     }
+}
+
+/// Was it our own certificate, rather than this server?
+///
+/// Two independent answers, because neither covers both paths. The keyring
+/// holds the expiry outright and can be read from anywhere — including the
+/// fast path, which activates a saved NetworkManager profile over D-Bus and
+/// so never makes Proton write the log line the other check reads. That gap
+/// is what let a server with fourteen successful connects behind it be
+/// written off twice in ten minutes on 2026-08-31.
+///
+/// Proton's log stays because it catches what the keyring cannot see: a
+/// certificate the *node* rejects while our copy still looks valid, and a
+/// keyring that will not open at all.
+async fn certificate_is_to_blame(since: DateTime<Utc>) -> bool {
+    if let Some(status) = blocking(cert::status).await {
+        if status.unusable(Utc::now()) {
+            return true;
+        }
+    }
+    blocking(move || proc::cert_failure_since(since)).await
 }
 
 /// Say what happened, in the terms the user can act on. A connect on a
@@ -349,6 +457,21 @@ async fn maintain_system_profile(server: &str) {
     match blocking(move || proc::reconcile_verified_proton_connection(&server_name)).await {
         Ok(_) => {}
         Err(err) => tracing::warn!("could not save {server} in Network Settings: {err}"),
+    }
+    tidy_duplicate_profiles().await;
+}
+
+/// Remove duplicate `ProtonVPN` entries left by interrupted teardowns.
+///
+/// Separate from [`maintain_system_profile`]'s reconcile, which only ever
+/// looks at the server being connected. Duplicates belong to whichever server
+/// was up when a connect was interrupted, and nothing was ever going to
+/// connect to that one again just to tidy it — so Network Settings quietly
+/// accumulated two `ProtonVPN JP-FREE#10` entries and kept them.
+async fn tidy_duplicate_profiles() {
+    let removed = blocking(proc::dedupe_proton_connections).await;
+    if removed > 0 {
+        tracing::info!("removed {removed} duplicate ProtonVPN profile(s) from Network Settings");
     }
 }
 
@@ -423,6 +546,11 @@ async fn record(
         tracing::info!("{server} written off on this network for now — see `pvpn blocked`");
     } else if matches!(outcome, ConnectOutcome::TrafficOk) {
         maintain_system_profile(server).await;
+        // Every path that produces a working tunnel comes through here, so
+        // this is where the certificate gets renewed while renewing it is
+        // still cheap. See `renew_certificate_opportunistically`.
+        let cfg = session.config.clone();
+        renew_certificate_opportunistically(&cfg).await;
     }
 }
 
@@ -439,44 +567,132 @@ async fn diagnose(since: chrono::DateTime<Utc>, log: Option<&str>) -> ConnectOut
     }
 }
 
-/// Renew Proton's client certificate over Tor, returning true if the
-/// refresh ran.
+/// Said whenever the certificate is the reason and we could not fix it.
 ///
-/// Proton's refresher only ever tries the direct path, and on a filtered
+/// Worth stating in full every time, because the failure it describes looks
+/// exactly like a network killing every server, and the two send the reader
+/// to opposite places. Nothing is written off for this — see
+/// `certificate_is_to_blame`.
+const CERT_DEAD_END: &str = "The client certificate has expired and could not be renewed on this network.\n\
+     Nothing is wrong with any server, and none has been written off.\n\
+     Start Tor (sudo systemctl start tor) and run `pvpn up` again, or connect \
+     from a network that does not block Proton's API.";
+
+/// Renew Proton's client certificate, returning true if the renewal landed.
+///
+/// Proton's own refresher only ever tries the direct path, and on a filtered
 /// network it logs `Certificate refresh failed: No working transports
-/// found`. After that every connect reaches `Connected` and the local
-/// agent drops it a second later with `ExpiredCertificate`. Tor is the one
-/// transport that reaches the API here, and `protonvpn servers` is what
-/// drives all three refreshers — server list, certificate, client config.
-/// Routing is untouched, so the caller's internet keeps working.
-async fn renew_certificate(cfg: &Config) -> bool {
-    if !blocking(proc::tor_available).await {
+/// found`. After that every connect reaches `Connected` and the local agent
+/// drops it a second later with `ExpiredCertificate`. `protonvpn servers`
+/// is what drives all three refreshers — server list, certificate, client
+/// config — so it is the lever for all of them.
+///
+/// Direct whenever the API answers, Tor only when it does not. Direct is
+/// the faster route and the one Proton serves reliably, and the case this
+/// is most often reached from — a tunnel that is already up and carrying —
+/// has already routed around the block Tor existed to dodge. Routing is
+/// untouched either way, so the caller's internet keeps working.
+pub async fn renew_certificate(cfg: &Config) -> bool {
+    let direct = matches!(
+        blocking(|| net::proton_api_health(6)).await,
+        net::ApiHealth::Answering(_)
+    );
+    let via_tor = !direct && blocking(proc::tor_available).await;
+    if !direct && !via_tor {
         tracing::warn!(
-            "the client certificate needs renewing and Tor is not running — Proton's API is unreachable here. Start it with: sudo systemctl start tor"
+            "the client certificate needs renewing, Proton's API is blocked here and Tor is not running. Start it with: sudo systemctl start tor"
         );
         return false;
     }
-    let shim = match paths::ensure_shim() {
-        Ok(p) => p,
-        Err(_) => paths::shim_dir(),
-    };
+
+    let _ = paths::ensure_shim();
     let timeout = Duration::from_secs(cfg.refresh_timeout_secs);
-    tracing::info!("renewing the client certificate over Tor (routing untouched)");
-    let result = blocking(move || proc::protonvpn_servers_via_tor(&shim, timeout)).await;
-    match result {
-        Ok(r) if r.success => {
-            tracing::info!("certificate renewed — retrying the connect");
+    if direct {
+        tracing::info!("renewing the client certificate (Proton's API is reachable from here)");
+    } else {
+        tracing::info!("renewing the client certificate over Tor (routing untouched)");
+    }
+
+    match blocking(move || cert::renew(via_tor, timeout)).await {
+        Ok(renewed) => {
+            tracing::info!(
+                "certificate renewed — {}",
+                renewed.describe(Utc::now())
+            );
             true
         }
-        _ => {
-            tracing::warn!("could not renew the certificate over Tor");
+        Err(err) => {
+            tracing::warn!("could not renew the certificate: {err}");
             false
         }
     }
 }
 
+/// Renew opportunistically, from inside a tunnel that already works.
+///
+/// This is the one that stops the deadlock happening at all. Proton issues
+/// a seven-day certificate and wants it renewed on day two, leaving a
+/// five-day window in which renewal costs one API call over a tunnel that
+/// is already carrying — no Tor, no interception to route around, nothing
+/// for the user to notice. Miss the whole window and the renewal has to
+/// happen *before* any tunnel exists, on a network that filters Proton by
+/// name, which is exactly the corner this tool kept ending up in.
+///
+/// Never fails a connect. The tunnel is up and working; a certificate for
+/// next week is a bonus, not a precondition.
+async fn renew_certificate_opportunistically(cfg: &Config) {
+    let Some(status) = blocking(cert::status).await else {
+        return;
+    };
+    let now = Utc::now();
+    if !status.renewal_due(now) {
+        return;
+    }
+    tracing::info!(
+        "client certificate {} and Proton's renewal point has passed — renewing through the tunnel",
+        status.describe(now)
+    );
+    if !renew_certificate(cfg).await {
+        // Worth saying and not worth acting on: this tunnel is fine, and
+        // the next connect will try again while there is still time.
+        tracing::warn!(
+            "could not renew the certificate through this tunnel — it still works, but renew before {}",
+            status.describe(now)
+        );
+    }
+}
+
+/// Refuse to start a connect on a certificate Proton will reject.
+///
+/// An expired certificate fails every server identically, one full settle
+/// window each. Before this existed the only way to find out was to spend
+/// those windows: the fast path cannot detect it at all, and the slow path
+/// only learns after Proton has written `ExpiredCertificate` into its log.
+/// Reading the expiry costs a couple of hundred milliseconds and happens
+/// before anything touches the routing table.
+///
+/// Returns the reason to stop, or `None` to carry on.
+async fn ensure_usable_certificate(cfg: &Config) -> Option<String> {
+    // No keyring, no opinion — the log-reading path still catches this
+    // after the fact, exactly as it did before.
+    let status = blocking(cert::status).await?;
+    let now = Utc::now();
+    if !status.unusable(now) {
+        return None;
+    }
+
+    tracing::warn!(
+        "Proton's client certificate {} — no server can work until it is renewed, so nothing will be blamed on one",
+        status.describe(now)
+    );
+    if renew_certificate(cfg).await {
+        return None;
+    }
+    Some(CERT_DEAD_END.to_string())
+}
+
 async fn drop_stale_tunnel() {
-    let connected = if blocking(proc::verified_tunnel_active).await {
+    let connected = if blocking(proc::proton_profile_active).await {
         true
     } else {
         blocking(|| {
@@ -540,6 +756,11 @@ pub async fn compute_full_rank(
 
 pub async fn up(session: &mut Session, protocol: Option<String>) -> UpReport {
     let _ = paths::ensure_shim();
+    // Asking for a tunnel cancels an earlier `pvpn down`. Cleared on entry,
+    // not on success: the user asked for a tunnel either way, so a later
+    // resume should try again rather than stay down because this network
+    // happened to be hostile tonight.
+    intent::clear_down(&Config::data_dir());
     // What we know about servers is filed per network; make sure we are
     // reading the right set before ranking or connecting.
     session.sync_network().await;
@@ -587,21 +808,29 @@ pub async fn up(session: &mut Session, protocol: Option<String>) -> UpReport {
             server: None,
         };
     }
+
+    // Before the fast path, not after it. The fast path activates a saved
+    // NetworkManager profile over D-Bus and never runs Proton's client, so
+    // it has no log to read and cannot tell an expired certificate of ours
+    // from a dead server — it just waits out the settle window and blocks
+    // whatever it was pointed at.
+    if let Some(problem) = ensure_usable_certificate(&cfg).await {
+        return UpReport {
+            ok: false,
+            message: problem,
+            server: None,
+        };
+    }
+
     if let Some(report) = activate_saved_fast_path(session).await {
         return report;
     }
 
     // This check only affects narration, so hide it behind the work that
     // actually decides and establishes the connection.
-    let api_check = tokio::task::spawn_blocking(net::api_reachable);
+    let api_check = tokio::task::spawn_blocking(|| net::proton_api_health(4));
 
-    let proto = {
-        let requested = protocol.clone();
-        blocking(move || {
-            proc::ensure_connect_protocol(requested.as_deref().unwrap_or("protun-tls"))
-        })
-        .await
-    };
+    let proto = prepare_protocol(protocol.clone(), session).await;
     let proto = match proto {
         Ok(p) => p,
         Err(err) => {
@@ -675,13 +904,39 @@ pub async fn up(session: &mut Session, protocol: Option<String>) -> UpReport {
         drop_stale_tunnel().await;
     }
 
-    let api_ok = api_check.await.unwrap_or(false);
-    if api_ok {
-        tracing::info!("Proton's API is reachable — normal network");
-    } else {
-        tracing::warn!(
+    // Reachability and usability are different questions, and only the
+    // first one decides whether to blackhole the API in `/etc/hosts`: a
+    // 503 still proves this network delivers our packets to Proton, so
+    // there is nothing here to route around. It is worth *saying*, though
+    // — an outage reported as a "normal network" sends the user looking
+    // for a fault on their side that does not exist.
+    let health = api_check.await.unwrap_or(net::ApiHealth::Unreachable);
+    let blackholed_by_us = matches!(health, net::ApiHealth::Unreachable)
+        && blocking(proc::api_hosts_blackholed).await;
+    match health {
+        net::ApiHealth::Down(code) => tracing::warn!(
+            "Proton's API answers {code} — this network is fine, Proton is not"
+        ),
+        net::ApiHealth::Answering(_) => {
+            tracing::info!("Proton's API is reachable — normal network")
+        }
+        net::ApiHealth::Intercepted(code) => tracing::warn!(
+            "something answered {code} for Proton's API but it was not Proton — \
+             this network is intercepting it"
+        ),
+        // Ask who made it unreachable before blaming the network. Once our
+        // own blackhole is in, it *is* the reason the API does not answer —
+        // so the un-checked version of this line told you to apply a fix you
+        // had already applied, every single connect, forever.
+        net::ApiHealth::Unreachable if blackholed_by_us => {
+            tracing::info!(
+                "Proton's API is blackholed in /etc/hosts by us — that is why it does not answer. \
+                 Undo with: pvpn fix --unhosts"
+            )
+        }
+        net::ApiHealth::Unreachable => tracing::warn!(
             "filtered network — skipping the /etc/hosts API blackhole (needs sudo). Use: pvpn fix --hosts"
-        );
+        ),
     }
 
     tracing::warn!(
@@ -738,10 +993,11 @@ pub async fn up(session: &mut Session, protocol: Option<String>) -> UpReport {
 
         let attempt_started = Utc::now();
         let attempt_timer = Instant::now();
+        let api_budget = api_budget_secs().await;
         let shim_c = shim.clone();
         let target_c = target.clone();
         let result =
-            blocking(move || proc::protonvpn_connect(target_c.as_deref(), &shim_c, timeout)).await;
+            blocking(move || proc::protonvpn_connect(target_c.as_deref(), &shim_c, timeout, api_budget)).await;
         let result = match result {
             Ok(r) => r,
             Err(err) => {
@@ -796,8 +1052,7 @@ pub async fn up(session: &mut Session, protocol: Option<String>) -> UpReport {
                 return UpReport {
                     ok: false,
                     message:
-                        "The client certificate has expired and could not be renewed on this network. Connect to another network, or start Tor and retry."
-                            .to_string(),
+                        CERT_DEAD_END.to_string(),
                     server: None,
                 };
             }
@@ -943,8 +1198,7 @@ pub async fn up(session: &mut Session, protocol: Option<String>) -> UpReport {
             return UpReport {
                 ok: false,
                 message:
-                    "The client certificate has expired and could not be renewed on this network. Connect to another network, or start Tor and retry."
-                        .to_string(),
+                    CERT_DEAD_END.to_string(),
                 server: None,
             };
         }
@@ -989,6 +1243,12 @@ pub async fn up(session: &mut Session, protocol: Option<String>) -> UpReport {
 }
 
 pub async fn down() -> UpReport {
+    // Record the intent before touching anything. The opt-in resume hook
+    // reads this and stays out of the way; without it, a suspend would put
+    // back the tunnel the user just asked to be rid of. Set it first so it
+    // holds even when the teardown below ends in a warning.
+    intent::mark_down(&Config::data_dir());
+
     // NetworkManager owns the actual tunnel. Proton's status can remain
     // "Connected" after that profile has already disappeared.
     let current = blocking(proc::active_proton_server).await;
@@ -999,6 +1259,7 @@ pub async fn down() -> UpReport {
         }
     }
     let restored = restore().await;
+    tidy_duplicate_profiles().await;
     let stray = blocking(proc::stray_leak_route).await;
     if let Some(dev) = stray {
         // Say this even when IPv4 came back: "Internet is working" while a
@@ -1060,8 +1321,50 @@ fn hop_candidates(session: &Session, exclude: Option<&str>) -> Vec<String> {
     out
 }
 
-pub async fn hop(session: &mut Session, pattern: Option<String>) -> UpReport {
+/// `pvpn up` takes no arguments. Say so, and say where the argument goes.
+///
+/// `up` used to accept a protocol, which read as harmless until you typed
+/// `pvpn up SG-FREE#2`: no protocol is named `SG-FREE#2`, so it fell back to
+/// Stealth, connected to whatever the ranking had picked, and reported
+/// success for a server nobody asked for. Three commands in a row can be
+/// spent that way with nothing in the output admitting the target was
+/// discarded.
+///
+/// Choosing anything is `hop`'s job, so the fix is to have one verb that
+/// chooses for you and one you steer, rather than a first positional whose
+/// meaning depends on whether it happens to collide with a protocol name.
+/// Returns the message to print, or `None` when there is nothing to reject.
+pub fn up_takes_no_arguments(args: &[String]) -> Option<String> {
+    let first = args.first()?;
+    let suggestion = if looks_like_protocol(first) {
+        format!("For a protocol, name a server too: pvpn hop <server> {first}")
+    } else {
+        format!("To choose a server: pvpn hop {first}")
+    };
+    Some(format!(
+        "pvpn up takes no arguments — it connects to the fastest measured server.\n{suggestion}"
+    ))
+}
+
+fn looks_like_protocol(arg: &str) -> bool {
+    proc::TRY_PROTOCOLS
+        .iter()
+        .any(|known| known.eq_ignore_ascii_case(arg))
+        // Anything from a backend family we know, so an unfamiliar protocol
+        // is still recognised as one and pointed at the right verb.
+        || ["protun", "openvpn", "wireguard"]
+            .iter()
+            .any(|family| arg.to_lowercase().starts_with(family))
+}
+
+pub async fn hop(
+    session: &mut Session,
+    pattern: Option<String>,
+    protocol: Option<String>,
+) -> UpReport {
     let _ = paths::ensure_shim();
+    // Same as `up`: hopping is asking for a tunnel.
+    intent::clear_down(&Config::data_dir());
     // What we know about servers is filed per network; make sure we are
     // reading the right set before ranking or connecting.
     session.sync_network().await;
@@ -1081,6 +1384,16 @@ pub async fn hop(session: &mut Session, pattern: Option<String>) -> UpReport {
                 server: None,
             };
         }
+        // `pvpn up SG-FREE#2` lands here, and an expired certificate fails
+        // every server identically. Without this the named server takes the
+        // blame and gets blocked for a fault that was ours.
+        if let Some(problem) = ensure_usable_certificate(&session.config.clone()).await {
+            return UpReport {
+                ok: false,
+                message: problem,
+                server: None,
+            };
+        }
     }
     if pattern.is_none() {
         if let Some(server) = before.as_deref() {
@@ -1091,8 +1404,8 @@ pub async fn hop(session: &mut Session, pattern: Option<String>) -> UpReport {
     }
 
     match pattern {
-        Some(want) => hop_to_pattern(session, want, before).await,
-        None => hop_to_next_best(session, before).await,
+        Some(want) => hop_to_pattern(session, want, before, protocol).await,
+        None => hop_to_next_best(session, before, protocol).await,
     }
 }
 
@@ -1104,7 +1417,11 @@ pub async fn hop(session: &mut Session, pattern: Option<String>) -> UpReport {
 /// accept the result after a single attempt. On a network that kills most
 /// sessions that is one roll of the dice against a list this tool has
 /// already measured and written down.
-async fn hop_to_next_best(session: &mut Session, before: Option<String>) -> UpReport {
+async fn hop_to_next_best(
+    session: &mut Session,
+    before: Option<String>,
+    protocol: Option<String>,
+) -> UpReport {
     let Some(current) = before.clone() else {
         tracing::info!("not connected — just connecting");
         return up(session, None).await;
@@ -1135,7 +1452,7 @@ async fn hop_to_next_best(session: &mut Session, before: Option<String>) -> UpRe
         };
     }
 
-    let proto = match prepare_protocol().await {
+    let proto = match prepare_protocol(protocol, session).await {
         Ok(p) => p,
         Err(err) => {
             return UpReport {
@@ -1223,7 +1540,12 @@ async fn hop_to_next_best(session: &mut Session, before: Option<String>) -> UpRe
 
 /// `pvpn hop JP`, `pvpn hop SG-FREE#12`: you named it, so you get it — one
 /// attempt, and the same verification everything else gets.
-async fn hop_to_pattern(session: &mut Session, want: String, before: Option<String>) -> UpReport {
+async fn hop_to_pattern(
+    session: &mut Session,
+    want: String,
+    before: Option<String>,
+    protocol: Option<String>,
+) -> UpReport {
     let cfg = session.config.clone();
     // Unlike the ranked hop path, this reads Proton's raw account cache
     // directly. Refresh it first so "not found" means the server is absent
@@ -1296,7 +1618,7 @@ async fn hop_to_pattern(session: &mut Session, want: String, before: Option<Stri
         }
     };
 
-    let proto = match prepare_protocol().await {
+    let proto = match prepare_protocol(protocol, session).await {
         Ok(p) => p,
         Err(err) => {
             if let Some(steered) = &steered {
@@ -1318,7 +1640,7 @@ async fn hop_to_pattern(session: &mut Session, want: String, before: Option<Stri
 
     let network = session.network().to_string();
     let primary = if local_only {
-        match activate_saved_and_verify(session, &want, &proto, &network).await {
+        match activate_saved_and_verify(session, &want, &network).await {
             Ok(Some(attempt)) => ConnectAttempt::Connected(attempt),
             Ok(None) => ConnectAttempt::Failed {
                 outcome: ConnectOutcome::ClientError,
@@ -1354,7 +1676,7 @@ async fn hop_to_pattern(session: &mut Session, want: String, before: Option<Stri
                 "Proton's current endpoint for {want} did not carry traffic; trying the locally \
                  saved verified profile"
             );
-            match activate_saved_and_verify(session, &want, &proto, &network).await {
+            match activate_saved_and_verify(session, &want, &network).await {
                 Ok(Some(fallback)) => {
                     used_local_fallback = true;
                     fallback
@@ -1418,7 +1740,7 @@ async fn hop_to_pattern(session: &mut Session, want: String, before: Option<Stri
                 "Proton's current endpoint could not start {want}; trying the locally saved \
                  verified profile"
             );
-            match activate_saved_and_verify(session, &want, &proto, &network).await {
+            match activate_saved_and_verify(session, &want, &network).await {
                 Ok(Some(fallback)) => {
                     used_local_fallback = true;
                     fallback
@@ -1522,11 +1844,49 @@ async fn hop_to_pattern(session: &mut Session, want: String, before: Option<Stri
     }
 }
 
-/// Put the connect protocol where it needs to be — Stealth if this install
-/// has it, since that is the only one these networks let through.
-async fn prepare_protocol() -> anyhow::Result<String> {
-    blocking(|| proc::ensure_connect_protocol("protun-tls")).await
+/// How long the connect's own refresher may spend on Proton's API.
+///
+/// The shim fast-fails API calls so a blocked network does not stall every
+/// connect. That is the right default and the wrong one whenever the API can
+/// actually be reached — a `connect` is the only thing that refreshes the
+/// server list, so starving it there is what leaves the cache permanently
+/// stale. Ask first, then spend accordingly.
+async fn api_budget_secs() -> u64 {
+    match blocking(|| net::proton_api_health(4)).await {
+        net::ApiHealth::Answering(_) => proc::API_TIMEOUT_REACHABLE_SECS,
+        _ => proc::API_TIMEOUT_BLOCKED_SECS,
+    }
 }
+
+/// Put the connect protocol where it needs to be.
+///
+/// Stealth is the default because it is the only one the filtered networks
+/// this tool exists for reliably let through: they pass TCP 443 and drop
+/// UDP to every port OpenVPN and WireGuard use. `want` overrides that, so a
+/// network where the assumption does not hold can be tested and used
+/// without editing Proton's settings by hand — on detnsw, Stealth clears the
+/// port filter but dies waiting on Proton's local agent, which makes the
+/// override the difference between one working protocol and none.
+async fn prepare_protocol(want: Option<String>, session: &Session) -> anyhow::Result<String> {
+    let want = want.or_else(|| {
+        let proven = session.state.proven_protocol();
+        if let Some(p) = &proven {
+            if p != DEFAULT_PROTOCOL {
+                tracing::info!("{p} is what last carried traffic on this network — using it");
+            }
+        }
+        proven
+    });
+    let want = want.unwrap_or_else(|| DEFAULT_PROTOCOL.to_string());
+    blocking(move || proc::ensure_connect_protocol(&want)).await
+}
+
+/// The opening guess on a network nothing is known about yet.
+///
+/// Stealth-over-TLS because these networks pass TCP 443 and little else.
+/// It is only ever a guess: [`State::proven_protocol`] replaces it as soon
+/// as one connect on this network has actually carried traffic.
+const DEFAULT_PROTOCOL: &str = "protun-tls";
 
 /// One connect attempt with the full verification behind it, recorded.
 /// `None` means the tunnel never came up at all.
@@ -1603,10 +1963,16 @@ async fn verify_connected_server(
     }
 }
 
+/// Activate the locally saved profile for a server and see whether it works.
+///
+/// Deliberately takes no protocol: the caller's intended protocol is not what
+/// a saved NetworkManager profile uses, and recording it as though it were is
+/// what taught this tool that `protun-tls` was the fast choice on a network
+/// where it takes a minute. The protocol is read back off the profile that
+/// actually came up.
 async fn activate_saved_and_verify(
     session: &mut Session,
     server: &str,
-    proto: &str,
     network: &str,
 ) -> anyhow::Result<Option<Attempt>> {
     let started = Utc::now();
@@ -1621,8 +1987,11 @@ async fn activate_saved_and_verify(
     let Some(active) = active.filter(|active| active.eq_ignore_ascii_case(server)) else {
         anyhow::bail!("NetworkManager activated a different VPN profile");
     };
+    let protocol = blocking(proc::active_profile_protocol)
+        .await
+        .unwrap_or_default();
     Ok(Some(
-        verify_connected_server(session, active, proto, network, started, timer, true).await,
+        verify_connected_server(session, active, &protocol, network, started, timer, true).await,
     ))
 }
 
@@ -1641,12 +2010,13 @@ async fn connect_and_verify(
     let timeout = Duration::from_secs(cfg.connect_timeout_secs);
     let started = Utc::now();
     let timer = Instant::now();
+    let api_budget = api_budget_secs().await;
     let target_c = connect_target.cloned();
     let expected = expected_server
         .map(str::to_string)
         .or_else(|| connect_target.cloned());
     let result = match blocking(move || {
-        proc::protonvpn_connect(target_c.as_deref(), &shim, timeout)
+        proc::protonvpn_connect(target_c.as_deref(), &shim, timeout, api_budget)
     })
     .await
     {
@@ -1755,5 +2125,39 @@ mod tests {
     fn a_country_hop_accepts_a_server_in_that_country() {
         assert!(super::selected_server_matches("JP-FREE#11", Some("JP")));
         assert!(!super::selected_server_matches("SG-FREE#11", Some("JP")));
+    }
+
+    #[test]
+    fn a_server_name_given_to_up_is_refused_and_redirected() {
+        // `pvpn up SG-FREE#2` used to resolve as a protocol, fail, fall back
+        // to Stealth, and connect to whatever the ranking had picked — which
+        // on 2026-09-02 was SG-FREE#13, announced as a success. Anything but
+        // silence is an improvement; naming the right command is the point.
+        let message = super::up_takes_no_arguments(&["SG-FREE#2".to_string()])
+            .expect("an argument must be refused, never quietly discarded");
+        assert!(message.contains("takes no arguments"));
+        assert!(message.contains("pvpn hop SG-FREE#2"));
+    }
+
+    #[test]
+    fn a_protocol_given_to_up_is_pointed_at_hops_second_argument() {
+        for name in pvpn_core::proc::TRY_PROTOCOLS {
+            let message = super::up_takes_no_arguments(&[name.to_string()])
+                .unwrap_or_else(|| panic!("{name} must be refused"));
+            assert!(
+                message.contains(&format!("pvpn hop <server> {name}")),
+                "{name} should be pointed at hop's protocol argument, got: {message}"
+            );
+        }
+        // A backend this build has not heard of is still recognisably a
+        // protocol, so it gets the protocol advice rather than being read as
+        // a server name.
+        let message = super::up_takes_no_arguments(&["protun-quic".to_string()]).unwrap();
+        assert!(message.contains("pvpn hop <server> protun-quic"));
+    }
+
+    #[test]
+    fn bare_up_still_chooses_for_itself() {
+        assert_eq!(super::up_takes_no_arguments(&[]), None);
     }
 }

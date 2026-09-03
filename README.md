@@ -85,9 +85,16 @@ If `repo.protonvpn.com` is blocked, the Proton repo package and apt/dnf
 refreshes for that host go through Tor automatically (`socks5h://127.0.0.1:9050`).
 
 ```bash
-./setup.sh --no-wizard   # install only, skip login prompts
-./setup.sh --uninstall   # remove the ~/.local pvpn files
+./setup.sh --no-wizard      # install only, skip login prompts
+./setup.sh --uninstall      # remove the ~/.local pvpn files
+./setup.sh --always-on      # also put the tunnel back after a suspend
+./setup.sh --no-always-on   # remove those hooks again
 ```
+
+`--always-on` is opt-in and needs sudo — it is the only part of this
+project that writes outside `$HOME`. Without it, closing the lid suspends,
+the tunnel dies, and DNS stops resolving until you run `pvpn up` again. See
+[docs/always-on.md](docs/always-on.md).
 
 ## Usage
 
@@ -282,6 +289,32 @@ and a Rust CLI check of `pvpn best --quick` against
 
 The deprecated bash script is still exercised as `legacy/pvpn.sh`.
 
+## Surviving suspend
+
+Closing a laptop lid is usually a real suspend, and NetworkManager tears
+the tunnel down whenever logind announces one. Your desktop's own
+lid setting is often a dead key — logind's `HandleLidSwitch` is what
+decides — and Caffeine-style extensions cannot prevent it, because they
+take an *idle* inhibitor and logind's lid handling only respects a
+`handle-lid-switch` **block** inhibitor.
+
+Worse than the dropped tunnel is what it leaves behind: Proton's leak guard
+claims every domain (`~.`) with the nameserver `::1`, systemd-resolved's own
+stub, so DNS resolves nothing at all until you reconnect by hand.
+
+```bash
+./setup.sh --always-on
+```
+
+installs a resume hook that withdraws that stale DNS claim and rebuilds the
+tunnel, plus an optional `logind` drop-in that makes a lid close lock
+rather than suspend. It is event-driven and bounded — not the old `pvpnd`
+supervisor.
+
+A deliberate `pvpn down` is never undone, awake or locked: it holds until
+you run `pvpn up`. `pvpn-autoconnect --off` stops the reconnect entirely.
+[docs/always-on.md](docs/always-on.md) has the evidence and the reasoning.
+
 ## Limits — read before filing a bug
 
 - **A network can pass every reachability check and still refuse the tunnel.**
@@ -302,6 +335,9 @@ The deprecated bash script is still exercised as `legacy/pvpn.sh`.
   OpenVPN-TCP. **Stealth (`protun-tls`) is the default.**
 - `pvpn fix --hosts` edits `/etc/hosts`. Verify that file if the command
   is ever killed with -9.
+- **A suspend always drops the tunnel.** `--always-on` shortens the outage
+  to a reconnect; it cannot make one survive a suspend, and it will not
+  rescue a network that refuses every connect anyway.
 
 ## License
 

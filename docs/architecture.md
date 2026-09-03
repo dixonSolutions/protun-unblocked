@@ -12,9 +12,10 @@ persisted per-network knowledge about servers.
 ## Layout
 
 ```
-crates/pvpn-core/   rank, probe, geo, serverlist, state, config, proc, link
+crates/pvpn-core/   rank, probe, geo, serverlist, state, config, proc, link, intent
 crates/pvpn/        the CLI: connect, verify, blocklist, session, narration
 lib/                Python shims loaded into protonvpn via PYTHONPATH
+system/             opt-in suspend/resume recovery (see always-on.md)
 legacy/             the previous bash tool, and the removed daemon
 ```
 
@@ -148,6 +149,26 @@ learns.
 
 The removed source is kept at `legacy/pvpnd/` for reference.
 
+### What came back, and what did not
+
+One real problem outlived the daemon: a suspend takes the tunnel with it,
+and Proton's leak guard leaves DNS pointed at `::1` afterwards, so the
+machine cannot resolve anything until you notice and run `pvpn` yourself.
+That is not a supervisor's problem to solve — it is a single event with a
+single response.
+
+`setup.sh --always-on` installs that response, and it is shaped to keep
+every objection above satisfied: nothing polls, nothing runs between
+events, retries are capped at three, and a resume or a link coming up is the
+only thing that starts it. It is opt-in and it names itself
+(`pvpn-autoconnect --status`).
+
+It does persist one thing, and the direction is the argument. `pvpn down`
+writes a `down-by-user` marker that `pvpn up` and `pvpn hop` clear, so a
+suspend cannot put back a tunnel you just turned off. `want_up` fought you;
+`want_down` can only ever cause less to happen. See
+[always-on.md](always-on.md).
+
 ## State — `~/.local/share/pvpn/state.json`
 
 The observations are filed **per network** and populated in different ways. A
@@ -207,6 +228,11 @@ need interactive `sudo` and are skipped with a warning:
 
 - blackholing Proton's API in `/etc/hosts`
 - force-deleting a stray `pvpnksintrf0` kill-switch interface
+
+`setup.sh --always-on` is the one thing that installs root-owned files
+rather than asking for sudo at use time — four under `/etc` and
+`/usr/local/sbin`, listed in [always-on.md](always-on.md), removable with
+`setup.sh --no-always-on`.
 
 Use `pvpn fix` (and `pvpn fix --hosts` / `pvpn fix --unhosts`) for those.
 

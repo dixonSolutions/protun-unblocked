@@ -315,6 +315,11 @@ pub fn cmd_fix(hosts: bool, unhosts: bool) -> anyhow::Result<i32> {
     for (_, uuid) in proc::nmcli_proton_connections() {
         proc::nmcli_clear_autoconnect(&uuid);
     }
+    let duplicates = proc::dedupe_proton_connections();
+    if duplicates > 0 {
+        println!("Removed {duplicates} duplicate ProtonVPN profile(s) from Network Settings.");
+        did = true;
+    }
     if !did {
         println!("Nothing privileged to fix. For a temporary API blackhole: pvpn fix --hosts");
     }

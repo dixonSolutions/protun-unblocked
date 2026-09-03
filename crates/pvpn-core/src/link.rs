@@ -210,9 +210,129 @@ where
     neighbour(link)
 }
 
+// --- where traffic actually leaves ------------------------------------------
+
+/// The address the egress question is asked about.
+///
+/// RFC 5737 documentation space: guaranteed never to be a real destination,
+/// so nothing on a normal machine has a host route for it and the answer is
+/// purely "what does the default path look like right now". Asking about a
+/// live address instead — 1.1.1.1 is the tempting one — risks reading back
+/// somebody's DNS host route rather than the tunnel.
+const EGRESS_PROBE_ADDR: &str = "198.51.100.1";
+
+/// Does a device name belong to a VPN tunnel this tool could have built?
+///
+/// Proton's tunnel surfaces as `proton0` (protun), `tunN` (OpenVPN) or a
+/// `wg*` device (WireGuard), depending on protocol. `tailscale0` is a `tun`
+/// device too and is deliberately excluded: it is a second tunnel that can
+/// legitimately own the default route, and counting it would report "we are
+/// tunnelled" about somebody else's tunnel.
+fn is_tunnel_device(device: &str) -> bool {
+    if device.starts_with("tailscale") {
+        return false;
+    }
+    device.starts_with("proton") || device.starts_with("tun") || device.starts_with("wg")
+}
+
+/// Does the machine's traffic actually leave through a tunnel?
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EgressPath {
+    /// The kernel sends public traffic out of a tunnel device.
+    Tunnelled(String),
+    /// The kernel sends public traffic out of something else — whatever
+    /// NetworkManager or Proton's status may claim, there is no tunnel
+    /// carrying this machine's packets.
+    Bypassed(String),
+    /// The route could not be read. Never treated as either answer.
+    Unknown,
+}
+
+impl EgressPath {
+    /// Positive evidence that traffic is *not* tunnelled. Deliberately not
+    /// `!= Tunnelled`, for the same reason [`LinkHealth::is_down`] is not
+    /// `!= Up`: `Unknown` must not decide anything.
+    pub fn is_bypassed(&self) -> bool {
+        matches!(self, EgressPath::Bypassed(_))
+    }
+}
+
+/// Ask the kernel which device public traffic leaves by.
+///
+/// This is a routing-table lookup, not a network round trip: it costs about
+/// a millisecond and answers while the tunnel it is asked about is dead.
+/// That is the whole point — every other way of telling whether a tunnel
+/// works has to send a packet through it and wait out a timeout, and a
+/// tunnel that never came up at all is knowable long before that.
+pub fn egress_path() -> EgressPath {
+    let Ok(result) = run_with_timeout(
+        "ip",
+        &["-4", "route", "get", EGRESS_PROBE_ADDR],
+        &[],
+        Duration::from_secs(3),
+    ) else {
+        return EgressPath::Unknown;
+    };
+    if !result.success {
+        return EgressPath::Unknown;
+    }
+    parse_egress_path(&result.stdout)
+}
+
+fn parse_egress_path(route: &str) -> EgressPath {
+    let Some(device) = route.split_whitespace().collect::<Vec<_>>().windows(2).find_map(|pair| {
+        (pair[0] == "dev").then(|| pair[1].to_string())
+    }) else {
+        return EgressPath::Unknown;
+    };
+    if is_tunnel_device(&device) {
+        EgressPath::Tunnelled(device)
+    } else {
+        EgressPath::Bypassed(device)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_physical_default_route_is_not_a_tunnel() {
+        // The exact state that made `pvpn up` report "verified in 0s" while
+        // every packet was leaving unencrypted over the hotspot.
+        let route = "198.51.100.1 via 172.20.10.1 dev wlp0s20f3 src 172.20.10.2 uid 1000 \n    cache ";
+        assert_eq!(
+            parse_egress_path(route),
+            EgressPath::Bypassed("wlp0s20f3".to_string())
+        );
+        assert!(parse_egress_path(route).is_bypassed());
+    }
+
+    #[test]
+    fn proton_and_openvpn_devices_both_count_as_tunnelled() {
+        assert_eq!(
+            parse_egress_path("198.51.100.1 via 10.2.0.1 dev proton0 src 10.2.0.2 uid 1000 \n    cache "),
+            EgressPath::Tunnelled("proton0".to_string())
+        );
+        assert_eq!(
+            parse_egress_path("198.51.100.1 via 10.8.0.1 dev tun0 src 10.8.0.2 uid 1000 \n    cache "),
+            EgressPath::Tunnelled("tun0".to_string())
+        );
+    }
+
+    #[test]
+    fn tailscale_is_somebody_elses_tunnel() {
+        // A `tun` device by name, but counting it would report "we are
+        // tunnelled" about a tunnel this tool did not build.
+        let route = "198.51.100.1 dev tailscale0 src 100.71.61.85 uid 1000 \n    cache ";
+        assert!(parse_egress_path(route).is_bypassed());
+    }
+
+    #[test]
+    fn an_unreadable_route_decides_nothing() {
+        assert_eq!(parse_egress_path(""), EgressPath::Unknown);
+        assert!(!parse_egress_path("").is_bypassed());
+    }
 
     const WIFI_ONLY: &str = "\
 wlp0s20f3:wifi:connected

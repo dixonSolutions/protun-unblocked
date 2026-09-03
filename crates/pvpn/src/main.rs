@@ -37,8 +37,25 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Connect to the fastest measured server
-    #[command(alias = "connect")]
-    Up { protocol: Option<String> },
+    #[command(
+        alias = "connect",
+        after_help = "\
+pvpn up — connect to the fastest measured server
+
+Takes no arguments. Choosing a server or a protocol is hop's job:
+
+  pvpn hop SG-FREE#2             that server
+  pvpn hop JP                    the best server matching JP
+  pvpn hop SG-FREE#2 protun-tcp  that server, over that protocol"
+    )]
+    Up {
+        /// Not accepted; kept only so a server or protocol name gets a
+        /// straight answer instead of a parser error. `pvpn up SG-FREE#2`
+        /// used to resolve as a protocol, fail, and connect somewhere else
+        /// entirely — silence is the one thing it must not do again.
+        #[arg(hide = true)]
+        rejected: Vec<String>,
+    },
     /// Rank the fastest servers your account can use
     #[command(after_help = "\
 pvpn best — find the fastest servers your account can use
@@ -77,8 +94,15 @@ pvpn best — find the fastest servers your account can use
         offline: bool,
     },
     /// Switch server; optionally one matching e.g. JP, SG-FREE#12
+    ///
+    /// A second argument overrides the protocol for this hop, e.g.
+    /// `pvpn hop SG-FREE#2 openvpn-tcp`. Useful where the default (Stealth)
+    /// is the wrong bet: see `pvpn protocols` for what this install has.
     #[command(alias = "next")]
-    Hop { pattern: Option<String> },
+    Hop {
+        pattern: Option<String>,
+        protocol: Option<String>,
+    },
     /// Disconnect and restore normal internet
     #[command(alias = "disconnect")]
     Down,
@@ -137,6 +161,26 @@ pvpn apps — find Flatpak apps whose traffic skips the tunnel
         /// Remove the /etc/hosts blackhole
         #[arg(long)]
         unhosts: bool,
+    },
+    /// Proton's client certificate: when it expires, and renew it
+    #[command(after_help = "\
+pvpn cert — the credential every server shares
+
+  pvpn cert                 when it expires, and whether renewal is due
+  pvpn cert --renew         renew it now, without connecting
+
+An expired certificate fails every server identically: the tunnel builds,
+Proton's local agent rejects the session a second later, and on the fast
+path there is not even a log line to say so. No server is written off for
+it. Proton issues seven days and wants a renewal on day two, so there is a
+five-day window in which `pvpn up` renews it through the tunnel for free.
+Past that, renewal has to happen before any tunnel exists — which on a
+network that blocks Proton's API means Tor.
+")]
+    Cert {
+        /// Renew it now, without connecting (routing untouched)
+        #[arg(long, short = 'r')]
+        renew: bool,
     },
     /// Servers measured fast on this network
     Fast,
@@ -242,10 +286,10 @@ or a session the far end tore down actually shows up.
 const USAGE: &str = "\
 pvpn - simple Proton VPN control
 
-  pvpn up [protocol]   connect to the fastest measured server
+  pvpn up              connect to the fastest measured server
   pvpn best            rank the fastest servers you can use
   pvpn best --connect  rank them, then connect to the best
-  pvpn hop [match]     switch server; optionally one matching e.g. JP, SG-FREE#12
+  pvpn hop [match] [proto]  switch server; optionally one matching e.g. JP, SG-FREE#12
   pvpn down            disconnect and restore normal internet
   pvpn status          show connection state and protocol
   pvpn ip              show your current public IP
@@ -353,17 +397,21 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
             print!("{USAGE}");
             Ok(0)
         }
-        Command::Up { protocol } => block_on(async move {
+        Command::Up { rejected } => block_on(async move {
+            if let Some(message) = connect::up_takes_no_arguments(&rejected) {
+                eprintln!("{message}");
+                return Ok(2);
+            }
             let mut session = Session::load()?;
             Ok(report(
-                run_interruptible(connect::up(&mut session, protocol)).await,
+                run_interruptible(connect::up(&mut session, None)).await,
             ))
         }),
         Command::Down => block_on(async move { Ok(report(connect::down().await)) }),
-        Command::Hop { pattern } => block_on(async move {
+        Command::Hop { pattern, protocol } => block_on(async move {
             let mut session = Session::load()?;
             Ok(report(
-                run_interruptible(connect::hop(&mut session, pattern)).await,
+                run_interruptible(connect::hop(&mut session, pattern, protocol)).await,
             ))
         }),
         Command::Status => block_on(cmd_status()),
@@ -407,6 +455,7 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
         Command::Try => block_on(login::cmd_try()),
         Command::Protocols => login::cmd_protocols(),
         Command::Fix { hosts, unhosts } => login::cmd_fix(hosts, unhosts),
+        Command::Cert { renew } => block_on(cmd_cert(renew)),
         Command::Fast => block_on(cmd_fast()),
         Command::Working => block_on(cmd_working()),
         Command::Blocked => block_on(cmd_blocked()),
@@ -482,6 +531,29 @@ async fn cmd_status() -> anyhow::Result<i32> {
     println!("Network: {}", session.network());
 
     let mut code = 0;
+
+    // The one piece of state that fails every server at once, and the one
+    // nothing else here would show. A lapsed certificate reads on this
+    // screen as a healthy disconnected client.
+    if let Some(cert) = session::blocking(pvpn_core::cert::status).await {
+        let now = chrono::Utc::now();
+        println!("Certificate: {}", cert.describe(now));
+        if cert.unusable(now) {
+            eprintln!();
+            eprintln!(
+                "No server can connect until the certificate is renewed, and no server is\n\
+                 at fault for that. `pvpn up` renews it — over Tor if this network blocks\n\
+                 Proton's API."
+            );
+            code = 1;
+        } else if cert.renewal_due(now) {
+            eprintln!();
+            eprintln!(
+                "Past Proton's renewal point. `pvpn up` renews it through the tunnel, which\n\
+                 is free; leaving it until it lapses means renewing before any tunnel exists."
+            );
+        }
+    }
     if status.connected && !status.tunneled {
         eprintln!();
         eprintln!(
@@ -499,6 +571,65 @@ async fn cmd_status() -> anyhow::Result<i32> {
         code = 1;
     }
     Ok(code)
+}
+
+/// `pvpn cert` — read the expiry, and optionally renew without connecting.
+///
+/// Renewing is a separate command from connecting because the two failure
+/// modes need separating. "Every server connects and dies" and "the
+/// credential they all share has lapsed" look identical from the outside,
+/// and only one of them is worth trying another server for.
+async fn cmd_cert(renew: bool) -> anyhow::Result<i32> {
+    let session = Session::load()?;
+    let Some(before) = session::blocking(pvpn_core::cert::status).await else {
+        eprintln!(
+            "Could not read the certificate from the keyring.\n\
+             That is not a verdict on it — connects still fall back to reading Proton's log.\n\
+             If you are signed in, check the secret service is running."
+        );
+        return Ok(1);
+    };
+
+    let now = chrono::Utc::now();
+    println!("Certificate: {}", before.describe(now));
+    println!("Expires:     {}", before.expires_at.to_rfc3339());
+    println!(
+        "Renew after: {} ({})",
+        before.refresh_at.to_rfc3339(),
+        if before.renewal_due(now) {
+            "due"
+        } else {
+            "not yet"
+        }
+    );
+
+    if !renew {
+        if before.unusable(now) {
+            eprintln!();
+            eprintln!("Renew it with: pvpn cert --renew");
+            return Ok(1);
+        }
+        if before.renewal_due(now) {
+            eprintln!();
+            eprintln!(
+                "Renewal is due. `pvpn up` does it through the tunnel, which needs nothing else."
+            );
+        }
+        return Ok(0);
+    }
+
+    println!();
+    if !connect::renew_certificate(&session.config).await {
+        return Ok(1);
+    }
+    match session::blocking(pvpn_core::cert::status).await {
+        Some(after) => {
+            println!("Certificate: {}", after.describe(chrono::Utc::now()));
+            println!("Expires:     {}", after.expires_at.to_rfc3339());
+        }
+        None => println!("Renewed."),
+    }
+    Ok(0)
 }
 
 async fn cmd_ip() -> anyhow::Result<i32> {

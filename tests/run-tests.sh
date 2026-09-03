@@ -24,8 +24,19 @@ head_() { printf '\n%s== %s ==%s\n' "$B" "$1" "$X"; }
 FAILED=()
 
 head_ "Bash syntax"
-for script in "$REPO"/legacy/pvpn.sh "$REPO"/bin/pvpn "$REPO"/bin/vpn-check "$REPO"/setup.sh "$HERE"/*.sh; do
+for script in "$REPO"/legacy/pvpn.sh "$REPO"/bin/pvpn "$REPO"/bin/vpn-check \
+              "$REPO"/bin/pvpn-autoconnect "$REPO"/setup.sh "$HERE"/*.sh; do
     if bash -n "$script"; then
+        printf '  ok   %s\n' "${script#"$REPO"/}"
+    else
+        FAILED+=("syntax: ${script#"$REPO"/}")
+    fi
+done
+
+head_ "POSIX sh syntax (system/)"
+for script in "$REPO"/system/pvpn-dns-unsnap "$REPO"/system/pvpn-kick-user \
+              "$REPO"/system/90-pvpn-autoconnect; do
+    if sh -n "$script"; then
         printf '  ok   %s\n' "${script#"$REPO"/}"
     else
         FAILED+=("syntax: ${script#"$REPO"/}")
@@ -43,7 +54,10 @@ fi
 # stays runnable on a bare machine.
 head_ "Linters"
 if command -v shellcheck >/dev/null 2>&1; then
-    if shellcheck "$REPO/legacy/pvpn.sh" "$REPO/bin/pvpn" "$HERE"/*.sh; then
+    if shellcheck "$REPO/legacy/pvpn.sh" "$REPO/bin/pvpn" \
+            "$REPO/bin/pvpn-autoconnect" "$REPO"/system/pvpn-dns-unsnap \
+            "$REPO"/system/pvpn-kick-user "$REPO"/system/90-pvpn-autoconnect \
+            "$HERE"/*.sh; then
         printf '  ok   shellcheck\n'
     else
         FAILED+=("shellcheck")
@@ -79,6 +93,13 @@ if command -v cargo >/dev/null 2>&1; then
     fi
 else
     printf '  --   cargo not installed, skipping Rust tests\n'
+fi
+
+head_ "Always-on recovery"
+if "$HERE/test-always-on.sh"; then
+    printf '  ok   test-always-on.sh\n'
+else
+    FAILED+=("test-always-on.sh")
 fi
 
 head_ "CLI tests: legacy bash pvpn"
