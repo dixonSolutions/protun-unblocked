@@ -170,7 +170,10 @@ mod tests {
         )
         .unwrap();
         let cfg = Config::load(&path).unwrap();
-        assert_eq!(cfg.settle_secs, 120, "the keys that still mean something survive");
+        assert_eq!(
+            cfg.settle_secs, 120,
+            "the keys that still mean something survive"
+        );
         std::fs::remove_dir_all(dir).ok();
     }
 

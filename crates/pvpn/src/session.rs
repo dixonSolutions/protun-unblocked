@@ -77,8 +77,10 @@ impl Session {
     pub async fn status(&self) -> Status {
         let result = blocking(|| proc::protonvpn_status().ok()).await;
         let stdout = result.as_ref().map(|r| r.stdout.as_str()).unwrap_or("");
-        let connected = proc::is_connected(stdout);
-        let server_desc = proc::current_server_desc(stdout);
+        let network_manager_server = blocking(proc::active_proton_server).await;
+        let connected = proc::is_connected(stdout) || network_manager_server.is_some();
+        let server_desc =
+            proc::current_server_desc(stdout).or_else(|| network_manager_server.clone());
         let protocol = blocking(proc::current_protocol).await;
         // Only worth the probes when something claims to be up.
         let tunneled = connected && blocking(proc::tunnel_is_real).await;

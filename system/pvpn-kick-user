@@ -1,0 +1,26 @@
+#!/bin/sh
+# Hand the reconnect to a logged-in user's own systemd manager.
+#
+# pvpn reads Proton's session from the SSO keyring, so it needs that user's
+# D-Bus session bus and cannot usefully run as root. Rather than baking in a
+# username at install time, find whoever is actually logged in with a live
+# bus -- so the same file works on any machine.
+set -u
+
+kicked=0
+for uid in $(loginctl list-users --no-legend 2>/dev/null | awk '$1 >= 1000 {print $1}'); do
+    [ -S "/run/user/$uid/bus" ] || continue
+    user=$(id -nu "$uid" 2>/dev/null) || continue
+    # --no-block so this returns immediately: the connect itself can take well
+    # over a minute, and whatever called us may be on a timeout.
+    runuser -u "$user" -- env \
+        "XDG_RUNTIME_DIR=/run/user/$uid" \
+        "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid/bus" \
+        systemctl --user start --no-block pvpn-autoconnect.service >/dev/null 2>&1 \
+        && kicked=1
+done
+
+# Never fail: this runs from a systemd unit that must not go red just because
+# nobody happens to be logged in.
+[ "$kicked" = 1 ] || true
+exit 0

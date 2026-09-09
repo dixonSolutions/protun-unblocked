@@ -1,0 +1,28 @@
+#!/bin/sh
+# NetworkManager dispatcher: a physical link came back, so repair DNS and
+# reconnect.
+#
+# This script must return immediately. NetworkManager-dispatcher(8) is
+# explicit that scripts "will be killed if they run for too long", and a
+# protun-tls connect takes well over a minute on a filtered network -- far
+# past that limit. A SIGKILL landing mid-connect strands the kill switch and
+# takes all internet with it. So this only starts a systemd unit with
+# --no-block and gets out of the way. Never call pvpn from here.
+set -u
+iface="${1:-}"
+action="${2:-}"
+
+case "$action" in
+    up|dhcp4-change|dhcp6-change) ;;
+    *) exit 0 ;;
+esac
+
+# Skip the tunnel's own interfaces and the usual virtual ones, or bringing a
+# tunnel up retriggers this forever.
+case "$iface" in
+    proton*|ipv6leakintrf*|pvpnks*|tun*|tap*|wg*|tailscale*) exit 0 ;;
+    docker*|veth*|br-*|virbr*|lo) exit 0 ;;
+esac
+
+systemctl start --no-block pvpn-recover.service >/dev/null 2>&1
+exit 0

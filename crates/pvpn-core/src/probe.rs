@@ -275,6 +275,7 @@ mod tests {
             distance_km: None,
             latency_ms: None,
             rating: None,
+            carry: None,
         }
     }
 

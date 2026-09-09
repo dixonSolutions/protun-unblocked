@@ -1,0 +1,15 @@
+[Unit]
+Description=Repair stranded VPN DNS and bring the Proton tunnel back
+Documentation=https://github.com/dixonSolutions/protun-unblocked
+After=suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target NetworkManager.service
+
+[Service]
+Type=oneshot
+# Repair DNS first so the machine has working name resolution immediately,
+# then ask the user session to reconnect. Order matters: the connect needs
+# DNS to reach Proton's API.
+ExecStart=/usr/local/sbin/pvpn-dns-unsnap
+ExecStart=/usr/local/sbin/pvpn-kick-user
+
+[Install]
+WantedBy=suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target

@@ -8,9 +8,13 @@
 
 pub mod apps;
 pub mod cache;
+pub mod cert;
 pub mod config;
+pub mod dbus;
 pub mod display;
 pub mod geo;
+pub mod intent;
+pub mod link;
 pub mod net;
 pub mod paths;
 pub mod pipeline;

@@ -72,6 +72,55 @@ pub struct Candidate {
     pub distance_km: Option<f64>,
     pub latency_ms: Option<f64>,
     pub rating: Option<f64>,
+    /// What real connects on this network have taught us about this server.
+    /// `None` where there is no history to consult — `pvpn best
+    /// --serverlist` and the tests — which ranks exactly as it always did.
+    #[serde(default)]
+    pub carry: Option<CarryRecord>,
+}
+
+/// Real connect attempts on this network, and how many of them carried
+/// traffic.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CarryRecord {
+    pub attempts: u32,
+    pub successes: u32,
+}
+
+/// How much a server's own connect history is worth against its handshake.
+///
+/// Not a weight in the rating — a tier above it. A latency probe opens a TCP
+/// connection and stops there, which on the networks this tool exists for is
+/// precisely the part that always works: the middlebox completes the
+/// handshake and then kills the session behind it. Scoring the two together
+/// lets 40ms of ping outvote twenty-one connects that actually carried
+/// traffic, which is what picked SG-FREE#13 (0 successes in 3 attempts,
+/// 205ms) over SG-FREE#2 (21 successes in 30, 244ms) every time on
+/// 2026-09-02.
+///
+/// So they are ordered, not blended. Within a tier the existing rating
+/// decides, untouched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum CarryTier {
+    /// Has carried traffic here.
+    Proven,
+    /// Never tried here. The honest default, and where every server starts.
+    Unknown,
+    /// Tried here, repeatedly, and never once carried.
+    Failing,
+}
+
+/// One failed connect is noise — a server restarting, a roam, a bad moment.
+/// A pattern needs more than that before a server is ranked below one
+/// nobody has tried.
+const FAILURES_BEFORE_DEMOTION: u32 = 2;
+
+fn carry_tier(carry: Option<CarryRecord>) -> CarryTier {
+    match carry {
+        Some(record) if record.successes > 0 => CarryTier::Proven,
+        Some(record) if record.attempts >= FAILURES_BEFORE_DEMOTION => CarryTier::Failing,
+        _ => CarryTier::Unknown,
+    }
 }
 
 impl Candidate {
@@ -229,11 +278,13 @@ pub fn rank(candidates: &[Candidate]) -> Vec<Candidate> {
         reachable.sort_by(|a, b| {
             let ra = -(a.rating.unwrap_or(0.0));
             let rb = -(b.rating.unwrap_or(0.0));
-            ra.partial_cmp(&rb).unwrap().then(
-                a.latency_ms
-                    .unwrap()
-                    .partial_cmp(&b.latency_ms.unwrap())
-                    .unwrap(),
+            carry_tier(a.carry).cmp(&carry_tier(b.carry)).then(
+                ra.partial_cmp(&rb).unwrap().then(
+                    a.latency_ms
+                        .unwrap()
+                        .partial_cmp(&b.latency_ms.unwrap())
+                        .unwrap(),
+                ),
             )
         });
     } else {
@@ -242,9 +293,13 @@ pub fn rank(candidates: &[Candidate]) -> Vec<Candidate> {
             let rb = -(b.rating.unwrap_or(0.0));
             let da = a.distance_km.unwrap_or(f64::INFINITY);
             let db = b.distance_km.unwrap_or(f64::INFINITY);
-            ra.partial_cmp(&rb)
-                .unwrap()
-                .then(da.partial_cmp(&db).unwrap())
+            // Latency could not be trusted here, which makes the carry
+            // record the *only* measurement of this network in the sort.
+            carry_tier(a.carry).cmp(&carry_tier(b.carry)).then(
+                ra.partial_cmp(&rb)
+                    .unwrap()
+                    .then(da.partial_cmp(&db).unwrap()),
+            )
         });
     }
     unreachable.sort_by(|a, b| {
@@ -264,15 +319,96 @@ pub fn rank_without_probing(candidates: &[Candidate]) -> Vec<Candidate> {
     ordered.sort_by(|a, b| {
         let da = a.distance_km.unwrap_or(f64::INFINITY);
         let db = b.distance_km.unwrap_or(f64::INFINITY);
-        da.partial_cmp(&db)
-            .unwrap()
-            .then(a.load.cmp(&b.load))
-            .then(a.proton_score.partial_cmp(&b.proton_score).unwrap())
+        carry_tier(a.carry).cmp(&carry_tier(b.carry)).then(
+            da.partial_cmp(&db)
+                .unwrap()
+                .then(a.load.cmp(&b.load))
+                .then(a.proton_score.partial_cmp(&b.proton_score).unwrap()),
+        )
     });
     for candidate in ordered.iter_mut() {
         candidate.rating = None;
     }
     ordered
+}
+
+#[cfg(test)]
+mod carry_tests {
+    use super::*;
+
+    fn candidate(name: &str, latency: f64, carry: Option<CarryRecord>) -> Candidate {
+        Candidate {
+            name: name.to_string(),
+            entry_ip: "203.0.113.1".to_string(),
+            country: "SG".to_string(),
+            city: "Singapore".to_string(),
+            tier: 0,
+            load: 50,
+            proton_score: 1.0,
+            distance_km: Some(6300.0),
+            latency_ms: Some(latency),
+            rating: None,
+            carry: Some(carry.unwrap_or_default()),
+        }
+    }
+
+    #[test]
+    fn a_server_that_has_carried_traffic_outranks_a_faster_one_that_never_has() {
+        // The 2026-09-02 pick, exactly: SG-FREE#13 pinged 205ms with 0
+        // successes in 3 attempts and won every time over SG-FREE#2 at
+        // 244ms with 21 successes in 30. A probe opens a TCP connection and
+        // stops, which on this network is the half that always works.
+        let ranked = rank(&[
+            candidate(
+                "SG-FREE#13",
+                204.8,
+                Some(CarryRecord {
+                    attempts: 3,
+                    successes: 0,
+                }),
+            ),
+            candidate(
+                "SG-FREE#2",
+                244.1,
+                Some(CarryRecord {
+                    attempts: 30,
+                    successes: 21,
+                }),
+            ),
+        ]);
+        assert_eq!(ranked[0].name, "SG-FREE#2");
+        assert_eq!(ranked[1].name, "SG-FREE#13");
+    }
+
+    #[test]
+    fn one_bad_night_does_not_demote_a_server_below_an_untried_one() {
+        let ranked = rank(&[
+            candidate(
+                "A#1",
+                300.0,
+                Some(CarryRecord {
+                    attempts: 1,
+                    successes: 0,
+                }),
+            ),
+            candidate("B#1", 200.0, None),
+        ]);
+        assert_eq!(
+            ranked[0].name, "B#1",
+            "faster wins on rating; neither is demoted"
+        );
+        assert_eq!(ranked[1].name, "A#1");
+    }
+
+    #[test]
+    fn with_no_history_the_ranking_is_exactly_what_it_always_was() {
+        let mut fast = candidate("FAST#1", 200.0, None);
+        let mut slow = candidate("SLOW#1", 400.0, None);
+        fast.carry = None;
+        slow.carry = None;
+        let ranked = rank(&[slow, fast]);
+        assert_eq!(ranked[0].name, "FAST#1");
+    }
 }
 
 #[cfg(test)]
@@ -291,6 +427,7 @@ mod tests {
             distance_km: distance,
             latency_ms: latency,
             rating: None,
+            carry: None,
         }
     }
 

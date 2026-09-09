@@ -272,6 +272,12 @@ run_pvpn_isolated() {
         PVPN_SERVERLIST="$FIXTURE" "$PVPN" "$@" 2>&1
 }
 
+# Same, but pinned to a known network so the assertions do not depend on
+# which wifi the machine running the tests happens to be attached to.
+run_pvpn_on_test_network() {
+    PVPN_NETWORK="wifi:test" run_pvpn_isolated "$@"
+}
+
 out="$(run_pvpn_isolated fast)"; status=$?
 assert_status   "fast answers without a daemon" 0 "$status"
 assert_contains "an empty fast list says how it gets filled" "pvpn best" "$out"
@@ -297,6 +303,119 @@ json.dump({
 STATE
 out="$(run_pvpn_isolated blocked)"; status=$?
 assert_status   "a daemon-era state file still loads" 0 "$status"
+
+# --- what this network taught us -----------------------------------------
+#
+# The state file below is one evening on a filtered network written out
+# longhand: a server that worked, one whose session was killed, one that
+# was only ever measured, and two attempts nobody is to blame for. Every
+# assertion here is about the tool telling those apart.
+/usr/bin/python3 - "$STATE_HOME/pvpn/state.json" <<'STATE'
+import json, sys
+from datetime import datetime, timedelta, timezone
+
+now = datetime.now(timezone.utc)
+def ts(**kw):
+    return (now - timedelta(**kw)).isoformat().replace("+00:00", "Z")
+
+def stat(**kw):
+    base = dict(ema_latency_ms=None, samples=1, last_probe_ok=None,
+                status="known", blocked_reason=None, blocked_since=None,
+                consecutive_connect_failures=0, connect_attempts=0,
+                connect_successes=0, last_connect_ok=None, last_tried=None)
+    base.update(kw)
+    return base
+
+def event(server, outcome, minutes, seconds, detail=None):
+    return dict(at=ts(minutes=minutes), server=server, protocol="protun-tls",
+                outcome=outcome, detail=detail, seconds=seconds)
+
+json.dump({"networks": {"wifi:test": {
+    "servers": {
+        "JP-FREE#11": stat(ema_latency_ms=284.0, status="known",
+                           connect_attempts=3, connect_successes=2,
+                           last_connect_ok=ts(hours=3), last_tried=ts(hours=3)),
+        "SG-FREE#13": stat(ema_latency_ms=206.0, status="blocked",
+                           blocked_reason="session-killed",
+                           blocked_since=ts(hours=1),
+                           consecutive_connect_failures=1,
+                           connect_attempts=1, last_tried=ts(hours=1)),
+        "US-FREE#124": stat(ema_latency_ms=290.0, status="known"),
+    },
+    "last_full_rank": {"computed_at": None, "servers": ["SG-FREE#13", "JP-FREE#11"]},
+    "events": [
+        event("SG-FREE#13", "session-killed", 70, 24,
+              "Reached connection error state: Timeout"),
+        event("JP-FREE#11", "link-down", 65, 12),
+        event("JP-FREE#11", "ok", 60, 2),
+    ],
+}}}, open(sys.argv[1], "w"))
+STATE
+
+out="$(run_pvpn_on_test_network working)"; status=$?
+assert_status   "working answers from disk" 0 "$status"
+assert_contains "working lists the server that carried traffic" "JP-FREE#11" "$out"
+assert_contains "working shows the connect record" "2/3 connects worked" "$out"
+assert_not_contains "working excludes a blocked server" "SG-FREE#13" "$out"
+assert_not_contains "working excludes a merely-measured server" "US-FREE#124" "$out"
+
+# The distinction the whole tool turns on: SG-FREE#13 measured *fastest*
+# here and never carried a packet. A list that only ranks latency puts it
+# first; `pvpn fast` has to say what the number is not proof of.
+out="$(run_pvpn_on_test_network fast)"; status=$?
+assert_status   "fast answers from disk" 0 "$status"
+assert_contains "fast says when a quick server never worked" \
+    "never carried traffic here" "$out"
+assert_contains "fast points at the list that is proof" "pvpn working" "$out"
+
+out="$(run_pvpn_on_test_network blocked)"; status=$?
+assert_contains "blocked names the reason" "session-killed" "$out"
+assert_contains "blocked says when it lifts" "retried in" "$out"
+assert_contains "blocked says a block is not permanent" "pvpn forget" "$out"
+
+out="$(run_pvpn_on_test_network servers)"; status=$?
+assert_status   "servers answers from disk" 0 "$status"
+assert_contains "servers names the network" "wifi:test" "$out"
+assert_contains "servers marks a proven server working" "working" "$out"
+assert_contains "servers marks a failed server blocked" "blocked" "$out"
+assert_contains "servers shows the connect record" "2/3" "$out"
+
+out="$(run_pvpn_on_test_network history)"; status=$?
+assert_status   "history answers from disk" 0 "$status"
+assert_contains "history shows the outcome tag" "session-killed" "$out"
+assert_contains "history quotes what said so" \
+    "Reached connection error state: Timeout" "$out"
+assert_contains "history shows how long the verdict took" "24s" "$out"
+# The reason the history exists: a bad evening has to be readable as
+# "three servers failed" or "our own network failed", never as one blur.
+assert_contains "history separates what nobody was blamed for" \
+    "no server was written off" "$out"
+
+out="$(run_pvpn_on_test_network history --json)"
+if printf '%s' "$out" | /usr/bin/python3 -c '
+import json,sys
+d = json.load(sys.stdin)
+assert [e["outcome"] for e in d] == ["ok", "link-down", "session-killed"], d
+assert d[2]["seconds"] == 24, d[2]
+assert d[0]["network"] == "wifi:test", d[0]
+' 2>/dev/null; then
+    pass "history --json is newest-first and tagged with its network"
+else
+    fail "history --json is newest-first and tagged with its network" "$out"
+fi
+
+out="$(run_pvpn_on_test_network forget)"; status=$?
+assert_status   "forget with no argument is an error" 1 "$status"
+assert_contains "forget with no argument says how to use it" "--all" "$out"
+
+out="$(run_pvpn_on_test_network forget SG-FREE#13)"; status=$?
+assert_status   "forget lifts a real block" 0 "$status"
+assert_contains "forget says the server is back" "tried again" "$out"
+
+out="$(run_pvpn_on_test_network blocked)"
+assert_contains "a forgotten server is no longer blocked" "No blocked servers" "$out"
+out="$(run_pvpn_on_test_network servers)"
+assert_contains "and it is back in the table as usable" "SG-FREE#13" "$out"
 
 echo
 if (( FAIL == 0 )); then

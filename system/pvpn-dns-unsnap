@@ -1,0 +1,34 @@
+#!/bin/sh
+# Clear the DNS blackhole Proton's leak guard leaves behind when a tunnel dies.
+#
+# While the tunnel is up, proton0 owns the catch-all routing domain "~." and
+# the physical link's own nameserver is suppressed outright: the Proton
+# connection profile sets ipv4.dns-priority to a negative number, and a
+# negative priority is NetworkManager's "exclusive" mode. `nmcli dev show`
+# still lists the nameserver; `resolvectl dns` shows the link empty.
+#
+# The moment the tunnel goes away, ipv6leakintrf0 claims "~." with the
+# nameserver ::1 -- systemd-resolved's own stub -- so every lookup loops back
+# into the resolver and dies. The journal fills with "Using degraded feature
+# set UDP instead of TCP for DNS server ::1". Nothing clears it on its own,
+# which is why DNS stays dead until pvpn is run again by hand.
+#
+# Reverting the leak guard's claim is only correct once the tunnel is already
+# gone. While a tunnel is up this is exactly the DNS protection you want.
+set -u
+
+# Only a route through the tunnel proves a tunnel.
+if ip route get 1.1.1.1 2>/dev/null | grep -qE 'dev proton[0-9]*'; then
+    exit 0
+fi
+
+changed=0
+for ifc in ipv6leakintrf0 proton0; do
+    ip link show "$ifc" >/dev/null 2>&1 || continue
+    resolvectl revert "$ifc" >/dev/null 2>&1 && changed=1
+done
+
+# With the stale claim gone, nudge NetworkManager to re-publish the nameserver
+# the physical link has held all along.
+[ "$changed" = 1 ] && nmcli general reload dns-full >/dev/null 2>&1
+exit 0

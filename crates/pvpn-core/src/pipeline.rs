@@ -27,6 +27,9 @@ pub struct RankRequest {
     pub extra_keep: Vec<String>,
     /// Currently-blocked names, excluded from the connect sequence.
     pub blocked: HashSet<String>,
+    /// What real connects here have taught us, per server. Empty when there
+    /// is no history to consult, which ranks exactly as it did before.
+    pub carry: HashMap<String, rank::CarryRecord>,
 }
 
 #[derive(Debug, Clone)]
@@ -54,6 +57,7 @@ impl RankRequest {
             rounds: cfg.probe_rounds,
             extra_keep: Vec::new(),
             blocked: HashSet::new(),
+            carry: HashMap::new(),
         }
     }
 
@@ -67,6 +71,19 @@ impl RankRequest {
     ) -> Self {
         self.blocked = state.blocked_names(retry_after, now).into_iter().collect();
         self.extra_keep = state.fast_list().into_iter().map(|(n, _)| n).collect();
+        self.carry = state
+            .servers()
+            .iter()
+            .map(|(name, stat)| {
+                (
+                    name.clone(),
+                    rank::CarryRecord {
+                        attempts: stat.connect_attempts,
+                        successes: stat.connect_successes,
+                    },
+                )
+            })
+            .collect();
         self
     }
 }
@@ -82,6 +99,12 @@ pub async fn rank_servers(req: RankRequest) -> anyhow::Result<RankResult> {
     };
     let mut candidates = serverlist::eligible_servers(&logicals, max_tier, &opts);
     candidates.retain(|c| !req.blocked.contains(&c.name));
+    // Before the shortlist, not after: a server that has carried traffic here
+    // must not be cut for being the 41st nearest before its record is ever
+    // consulted.
+    for candidate in candidates.iter_mut() {
+        candidate.carry = req.carry.get(&candidate.name).copied();
+    }
     if candidates.is_empty() {
         anyhow::bail!(
             "No servers available to this account{}.",
@@ -176,6 +199,7 @@ pub fn quick_request(
         rounds: 0,
         extra_keep: Vec::new(),
         blocked: HashSet::new(),
+        carry: HashMap::new(),
     }
 }
 
@@ -276,6 +300,7 @@ mod tests {
             rounds: 0,
             extra_keep: Vec::new(),
             blocked: ["SG-FREE#2".to_string()].into_iter().collect(),
+            carry: HashMap::new(),
         };
         let result = tokio::runtime::Builder::new_current_thread()
             .enable_all()

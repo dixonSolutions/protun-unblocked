@@ -18,6 +18,7 @@ tokio-native-tls.workspace = true
 chrono.workspace = true
 regex.workspace = true
 dirs = "5"
+zbus = { version = "5.19.0", features = ["blocking-api"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }

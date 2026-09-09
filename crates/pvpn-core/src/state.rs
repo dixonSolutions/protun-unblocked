@@ -39,6 +39,14 @@ pub enum ServerStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerStat {
     pub ema_latency_ms: Option<f64>,
+    /// End-to-end time from starting activation until traffic was verified.
+    ///
+    /// Unlike handshake latency, this includes the VPN plugin's internal
+    /// retries and the readiness probe, so it predicts the wait users feel.
+    #[serde(default)]
+    pub ema_ready_ms: Option<f64>,
+    #[serde(default)]
+    pub ready_samples: u32,
     #[serde(default)]
     pub samples: u32,
     pub last_probe_ok: Option<DateTime<Utc>>,
@@ -47,20 +55,70 @@ pub struct ServerStat {
     pub blocked_since: Option<DateTime<Utc>>,
     #[serde(default)]
     pub consecutive_connect_failures: u32,
+    /// Real connect attempts made to this server here — not probes.
+    #[serde(default)]
+    pub connect_attempts: u32,
+    /// How many of those carried traffic.
+    #[serde(default)]
+    pub connect_successes: u32,
+    /// When one last did. This is what makes a server *known-working* here
+    /// rather than merely fast, and it is the list `pvpn hop` reaches for
+    /// first: a handshake time is a guess, a tunnel that carried traffic on
+    /// this network yesterday is evidence.
+    #[serde(default)]
+    pub last_connect_ok: Option<DateTime<Utc>>,
+    /// When we last asked it for a tunnel, whatever came of it.
+    #[serde(default)]
+    pub last_tried: Option<DateTime<Utc>>,
 }
 
 impl Default for ServerStat {
     fn default() -> Self {
         Self {
             ema_latency_ms: None,
+            ema_ready_ms: None,
+            ready_samples: 0,
             samples: 0,
             last_probe_ok: None,
             status: ServerStatus::Known,
             blocked_reason: None,
             blocked_since: None,
             consecutive_connect_failures: 0,
+            connect_attempts: 0,
+            connect_successes: 0,
+            last_connect_ok: None,
+            last_tried: None,
         }
     }
+}
+
+/// One connect attempt, as it happened. Written by the CLI's `connect`
+/// module, read back by `pvpn history`.
+///
+/// The tool narrates its work to whatever terminal asked for it and then
+/// exits, which is fine while you are watching and useless the next
+/// morning when you want to know whether last night's four failures were
+/// four bad servers or one bad network. This is the copy that outlives the
+/// terminal.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Event {
+    pub at: DateTime<Utc>,
+    pub server: String,
+    pub protocol: String,
+    /// A short machine-readable tag — `"ok"`, `"no-traffic"`,
+    /// `"session-killed"`, `"refused"`, `"cert-expired"`, `"link-down"`.
+    pub outcome: String,
+    /// Whatever said so, in its own words — usually a line from Proton's log.
+    #[serde(default)]
+    pub detail: Option<String>,
+    /// Seconds from starting the connect to knowing how it went. The number
+    /// that says whether verification is fast, and the one to look at
+    /// before touching `settle_secs`.
+    #[serde(default)]
+    pub seconds: Option<u64>,
+    /// Millisecond form used for latency comparisons and machine output.
+    #[serde(default)]
+    pub ready_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -76,6 +134,10 @@ pub struct NetworkState {
     pub servers: HashMap<String, ServerStat>,
     #[serde(default)]
     pub last_full_rank: RankedList,
+    /// Newest last. Bounded by [`MAX_EVENTS`]: this file is read by every
+    /// command, and an unbounded log makes the cheap ones slow.
+    #[serde(default)]
+    pub events: Vec<Event>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -130,6 +192,20 @@ fn hold_for(stat: &ServerStat, base: chrono::Duration) -> chrono::Duration {
         .clamp(1, MAX_BLOCK_ESCALATION);
     base * escalation as i32
 }
+
+/// How many connect attempts to keep per network.
+///
+/// Enough to cover a bad week — a hostile network produces perhaps a dozen
+/// entries in an evening — without turning the file every command reads
+/// into something worth parsing lazily.
+const MAX_EVENTS: usize = 200;
+
+/// How many recent successes [`State::proven_protocol`] weighs.
+///
+/// Small enough that a protocol which stops working here falls out of the
+/// window within an evening's use, large enough that one unlucky slow
+/// connect does not unseat a protocol with a good record.
+const RECENT_SUCCESSES: usize = 10;
 
 impl State {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
@@ -215,11 +291,7 @@ impl State {
     /// that window left the blocked server sitting at the top of the retry
     /// list: the tunnel would fail, the server would be written off, and
     /// the very next attempt went straight back to it.
-    pub fn ranked_targets(
-        &self,
-        retry_after: chrono::Duration,
-        now: DateTime<Utc>,
-    ) -> Vec<String> {
+    pub fn ranked_targets(&self, retry_after: chrono::Duration, now: DateTime<Utc>) -> Vec<String> {
         self.networks
             .get(&self.current)
             .map(|n| {
@@ -264,9 +336,36 @@ impl State {
         entry.blocked_reason = None;
         entry.blocked_since = None;
         entry.last_probe_ok = Some(now);
+        entry.connect_attempts += 1;
+        entry.connect_successes += 1;
+        entry.last_connect_ok = Some(now);
+        entry.last_tried = Some(now);
         if entry.status == ServerStatus::Blocked {
             entry.status = ServerStatus::Known;
         }
+    }
+
+    /// Record end-to-end command latency only after real traffic succeeds.
+    pub fn record_verified_ready(&mut self, name: &str, ready_ms: u64) {
+        let entry = self.here_mut().servers.entry(name.to_string()).or_default();
+        let sample = ready_ms as f64;
+        entry.ema_ready_ms = Some(match entry.ema_ready_ms {
+            Some(previous) => EMA_ALPHA * sample + (1.0 - EMA_ALPHA) * previous,
+            None => sample,
+        });
+        entry.ready_samples += 1;
+    }
+
+    /// We asked this server for a tunnel and the outcome was nobody's
+    /// fault — our certificate had lapsed, or the wifi went away under us.
+    ///
+    /// Records that it was tried, and nothing else. Without this the
+    /// history says a server was never attempted on an evening it was
+    /// attempted four times, which is precisely the evening you go looking.
+    pub fn record_connect_attempt(&mut self, name: &str, now: DateTime<Utc>) {
+        let entry = self.here_mut().servers.entry(name.to_string()).or_default();
+        entry.connect_attempts += 1;
+        entry.last_tried = Some(now);
     }
 
     /// A real connect attempt did not produce a working tunnel. `reason`
@@ -274,6 +373,8 @@ impl State {
     /// `"handshake-closed-early"`, `"refused"`.
     pub fn record_connect_blocked(&mut self, name: &str, reason: &str, now: DateTime<Utc>) {
         let entry = self.here_mut().servers.entry(name.to_string()).or_default();
+        entry.connect_attempts += 1;
+        entry.last_tried = Some(now);
         entry.consecutive_connect_failures += 1;
         entry.status = ServerStatus::Blocked;
         entry.blocked_reason = Some(reason.to_string());
@@ -372,12 +473,202 @@ impl State {
         out
     }
 
+    /// Servers that have actually produced a working tunnel *here*, most
+    /// recently proven first, currently-blocked ones excluded.
+    ///
+    /// Distinct from [`fast_list`](Self::fast_list) on purpose, and the
+    /// distinction is the tool's oldest lesson: latency is measured against
+    /// whatever answers the handshake, which on a network with a
+    /// transparent proxy is the proxy. Only a connect that carried traffic
+    /// gets a server onto this list.
+    pub fn working_list(&self) -> Vec<(String, ServerStat)> {
+        let mut out: Vec<(String, ServerStat)> = self
+            .servers()
+            .iter()
+            .filter(|(_, s)| s.status != ServerStatus::Blocked && s.connect_successes > 0)
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        out.sort_by_key(|(_, s)| std::cmp::Reverse(s.last_connect_ok));
+        out
+    }
+
+    /// Proven servers ordered by expected time to verified traffic.
+    ///
+    /// Success rate is folded into the cost so an occasionally quick but
+    /// unreliable server does not outrank one that consistently works.
+    pub fn fastest_working_list(&self) -> Vec<(String, ServerStat)> {
+        let mut out = self.working_list();
+        out.sort_by(|a, b| {
+            ready_cost(&a.1)
+                .partial_cmp(&ready_cost(&b.1))
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.1.last_connect_ok.cmp(&a.1.last_connect_ok))
+        });
+        out
+    }
+
+    /// When this server's block lifts, if it is blocked.
+    pub fn block_expires_at(
+        &self,
+        name: &str,
+        retry_after: chrono::Duration,
+    ) -> Option<DateTime<Utc>> {
+        let stat = self.servers().get(name)?;
+        if stat.status != ServerStatus::Blocked {
+            return None;
+        }
+        stat.blocked_since
+            .map(|since| since + hold_for(stat, retry_after))
+    }
+
+    /// Lift a block by hand. Returns false if there was nothing to lift.
+    ///
+    /// The escalation counter is cleared too, unlike an expiry: expiring is
+    /// the passage of time and should not forgive a history, while asking
+    /// for this is a person saying they know something the record does not.
+    pub fn unblock(&mut self, name: &str) -> bool {
+        let Some(stat) = self.here_mut().servers.get_mut(name) else {
+            return false;
+        };
+        if stat.status != ServerStatus::Blocked {
+            return false;
+        }
+        stat.status = ServerStatus::Known;
+        stat.blocked_reason = None;
+        stat.blocked_since = None;
+        stat.consecutive_connect_failures = 0;
+        true
+    }
+
+    /// Lift every block on this network. Returns how many were lifted.
+    pub fn unblock_all(&mut self) -> usize {
+        let names: Vec<String> = self
+            .servers()
+            .iter()
+            .filter(|(_, s)| s.status == ServerStatus::Blocked)
+            .map(|(n, _)| n.clone())
+            .collect();
+        names.iter().filter(|n| self.unblock(n)).count()
+    }
+
+    /// Append one connect attempt to this network's history.
+    pub fn record_event(&mut self, event: Event) {
+        let events = &mut self.here_mut().events;
+        events.push(event);
+        if events.len() > MAX_EVENTS {
+            let excess = events.len() - MAX_EVENTS;
+            events.drain(0..excess);
+        }
+    }
+
+    /// This network's connect history, newest first.
+    pub fn events(&self) -> Vec<Event> {
+        self.networks
+            .get(&self.current)
+            .map(|n| n.events.iter().rev().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// The protocol that carries traffic on this network *fastest*.
+    ///
+    /// The default guess for a filtered network is Stealth-over-TLS, and it
+    /// is a good guess right up until it is wrong: detnsw passes TCP 443 and
+    /// drops VPN UDP, so every OpenVPN and WireGuard option dies at the
+    /// transport — but its TLS proxy also terminates anything presenting as
+    /// TLS, which lets `protun-tls` build a tunnel that then takes the better
+    /// part of a minute to pass its first packet. `protun-tcp` is the one
+    /// that threads it, and nothing about the network says so in advance.
+    /// Only a connect that carried traffic does.
+    ///
+    /// This used to read the record as "newest success wins", which is the
+    /// wrong question. Both protocols succeed here. On 2026-09-02 the newest
+    /// success was `protun-tls`, so every connect that morning chose it and
+    /// took 60s to verify, while `protun-tcp` sat in the same history at 7s.
+    /// Recency cannot tell those apart; the recorded `ready_ms` can, and it
+    /// was already being written down.
+    ///
+    /// So: among the last [`RECENT_SUCCESSES`] successes, the protocol with
+    /// the best median time to verified traffic. Capping at the recent ones
+    /// keeps what made recency worth using in the first place — a protocol
+    /// that stops working here stops being chosen once it falls out of the
+    /// window, rather than being defended forever by one fast night months
+    /// ago. Successes with no recorded time still count as evidence that a
+    /// protocol works; they just cannot argue that it is quick, so they lose
+    /// to any protocol that has actually been timed.
+    pub fn proven_protocol(&self) -> Option<String> {
+        let recent: Vec<Event> = self
+            .events()
+            .into_iter()
+            .filter(|e| e.outcome == "ok" && !e.protocol.is_empty())
+            .take(RECENT_SUCCESSES)
+            .collect();
+
+        let mut names: Vec<String> = recent.iter().map(|e| e.protocol.clone()).collect();
+        names.sort();
+        names.dedup();
+
+        let mut protocols: Vec<(String, Option<u64>, DateTime<Utc>)> = names
+            .into_iter()
+            .filter_map(|name| {
+                let mine: Vec<&Event> = recent.iter().filter(|e| e.protocol == name).collect();
+                let mut times: Vec<u64> = mine.iter().filter_map(|e| e.ready_ms).collect();
+                times.sort_unstable();
+                let median = times.get(times.len() / 2).copied();
+                let newest = mine.iter().map(|e| e.at).max()?;
+                Some((name, median, newest))
+            })
+            .collect();
+
+        protocols.sort_by(|a, b| {
+            // An untimed protocol is not "infinitely slow" — it is unproven
+            // as fast. Sorting `None` last says exactly that, and lets
+            // recency settle it among equals.
+            match (a.1, b.1) {
+                (Some(x), Some(y)) => x.cmp(&y),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => std::cmp::Ordering::Equal,
+            }
+            .then_with(|| b.2.cmp(&a.2))
+        });
+        protocols.into_iter().next().map(|(name, _, _)| name)
+    }
+
+    /// Every network's connect history, newest first, tagged with which
+    /// network it happened on. For `pvpn history --all`.
+    pub fn all_events(&self) -> Vec<(String, Event)> {
+        let mut out: Vec<(String, Event)> = self
+            .networks
+            .iter()
+            .flat_map(|(net, n)| n.events.iter().map(move |e| (net.clone(), e.clone())))
+            .collect();
+        out.sort_by_key(|(_, e)| std::cmp::Reverse(e.at));
+        out
+    }
+
+    /// The networks this machine has learned something about.
+    pub fn known_networks(&self) -> Vec<String> {
+        let mut out: Vec<String> = self.networks.keys().cloned().collect();
+        out.sort();
+        out
+    }
+
     pub fn set_last_full_rank(&mut self, servers: Vec<String>, now: DateTime<Utc>) {
         self.here_mut().last_full_rank = RankedList {
             computed_at: Some(now),
             servers,
         };
     }
+}
+
+fn ready_cost(stat: &ServerStat) -> f64 {
+    let latency = stat.ema_ready_ms.unwrap_or(f64::MAX / 4.0);
+    let success_rate = if stat.connect_attempts == 0 {
+        0.0
+    } else {
+        stat.connect_successes as f64 / stat.connect_attempts as f64
+    };
+    latency * (1.0 + 2.0 * (1.0 - success_rate))
 }
 
 #[cfg(test)]
@@ -657,6 +948,366 @@ mod tests {
             .ranked_targets(ChronoDuration::hours(24), Utc::now())
             .is_empty());
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn a_working_list_is_earned_by_carrying_traffic_not_by_being_quick() {
+        // The distinction the whole tool turns on: SG measured fastest and
+        // never carried a packet; JP was slower and worked. `pvpn fast`
+        // ranks the first, `pvpn hop` must reach for the second.
+        let mut state = state_here();
+        let now = Utc::now();
+        state.record_probe("SG-FREE#13", 206.0, now);
+        state.record_probe("JP-FREE#11", 284.0, now);
+        state.record_connect_success("JP-FREE#11", now);
+        let names: Vec<String> = state.working_list().into_iter().map(|(n, _)| n).collect();
+        assert_eq!(names, vec!["JP-FREE#11"]);
+    }
+
+    #[test]
+    fn fastest_working_list_uses_verified_time_and_reliability() {
+        let mut state = state_here();
+        let now = Utc::now();
+        state.record_connect_success("slow", now);
+        state.record_verified_ready("slow", 12_000);
+        state.record_connect_success("fast", now);
+        state.record_verified_ready("fast", 1_500);
+        state.record_connect_attempt("fast", now);
+
+        let names: Vec<String> = state
+            .fastest_working_list()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(names, vec!["fast", "slow"]);
+    }
+
+    #[test]
+    fn verified_time_uses_an_ema_and_survives_missing_old_fields() {
+        let mut state = state_here();
+        state.record_verified_ready("JP-FREE#11", 1_000);
+        state.record_verified_ready("JP-FREE#11", 2_000);
+        let stat = &state.servers()["JP-FREE#11"];
+        assert_eq!(stat.ready_samples, 2);
+        assert_eq!(stat.ema_ready_ms, Some(1_300.0));
+    }
+
+    #[test]
+    fn the_working_list_is_most_recently_proven_first() {
+        let mut state = state_here();
+        let now = Utc::now();
+        state.record_connect_success("JP-FREE#11", now - ChronoDuration::hours(6));
+        state.record_connect_success("US-FREE#124", now);
+        let names: Vec<String> = state.working_list().into_iter().map(|(n, _)| n).collect();
+        assert_eq!(names, vec!["US-FREE#124", "JP-FREE#11"]);
+    }
+
+    #[test]
+    fn a_server_that_stopped_working_drops_off_the_working_list() {
+        let mut state = state_here();
+        let now = Utc::now();
+        state.record_connect_success("JP-FREE#11", now - ChronoDuration::hours(6));
+        state.record_connect_blocked("JP-FREE#11", "session-killed", now);
+        assert!(state.working_list().is_empty());
+        assert_eq!(state.servers()["JP-FREE#11"].connect_attempts, 2);
+        assert_eq!(state.servers()["JP-FREE#11"].connect_successes, 1);
+    }
+
+    #[test]
+    fn an_attempt_nobody_is_to_blame_for_is_still_recorded_as_an_attempt() {
+        // The wifi dropped, or our certificate had lapsed. The server keeps
+        // its standing — but the history must not claim we never tried.
+        let mut state = state_here();
+        let now = Utc::now();
+        state.record_connect_attempt("SG-FREE#13", now);
+        assert_eq!(state.servers()["SG-FREE#13"].connect_attempts, 1);
+        assert_eq!(state.servers()["SG-FREE#13"].status, ServerStatus::Known);
+        assert!(!state.is_blocked("SG-FREE#13", ChronoDuration::hours(24), now));
+    }
+
+    #[test]
+    fn a_block_reports_when_it_lifts() {
+        let mut state = state_here();
+        let now = Utc::now();
+        state.record_connect_blocked("SG-FREE#13", "no-traffic-after-settle", now);
+        assert_eq!(
+            state.block_expires_at("SG-FREE#13", ChronoDuration::hours(24)),
+            Some(now + ChronoDuration::hours(24))
+        );
+        // Twice-failed servers are held longer, and saying so is the point:
+        // "blocked" with no horizon reads as permanent.
+        state.record_connect_blocked("SG-FREE#13", "no-traffic-after-settle", now);
+        assert_eq!(
+            state.block_expires_at("SG-FREE#13", ChronoDuration::hours(24)),
+            Some(now + ChronoDuration::hours(48))
+        );
+        assert_eq!(
+            state.block_expires_at("JP-FREE#11", ChronoDuration::hours(24)),
+            None
+        );
+    }
+
+    #[test]
+    fn forgetting_a_block_forgives_the_escalation_too() {
+        // Unlike an expiry. Time passing should not excuse a bad record;
+        // a person saying "try it again" knows something the record does not.
+        let mut state = state_here();
+        let now = Utc::now();
+        state.record_connect_blocked("SG-FREE#13", "refused", now);
+        state.record_connect_blocked("SG-FREE#13", "refused", now);
+        assert!(state.unblock("SG-FREE#13"));
+        assert_eq!(
+            state.servers()["SG-FREE#13"].consecutive_connect_failures,
+            0
+        );
+        assert!(!state.unblock("SG-FREE#13"), "nothing left to lift");
+    }
+
+    #[test]
+    fn unblock_all_reports_what_it_lifted() {
+        let mut state = state_here();
+        let now = Utc::now();
+        state.record_connect_blocked("SG-FREE#13", "refused", now);
+        state.record_connect_blocked("SG-FREE#21", "no-traffic-after-settle", now);
+        state.record_probe("JP-FREE#11", 284.0, now);
+        assert_eq!(state.unblock_all(), 2);
+        assert!(state.blocked_list().is_empty());
+    }
+
+    #[test]
+    fn history_is_newest_first_and_bounded() {
+        let mut state = state_here();
+        let now = Utc::now();
+        for i in 0..(MAX_EVENTS + 25) {
+            state.record_event(event(&format!("S#{i}"), "ok", now));
+        }
+        let events = state.events();
+        assert_eq!(events.len(), MAX_EVENTS);
+        assert_eq!(events[0].server, format!("S#{}", MAX_EVENTS + 24));
+        assert_eq!(events[MAX_EVENTS - 1].server, "S#25", "the oldest fall off");
+    }
+
+    #[test]
+    fn history_belongs_to_its_network_but_can_be_read_across_all_of_them() {
+        let mut state = State::default();
+        let now = Utc::now();
+        state.set_network("wifi:detnsw");
+        state.record_event(event("SG-FREE#13", "session-killed", now));
+        state.set_network("wifi:hotspot");
+        state.record_event(event("JP-FREE#11", "ok", now + ChronoDuration::minutes(5)));
+
+        assert_eq!(state.events().len(), 1, "only this network's");
+        assert_eq!(state.events()[0].server, "JP-FREE#11");
+
+        let all = state.all_events();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].0, "wifi:hotspot", "newest first, across networks");
+        assert_eq!(all[1].0, "wifi:detnsw");
+    }
+
+    #[test]
+    fn a_state_file_without_the_history_keys_still_loads() {
+        // Every field added here is `#[serde(default)]` for this reason:
+        // upgrading must not throw away what the last version learned.
+        let dir = tempdir();
+        let path = dir.join("pre-history.json");
+        std::fs::write(
+            &path,
+            r#"{"networks":{"wifi:detnsw":{"servers":{"SG-FREE#13":{"ema_latency_ms":206.0,"samples":3,"last_probe_ok":null,"status":"blocked","blocked_reason":"no-traffic-after-settle","blocked_since":null,"consecutive_connect_failures":1}},"last_full_rank":{"computed_at":null,"servers":["SG-FREE#13"]}}}}"#,
+        )
+        .unwrap();
+        let mut state = State::load(&path).unwrap();
+        state.set_network("wifi:detnsw");
+        assert_eq!(state.servers()["SG-FREE#13"].connect_attempts, 0);
+        assert_eq!(state.servers()["SG-FREE#13"].ema_latency_ms, Some(206.0));
+        assert!(state.events().is_empty());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    fn state_here() -> State {
+        let mut state = State::default();
+        state.set_network("wifi:detnsw");
+        state
+    }
+
+    fn event_proto(server: &str, outcome: &str, proto: &str, at: DateTime<Utc>) -> Event {
+        Event {
+            protocol: proto.to_string(),
+            ..event(server, outcome, at)
+        }
+    }
+
+    #[test]
+    fn a_protocol_that_only_ever_failed_is_never_proven() {
+        let mut state = State::default();
+        state.set_network("wifi:detnsw");
+        let t0 = Utc::now();
+        // The real detnsw shape: the default builds a tunnel that never
+        // carries, and a protocol nothing would have guessed does.
+        state.record_event(event_proto("SG-FREE#2", "no-traffic", "protun-tls", t0));
+        state.record_event(event_proto(
+            "SG-FREE#2",
+            "ok",
+            "protun-tcp",
+            t0 + chrono::Duration::seconds(60),
+        ));
+        assert_eq!(state.proven_protocol().as_deref(), Some("protun-tcp"));
+    }
+
+    fn event_timed(
+        server: &str,
+        proto: &str,
+        at: DateTime<Utc>,
+        ready_ms: u64,
+    ) -> Event {
+        Event {
+            ready_ms: Some(ready_ms),
+            seconds: Some(ready_ms.div_ceil(1000)),
+            ..event_proto(server, "ok", proto, at)
+        }
+    }
+
+    #[test]
+    fn the_proven_protocol_is_the_quickest_one_not_the_newest() {
+        // 2026-09-02 on wifi:detnsw, exactly. Both protocols carry traffic
+        // here, so "newest success" cannot tell them apart — and the newest
+        // happened to be the one that takes a minute. Every connect that
+        // morning inherited it and waited out 55s of verification while
+        // protun-tcp sat in the same history at 7s.
+        let mut state = State::default();
+        state.set_network("wifi:detnsw");
+        let t0 = Utc::now();
+        for n in 0..4 {
+            state.record_event(event_timed(
+                "SG-FREE#2",
+                "protun-tcp",
+                t0 + chrono::Duration::minutes(n),
+                6_800,
+            ));
+        }
+        state.record_event(event_timed(
+            "SG-FREE#2",
+            "protun-tls",
+            t0 + chrono::Duration::hours(9),
+            60_141,
+        ));
+        assert_eq!(
+            state.proven_protocol().as_deref(),
+            Some("protun-tcp"),
+            "the newest success is not the same question as the fastest"
+        );
+    }
+
+    #[test]
+    fn a_protocol_that_stops_working_still_falls_out_of_the_window() {
+        // What recency was worth keeping: once the quick protocol stops
+        // succeeding, enough newer successes push it out of the recent
+        // window and the slower one that does work takes over.
+        let mut state = State::default();
+        state.set_network("wifi:detnsw");
+        let t0 = Utc::now();
+        state.record_event(event_timed("SG-FREE#2", "protun-tcp", t0, 6_800));
+        for n in 1..=RECENT_SUCCESSES {
+            state.record_event(event_timed(
+                "SG-FREE#2",
+                "protun-tls",
+                t0 + chrono::Duration::minutes(n as i64),
+                60_000,
+            ));
+        }
+        assert_eq!(state.proven_protocol().as_deref(), Some("protun-tls"));
+    }
+
+    #[test]
+    fn an_untimed_success_loses_to_a_timed_one() {
+        // A saved-profile activation records no protocol at all now, but an
+        // older history still holds successes with no `ready_ms`. They prove
+        // a protocol works; they cannot argue that it is quick.
+        let mut state = State::default();
+        state.set_network("wifi:detnsw");
+        let t0 = Utc::now();
+        state.record_event(event_timed("SG-FREE#2", "protun-tcp", t0, 6_800));
+        state.record_event(event_proto(
+            "SG-FREE#2",
+            "ok",
+            "openvpn-udp",
+            t0 + chrono::Duration::hours(1),
+        ));
+        assert_eq!(state.proven_protocol().as_deref(), Some("protun-tcp"));
+    }
+
+    #[test]
+    fn an_event_with_no_protocol_never_chooses_one() {
+        // The fast path records an empty protocol when it cannot read one
+        // off the profile it activated. That must stay invisible here rather
+        // than becoming a vote for whatever `settings.json` last held.
+        let mut state = State::default();
+        state.set_network("wifi:detnsw");
+        let t0 = Utc::now();
+        state.record_event(event_timed("SG-FREE#2", "protun-tcp", t0, 6_800));
+        state.record_event(event_timed(
+            "SG-FREE#2",
+            "",
+            t0 + chrono::Duration::hours(1),
+            1_064,
+        ));
+        assert_eq!(
+            state.proven_protocol().as_deref(),
+            Some("protun-tcp"),
+            "a 1s activation of an already-up tunnel is not a protocol result"
+        );
+    }
+
+    #[test]
+    fn a_later_success_supersedes_an_earlier_one() {
+        let mut state = State::default();
+        state.set_network("wifi:detnsw");
+        let t0 = Utc::now();
+        state.record_event(event_proto("A#1", "ok", "protun-tcp", t0));
+        state.record_event(event_proto(
+            "A#1",
+            "ok",
+            "openvpn-udp",
+            t0 + chrono::Duration::seconds(60),
+        ));
+        assert_eq!(
+            state.proven_protocol().as_deref(),
+            Some("openvpn-udp"),
+            "self-correcting when the network changes under us"
+        );
+    }
+
+    #[test]
+    fn a_network_with_no_success_yet_keeps_the_callers_default() {
+        let mut state = State::default();
+        state.set_network("wifi:new");
+        state.record_event(event_proto("A#1", "session-killed", "protun-tls", Utc::now()));
+        assert_eq!(state.proven_protocol(), None);
+    }
+
+    #[test]
+    fn what_worked_on_one_network_does_not_choose_for_another() {
+        let mut state = State::default();
+        state.set_network("wifi:detnsw");
+        state.record_event(event_proto("SG-FREE#2", "ok", "protun-tcp", Utc::now()));
+        state.set_network("wifi:cafe");
+        assert_eq!(
+            state.proven_protocol(),
+            None,
+            "detnsw's answer is not the cafe's"
+        );
+    }
+
+    fn event(server: &str, outcome: &str, at: DateTime<Utc>) -> Event {
+        Event {
+            at,
+            server: server.to_string(),
+            protocol: "protun-tls".to_string(),
+            outcome: outcome.to_string(),
+            detail: None,
+            seconds: Some(24),
+            ready_ms: Some(24_000),
+        }
     }
 
     /// One directory per call. These tests run concurrently and used to

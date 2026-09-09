@@ -14,6 +14,8 @@ Patches:
      default 45) so a real handshake has time to finish.
   4. Let a free account name a free server, so `pvpn best` can act on what
      it measured instead of only reporting it.
+  5. Route the API through a SOCKS proxy when PVPN_SOCKS is set, so a
+     network that blocks Proton by name can still renew a certificate.
 """
 import os
 from contextlib import asynccontextmanager
@@ -168,6 +170,59 @@ try:
         )
 
     _Controller.find_logical_server = _patched_find_logical_server
+
+except Exception:
+    pass
+
+
+# --- 5. Reach the API through a SOCKS proxy -----------------------------
+#
+# Set PVPN_SOCKS=socks5h://127.0.0.1:9050 to send Proton's API calls over
+# Tor. This exists because `torsocks` cannot do the job.
+#
+# torsocks works by LD_PRELOADing over libc's socket calls, and Proton's
+# default transport is aiohttp. Measured on wifi:detnsw, 2026-08-31:
+# `torsocks protonvpn ...` spent eleven minutes failing, because
+# AlternativeRouting resolves the API through public DNS-over-HTTPS
+# resolvers and races their IPv6 addresses (2620:fe::fe:11,
+# 2001:4860:4860::8844), which torsocks answers with ENOSYS - "Function not
+# implemented" - and then the whole fan-out has to time out. A direct curl
+# through the same Tor daemon answered in 2.5s.
+#
+# So: use RequestsTransport, which is synchronous and whose `requests`
+# session takes a socks5h:// proxy natively via PySocks, and make it the
+# *only* transport, so AlternativeRouting's DoH fan-out never starts. The
+# `h` matters - it resolves the hostname at the exit node, so this machine
+# never asks the filtered network's resolver about a Proton domain.
+try:
+    _socks = os.environ.get("PVPN_SOCKS", "").strip()
+    if _socks:
+        import requests as _requests
+        from proton.session.transports.auto import AutoTransport as _Auto
+        from proton.session.transports.requests import (
+            RequestsTransport as _Requests,
+        )
+
+        _orig_requests_init = _Requests.__init__
+
+        def _proxied_requests_init(self, session, requests_session=None):
+            http = requests_session or _requests.Session()
+            http.proxies = {"http": _socks, "https": _socks}
+            _orig_requests_init(self, session, http)
+
+        _Requests.__init__ = _proxied_requests_init
+
+        # Wraps whatever patch 1 installed, and has the last word on the
+        # transport list.
+        _pre_socks_auto_init = _Auto.__init__
+
+        def _socks_only_auto_init(
+            self, session, transport_choices=None, transport_timeout=None
+        ):
+            _pre_socks_auto_init(self, session, transport_choices, transport_timeout)
+            self._transport_choices = [(0, _Requests)]
+
+        _Auto.__init__ = _socks_only_auto_init
 
 except Exception:
     pass
