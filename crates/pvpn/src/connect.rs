@@ -561,6 +561,15 @@ async fn diagnose(since: chrono::DateTime<Utc>, log: Option<&str>) -> ConnectOut
     if matches!(blocking(link::health).await, LinkHealth::Down) {
         return ConnectOutcome::LocalNetworkDown;
     }
+    // Proton prints "Authentication required / Please sign in" when Secret
+    // Service is locked and the session cannot be loaded — even though the
+    // account is still in the keyring. Prefer Proton's own log over that
+    // wording; signing in again is the wrong fix.
+    if log.is_some_and(blocklist::log_says_auth_required)
+        && blocking(move || proc::keyring_locked_since(since)).await
+    {
+        return ConnectOutcome::KeyringLocked;
+    }
     match log {
         Some(text) => blocklist::classify_failure(text),
         None => ConnectOutcome::ConnectedNoTraffic,
@@ -577,6 +586,16 @@ const CERT_DEAD_END: &str = "The client certificate has expired and could not be
      Nothing is wrong with any server, and none has been written off.\n\
      Start Tor (sudo systemctl start tor) and run `pvpn up` again, or connect \
      from a network that does not block Proton's API.";
+
+/// Proton said "sign in" because the desktop keyring was locked.
+const KEYRING_LOCKED_DETAIL: &str = "the desktop keyring was locked, so Proton could not read your \
+still-signed-in session. Unlock the keyring (or unlock your desktop login) and try again — \
+do not sign out; `protonvpn signin` will only say you are already signed in.";
+
+/// Said when every ranked attempt dies on a locked keyring.
+const KEYRING_LOCKED_DEAD_END: &str = "The desktop keyring was locked, so Proton could not read your \
+still-signed-in session.\nNothing is wrong with any server, and none has been written off.\n\
+Unlock the keyring (or unlock your desktop login) and run `pvpn up` again — do not sign out.";
 
 /// Renew Proton's client certificate, returning true if the renewal landed.
 ///
@@ -1202,6 +1221,20 @@ pub async fn up(session: &mut Session, protocol: Option<String>) -> UpReport {
                 server: None,
             };
         }
+        if matches!(outcome, ConnectOutcome::KeyringLocked) {
+            tracing::warn!(
+                "Proton asked for sign-in because the desktop keyring was locked — the account is still signed in"
+            );
+            if let Some(name) = &target {
+                record(session, name, &proto, outcome, None, None).await;
+            }
+            restore().await;
+            return UpReport {
+                ok: false,
+                message: KEYRING_LOCKED_DEAD_END.to_string(),
+                server: None,
+            };
+        }
         if let Some(name) = &target {
             record(session, name, &proto, outcome, None, None).await;
         }
@@ -1734,19 +1767,35 @@ async fn hop_to_pattern(
                 server: None,
             };
         }
-        ConnectAttempt::Failed { outcome, detail } if forced_unavailable && !local_only => {
+        ConnectAttempt::Failed { outcome, detail }
+            if !local_only
+                && (forced_unavailable || matches!(outcome, ConnectOutcome::KeyringLocked)) =>
+        {
             restore().await;
-            tracing::warn!(
-                "Proton's current endpoint could not start {want}; trying the locally saved \
-                 verified profile"
-            );
+            if matches!(outcome, ConnectOutcome::KeyringLocked) {
+                tracing::warn!(
+                    "Proton could not read the signed-in session (keyring locked); trying the \
+                     locally saved verified profile for {want}"
+                );
+            } else {
+                tracing::warn!(
+                    "Proton's current endpoint could not start {want}; trying the locally saved \
+                     verified profile"
+                );
+            }
             match activate_saved_and_verify(session, &want, &network).await {
                 Ok(Some(fallback)) => {
                     used_local_fallback = true;
                     fallback
                 }
                 fallback => {
-                    record(session, &want, &proto, outcome, None, None).await;
+                    // Normal hops already recorded the primary failure inside
+                    // connect_and_verify. The forced-unavailable path deferred
+                    // that so a successful local fallback would not leave a
+                    // bogus block attempt behind.
+                    if forced_unavailable {
+                        record(session, &want, &proto, outcome, None, None).await;
+                    }
                     let fallback_detail = match fallback {
                         Ok(None) => "no locally saved profile exists".to_string(),
                         Err(err) => err.to_string(),
@@ -1754,10 +1803,17 @@ async fn hop_to_pattern(
                     };
                     return UpReport {
                         ok: false,
-                        message: format!(
-                            "Proton marks {want} unavailable. Its current endpoint failed: \
-                             {detail}\nLocal fallback also failed: {fallback_detail}"
-                        ),
+                        message: if matches!(outcome, ConnectOutcome::KeyringLocked) {
+                            format!(
+                                "{want}: {detail}\nLocal saved-profile fallback also failed: \
+                                 {fallback_detail}"
+                            )
+                        } else {
+                            format!(
+                                "Proton marks {want} unavailable. Its current endpoint failed: \
+                                 {detail}\nLocal fallback also failed: {fallback_detail}"
+                            )
+                        },
                         server: None,
                     };
                 }
@@ -1919,11 +1975,20 @@ fn connect_failure_detail(log: &str) -> String {
                 || lower.contains("not available")
                 || lower.contains("not allowed")
                 || lower.contains("unable")
+                || lower.contains("authentication required")
         })
         .or_else(|| lines.last())
         .copied()
         .unwrap_or("Proton exited before creating a tunnel")
         .to_string()
+}
+
+/// Prefer a human explanation over Proton's false "please sign in" wording.
+fn explain_connect_failure(outcome: ConnectOutcome, log: &str) -> String {
+    match outcome {
+        ConnectOutcome::KeyringLocked => KEYRING_LOCKED_DETAIL.to_string(),
+        _ => connect_failure_detail(log),
+    }
 }
 
 fn selected_server_matches(actual: &str, expected: Option<&str>) -> bool {
@@ -2050,7 +2115,7 @@ async fn connect_and_verify(
                 record(session, name, proto, outcome, None, None).await;
             }
         }
-        let detail = connect_failure_detail(&log);
+        let detail = explain_connect_failure(outcome, &log);
         tracing::warn!(
             "{} did not connect: {detail}",
             expected.as_deref().unwrap_or("that server")
@@ -2107,6 +2172,17 @@ mod tests {
             ),
             "Error: server selection is not available for this account"
         );
+    }
+
+    #[test]
+    fn a_locked_keyring_is_not_reported_as_please_sign_in() {
+        let detail = super::explain_connect_failure(
+            crate::blocklist::ConnectOutcome::KeyringLocked,
+            "Error: Authentication required.Please sign in with 'protonvpn signin' before connecting.",
+        );
+        assert!(detail.contains("keyring was locked"));
+        assert!(detail.contains("still-signed-in"));
+        assert!(!detail.to_lowercase().contains("please sign in"));
     }
 
     #[test]

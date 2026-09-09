@@ -1210,6 +1210,19 @@ fn active_wired_device() -> Option<String> {
 /// why a tunnel would not carry traffic.
 const CERT_FAILURE_MARKERS: [&str; 2] = ["ExpiredCertificate", "Certificate refresh failed"];
 
+/// Lines that mean Secret Service could not open the SSO session store.
+///
+/// Proton's CLI then reports `Authentication required` / `Please sign in`,
+/// which is a false alarm: the account is still in the keyring, just locked.
+/// Measured on `wifi:detnsw`, 2026-09-09 21:54 UTC — `pvpn hop SG-FREE#2`
+/// failed that way, then `protonvpn signin` correctly refused with
+/// "Already signed in".
+const KEYRING_LOCKED_MARKERS: [&str; 3] = [
+    "KeyringLocked",
+    "Failed to unlock the collection!",
+    "Keyring is locked",
+];
+
 /// How much of the log tail to read. Comfortably more than one connect
 /// attempt writes, far less than the whole file.
 const LOG_TAIL_BYTES: u64 = 256 * 1024;
@@ -1237,6 +1250,27 @@ impl ProtonLogSnapshot {
         })
     }
 
+    pub fn keyring_locked_since(&self, since: chrono::DateTime<chrono::Utc>) -> bool {
+        // The useful markers live on the traceback body (`KeyringLocked`,
+        // `Failed to unlock the collection!`), which has no timestamp of its
+        // own. Carry the nearest preceding Proton log timestamp forward so a
+        // locked keyring in this attempt is still attributed to it.
+        let mut last_ts = None;
+        for line in self.text.lines() {
+            if let Some(ts) = line_timestamp(line) {
+                last_ts = Some(ts);
+            }
+            if KEYRING_LOCKED_MARKERS
+                .iter()
+                .any(|marker| line.contains(marker))
+                && last_ts.is_some_and(|ts| ts >= since)
+            {
+                return true;
+            }
+        }
+        false
+    }
+
     pub fn session_death_since(&self, since: chrono::DateTime<chrono::Utc>) -> Option<String> {
         find_session_death(&self.text, since)
     }
@@ -1257,6 +1291,14 @@ impl ProtonLogSnapshot {
 /// prompted the renewal it has since done.
 pub fn cert_failure_since(since: chrono::DateTime<chrono::Utc>) -> bool {
     ProtonLogSnapshot::recent().cert_failure_since(since)
+}
+
+/// Did Proton fail to open the desktop keyring since `since`?
+///
+/// This is what turns "Authentication required. Please sign in" into the
+/// truth: you are still signed in; Secret Service would not unlock.
+pub fn keyring_locked_since(since: chrono::DateTime<chrono::Utc>) -> bool {
+    ProtonLogSnapshot::recent().keyring_locked_since(since)
 }
 
 /// Lines that mean the session this attempt built is over.
@@ -1310,11 +1352,16 @@ fn summarise_log_line(line: &str) -> String {
 }
 
 /// Proton's log lines start `2026-08-23T22:17:11.152816+00:00 | ...`.
-fn line_is_after(line: &str, cutoff: chrono::DateTime<chrono::Utc>) -> bool {
+fn line_timestamp(line: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     line.split_whitespace()
         .next()
         .and_then(|ts| chrono::DateTime::parse_from_rfc3339(ts).ok())
-        .map(|ts| ts.with_timezone(&chrono::Utc) >= cutoff)
+        .map(|ts| ts.with_timezone(&chrono::Utc))
+}
+
+fn line_is_after(line: &str, cutoff: chrono::DateTime<chrono::Utc>) -> bool {
+    line_timestamp(line)
+        .map(|ts| ts >= cutoff)
         .unwrap_or(false)
 }
 
@@ -1705,6 +1752,33 @@ enp2s0:ethernet:unavailable
         let before = "2026-08-23T22:00:00+00:00".parse().unwrap();
         assert!(!super::cert_failure_since(before));
         std::env::remove_var("PVPN_PROTON_LOG");
+    }
+
+    /// Verbatim from the hop that reported "Authentication required" while
+    /// the account was still signed in — Secret Service was locked.
+    const KEYRING_LOCKED_LOG: &str = "\
+2026-09-09T21:54:54.665655+00:00 | proton.keyring_linux.core.keyring_linux:120 | ERROR | Keyring keyring.backends.SecretService.Keyring (priority: 5) error
+Traceback (most recent call last):
+  File \"/usr/lib/python3/dist-packages/keyring/backends/SecretService.py\", line 68, in get_preferred_collection
+    raise KeyringLocked(\"Failed to unlock the collection!\")
+keyring.errors.KeyringLocked: Failed to unlock the collection!
+2026-09-09T21:54:57.031427+00:00 | proton.vpn.core.vpnconnector:479 | INFO | CONN:STATE_CHANGED | Disconnected (initial state)
+";
+
+    #[test]
+    fn a_locked_keyring_in_the_window_is_seen() {
+        with_log(KEYRING_LOCKED_LOG, || {
+            let before = "2026-09-09T21:54:00+00:00".parse().unwrap();
+            assert!(super::keyring_locked_since(before));
+        });
+    }
+
+    #[test]
+    fn a_locked_keyring_from_before_the_attempt_is_ignored() {
+        with_log(KEYRING_LOCKED_LOG, || {
+            let after = "2026-09-09T22:00:00+00:00".parse().unwrap();
+            assert!(!super::keyring_locked_since(after));
+        });
     }
 
     use super::*;

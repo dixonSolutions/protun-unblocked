@@ -35,6 +35,15 @@ pub enum ConnectOutcome {
     /// Account restrictions, stale inventory, authentication failures and
     /// unknown client errors say nothing reliable about the server itself.
     ClientError,
+    /// The desktop keyring was locked, so Proton could not read a session
+    /// that is still signed in.
+    ///
+    /// Proton's CLI reports this as `Authentication required` / `Please
+    /// sign in`, which sends people to `protonvpn signin` — and that then
+    /// refuses with "Already signed in". The account never left; Secret
+    /// Service would not unlock. Not the server's fault, and signing out
+    /// is the wrong fix.
+    KeyringLocked,
     /// *Our own* uplink went away mid-attempt — the wifi dropped, or the
     /// machine roamed to another network.
     ///
@@ -54,6 +63,7 @@ impl ConnectOutcome {
             ConnectOutcome::TrafficOk
             | ConnectOutcome::CertificateExpired
             | ConnectOutcome::ClientError
+            | ConnectOutcome::KeyringLocked
             | ConnectOutcome::LocalNetworkDown => None,
             ConnectOutcome::ConnectedNoTraffic => Some("no-traffic-after-settle"),
             ConnectOutcome::Refused => Some("refused"),
@@ -75,6 +85,7 @@ impl ConnectOutcome {
             ConnectOutcome::SessionKilled => "session-killed",
             ConnectOutcome::CertificateExpired => "cert-expired",
             ConnectOutcome::ClientError => "client-error",
+            ConnectOutcome::KeyringLocked => "keyring-locked",
             ConnectOutcome::LocalNetworkDown => "link-down",
         }
     }
@@ -94,6 +105,7 @@ pub fn apply(state: &mut State, name: &str, outcome: ConnectOutcome, now: DateTi
         // evening you go looking at.
         ConnectOutcome::CertificateExpired
         | ConnectOutcome::ClientError
+        | ConnectOutcome::KeyringLocked
         | ConnectOutcome::LocalNetworkDown => state.record_connect_attempt(name, now),
         other => {
             if let Some(reason) = other.reason() {
@@ -125,6 +137,14 @@ pub fn classify_failure(log: &str) -> ConnectOutcome {
     } else {
         ConnectOutcome::ClientError
     }
+}
+
+/// Proton's CLI wording when it cannot see a logged-in session.
+///
+/// Often a lie caused by a locked keyring — see [`ConnectOutcome::KeyringLocked`].
+pub fn log_says_auth_required(log: &str) -> bool {
+    let lower = log.to_lowercase();
+    lower.contains("authentication required") || lower.contains("please sign in")
 }
 
 /// The CLI does not always name this, which is why `connect` also consults
@@ -231,6 +251,7 @@ mod tests {
             ConnectOutcome::SessionKilled,
             ConnectOutcome::CertificateExpired,
             ConnectOutcome::ClientError,
+            ConnectOutcome::KeyringLocked,
             ConnectOutcome::LocalNetworkDown,
         ] {
             assert!(!outcome.tag().is_empty());
@@ -239,6 +260,7 @@ mod tests {
         assert!(!ConnectOutcome::LocalNetworkDown.blames_the_server());
         assert!(!ConnectOutcome::CertificateExpired.blames_the_server());
         assert!(!ConnectOutcome::ClientError.blames_the_server());
+        assert!(!ConnectOutcome::KeyringLocked.blames_the_server());
         assert!(!ConnectOutcome::TrafficOk.blames_the_server());
     }
 
@@ -322,5 +344,13 @@ mod tests {
             classify_failure("unexpected proton client failure"),
             ConnectOutcome::ClientError
         ));
+    }
+
+    #[test]
+    fn proton_asking_for_signin_is_recognised_as_auth_required() {
+        assert!(log_says_auth_required(
+            "Error: Authentication required.Please sign in with 'protonvpn signin' before connecting."
+        ));
+        assert!(!log_says_auth_required("Connection failed."));
     }
 }

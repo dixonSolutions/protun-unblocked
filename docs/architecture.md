@@ -52,6 +52,15 @@ refusal, TLS-handshake, or session-death evidence can attribute such a failure
 to the server; account restrictions, authentication, certificate, unknown
 client errors, and local-link failures cannot.
 
+One authentication message is a known false alarm. When Secret Service is
+locked, Proton's CLI prints `Authentication required` / `Please sign in`
+without ever starting a tunnel. The SSO session is still in the keyring —
+`protonvpn signin` then refuses with "Already signed in". `pvpn` reads
+`KeyringLocked` from Proton's own log, classifies the attempt as
+`keyring-locked`, tells you to unlock the keyring rather than sign out, and
+on a named hop tries the locally saved NetworkManager profile (which already
+holds the credentials).
+
 An explicit `pvpn hop <server>` prefers Proton's current inventory. If Proton
 marks that exact server unavailable but still supplies an endpoint, `pvpn`
 warns, temporarily enables only that endpoint in the cache, and verifies the
