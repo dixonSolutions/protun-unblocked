@@ -69,8 +69,12 @@ esac
 # turning the VPN off would turn it back on again.
 [[ -e "$DOWN_MARKER" ]] && exit 0
 
-# One connect at a time — pvpn has no inter-process lock of its own, and two
-# overlapping connects are what strand the kill switch.
+# One autoconnect at a time. The connects themselves are serialised by
+# pvpn's own lock (crates/pvpn-core/src/lock.rs): an overlap with a manual
+# `pvpn up`/`hop` waits its turn instead of fighting — two overlapping
+# connects are what strand the kill switch, and the protun plugin refuses
+# the second one outright. This flock only keeps two of *this script* from
+# queueing connects nobody needs.
 runtime="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 exec 9>"$runtime/pvpn-autoconnect.lock" || exit 0
 flock -n 9 || exit 0

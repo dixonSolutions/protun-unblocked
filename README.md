@@ -128,7 +128,8 @@ pvpn hop SG-FREE#12       # that exact server
 Bare `pvpn hop` does not hand the choice back to Proton. It works down the
 list this network has already taught it — **servers proven to carry traffic
 here first**, then the measured rank — and keeps going if one fails, up to
-four servers. Naming one gets you that one, and one attempt.
+four servers. Naming one gets you that one, and one attempt. Naming the one
+you are already on is a no-op: it verifies the tunnel and keeps it.
 
 ## Verifying a tunnel
 
@@ -252,6 +253,14 @@ stray `pvpnksintrf0`, and optionally blackholing Proton's API in
   See [docs/flatpak.md](docs/flatpak.md).
 - **Self-resurrecting tunnels.** Proton's NM profile is created with
   autoconnect on. `pvpn down` clears that flag.
+- **Two connects at once do not exist.** NetworkManager's protun plugin
+  allows exactly one active connection, so an overlapping second connect —
+  yours and `pvpn-autoconnect`'s, say — is a guaranteed refusal, not a race
+  anyone wins. `up`, `hop`, `try` and `down` hold an flock
+  (`$XDG_RUNTIME_DIR/pvpn-connect.lock`) for their whole duration; a second
+  command waits its turn, saying whose it is waiting on, and Ctrl-C while
+  waiting just exits. `down` alone stops waiting after 30s and tears down
+  anyway — it is the off switch.
 - **Blocked API for login.** `pvpn login` routes account traffic through Tor
   when needed, with a shim that forces aiohttp onto its threaded resolver.
 

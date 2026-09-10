@@ -338,6 +338,13 @@ Default protocol: protun-tls (Stealth) — required on DPI/filtered wifi.
 Others: protun-udp, protun-tcp, protun-smart, openvpn-tcp, openvpn-udp, wireguard
 ";
 
+/// How long `pvpn down` waits for a connect already in flight before
+/// tearing down anyway. `up`/`hop` wait without a cap — overlapping
+/// connects are what the lock exists to prevent — but `down` is the off
+/// switch, and an off switch that waits minutes is broken in the other
+/// direction.
+const DOWN_LOCK_PATIENCE: std::time::Duration = std::time::Duration::from_secs(30);
+
 fn main() {
     let cli = match Cli::try_parse() {
         Ok(c) => c,
@@ -403,13 +410,18 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
                 return Ok(2);
             }
             let mut session = Session::load()?;
+            let _guard = pvpn_core::lock::acquire().await;
             Ok(report(
                 run_interruptible(connect::up(&mut session, None)).await,
             ))
         }),
-        Command::Down => block_on(async move { Ok(report(connect::down().await)) }),
+        Command::Down => block_on(async move {
+            let _guard = pvpn_core::lock::acquire_bounded(DOWN_LOCK_PATIENCE).await;
+            Ok(report(connect::down().await))
+        }),
         Command::Hop { pattern, protocol } => block_on(async move {
             let mut session = Session::load()?;
+            let _guard = pvpn_core::lock::acquire().await;
             Ok(report(
                 run_interruptible(connect::hop(&mut session, pattern, protocol)).await,
             ))
@@ -452,7 +464,10 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
             }
         }
         Command::Apps { fix, verify, apps } => apps_cmd::cmd_apps(fix, verify, &apps),
-        Command::Try => block_on(login::cmd_try()),
+        Command::Try => block_on(async move {
+            let _guard = pvpn_core::lock::acquire().await;
+            login::cmd_try().await
+        }),
         Command::Protocols => login::cmd_protocols(),
         Command::Fix { hosts, unhosts } => login::cmd_fix(hosts, unhosts),
         Command::Cert { renew } => block_on(cmd_cert(renew)),
@@ -1090,6 +1105,7 @@ async fn cmd_best(
         print_rank(&result, json)?;
         if do_connect {
             let mut session = Session::load()?;
+            let _guard = pvpn_core::lock::acquire().await;
             return Ok(report(
                 run_interruptible(connect::up(&mut session, None)).await,
             ));
@@ -1111,6 +1127,7 @@ async fn cmd_best(
     print_rank(&result, json)?;
 
     if do_connect {
+        let _guard = pvpn_core::lock::acquire().await;
         return Ok(report(
             run_interruptible(connect::up(&mut session, None)).await,
         ));

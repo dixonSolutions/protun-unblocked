@@ -87,11 +87,29 @@ async fn wait_for_internet(timeout: Duration) -> bool {
     }
 }
 
+/// Disconnect whatever tunnel is up and wait until NetworkManager has
+/// actually let go of it — not merely until Proton's state machine says
+/// Disconnected. The protun plugin allows exactly one active connection,
+/// and it keeps holding the old one well past that announcement: measured
+/// on 2026-09-11, a connect started sixteen seconds after `Disconnected`
+/// was still refused with `The 'protun' plugin only supports a single
+/// active connection`.
 async fn disconnect_and_wait() {
     let _ = blocking(proc::protonvpn_disconnect).await;
-    if !wait_for_no_active_tunnel(Duration::from_secs(2)).await {
+    if wait_for_no_active_tunnel(Duration::from_secs(2)).await {
+        return;
+    }
+    // This used to announce "continuing with fallback cleanup" and then do
+    // none — the connect that followed ran straight into the plugin's
+    // one-connection limit. This is the cleanup the message promised:
+    // ask NetworkManager to deactivate every Proton profile directly, then
+    // give the plugin the time it actually takes to let go.
+    tracing::warn!("the previous tunnel is still deactivating; cleaning it up directly");
+    blocking(proc::nmcli_deactivate_proton_connections).await;
+    if !wait_for_no_active_tunnel(Duration::from_secs(13)).await {
         tracing::warn!(
-            "the previous tunnel is still deactivating; continuing with fallback cleanup"
+            "the previous tunnel is still held after 15s — if this connect is refused, \
+             wait a few seconds and run it again"
         );
     }
 }
@@ -173,10 +191,17 @@ async fn activate_saved_fast_path(session: &mut Session) -> Option<UpReport> {
     if verdict.carrying() {
         let fix = session.config.fix_apps;
         blocking(move || apps_hook::enforce_app_routing(fix)).await;
+        // A protun profile does not say which transport it is, and the
+        // honest empty answer used to print as "Connected via ;".
+        let via = if protocol.is_empty() {
+            String::new()
+        } else {
+            format!(" via {protocol}")
+        };
         return Some(UpReport {
             ok: true,
             message: format!(
-                "Connected via {protocol}; proven profile verified in {:.2}s.",
+                "Connected{via}; proven profile verified in {:.2}s.",
                 ready_ms as f64 / 1000.0
             ),
             server: Some(server),
@@ -1205,6 +1230,16 @@ pub async fn up(session: &mut Session, protocol: Option<String>) -> UpReport {
         }
 
         let outcome = diagnose(attempt_started, Some(&log)).await;
+        // The CLI reports the protun plugin's one-connection refusal as a
+        // bare `SystemExit: 1`; say what actually happened, in words.
+        if matches!(outcome, ConnectOutcome::ClientError)
+            && blocking(move || proc::single_active_conflict_since(attempt_started)).await
+        {
+            tracing::warn!(
+                "NetworkManager was still holding the previous protun tunnel — it allows only \
+                 one active connection, so the connect was refused before it started"
+            );
+        }
         if matches!(outcome, ConnectOutcome::CertificateExpired) {
             tracing::warn!("the connect failed on our own certificate, not on the server");
             if !renewed_cert {
@@ -1571,6 +1606,13 @@ async fn hop_to_next_best(
     }
 }
 
+/// `pvpn hop SG-FREE#2` while already on SG-FREE#2. Exact names only: a
+/// country pattern (`hop JP`) asks for somewhere in Japan, not necessarily
+/// somewhere *else*, so only a `#` name can be a no-op.
+fn same_server_hop(before: Option<&str>, want: &str) -> bool {
+    want.contains('#') && before.is_some_and(|current| current.eq_ignore_ascii_case(want))
+}
+
 /// `pvpn hop JP`, `pvpn hop SG-FREE#12`: you named it, so you get it — one
 /// attempt, and the same verification everything else gets.
 async fn hop_to_pattern(
@@ -1579,6 +1621,25 @@ async fn hop_to_pattern(
     before: Option<String>,
     protocol: Option<String>,
 ) -> UpReport {
+    // Hopping to the server you are already on used to tear a working
+    // tunnel down and rebuild it — a no-op made destructive. On
+    // 2026-09-11 the rebuild raced pvpn-autoconnect, the protun plugin
+    // refused it (one active connection only), and the failure cleanup
+    // then tore down the tunnel the autoconnect had just built. So check
+    // first: if the tunnel is carrying, there is nothing to do; if it is
+    // not, rebuilding it is exactly right and falls through.
+    if same_server_hop(before.as_deref(), &want) {
+        let started = Utc::now();
+        let verdict = verify::verify(started, Duration::from_secs(2), session.network()).await;
+        if verdict.carrying() {
+            return UpReport {
+                ok: true,
+                message: format!("Already on {want}; the tunnel is carrying traffic."),
+                server: Some(want),
+            };
+        }
+        tracing::warn!("already on {want}, but it is not carrying traffic — reconnecting it");
+    }
     let cfg = session.config.clone();
     // Unlike the ranked hop path, this reads Proton's raw account cache
     // directly. Refresh it first so "not found" means the server is absent
@@ -1977,10 +2038,25 @@ fn connect_failure_detail(log: &str) -> String {
                 || lower.contains("unable")
                 || lower.contains("authentication required")
         })
+        // The last line of a Python traceback says how the process died,
+        // never why: `SystemExit: 1` is `sys.exit(1)` unwinding through
+        // something that printed it. Walk back to a line with content
+        // rather than reporting that.
+        .or_else(|| lines.iter().rev().find(|line| !is_traceback_tail(line)))
         .or_else(|| lines.last())
         .copied()
         .unwrap_or("Proton exited before creating a tunnel")
         .to_string()
+}
+
+/// Traceback noise, not a reason. Matched only when choosing the fallback
+/// line — a real error message containing one of these words further up
+/// still wins the keyword match above.
+fn is_traceback_tail(line: &str) -> bool {
+    let lower = line.to_lowercase();
+    lower.starts_with("systemexit")
+        || lower.starts_with("keyboardinterrupt")
+        || lower.starts_with("traceback (most recent call last)")
 }
 
 /// Prefer a human explanation over Proton's false "please sign in" wording.
@@ -1989,6 +2065,25 @@ fn explain_connect_failure(outcome: ConnectOutcome, log: &str) -> String {
         ConnectOutcome::KeyringLocked => KEYRING_LOCKED_DETAIL.to_string(),
         _ => connect_failure_detail(log),
     }
+}
+
+/// What the CLI's words could not say, looked up in Proton's own log
+/// before settling for them. The one that matters: the protun plugin's
+/// one-connection refusal, which the CLI reports as a bare
+/// `SystemExit: 1` — the reason only ever reaches the log.
+async fn connect_failure_message(
+    started: DateTime<Utc>,
+    outcome: ConnectOutcome,
+    log: &str,
+) -> String {
+    if matches!(outcome, ConnectOutcome::ClientError)
+        && blocking(move || proc::single_active_conflict_since(started)).await
+    {
+        return "NetworkManager was still holding the previous protun tunnel — it allows only \
+                one active connection, so this connect was refused before it started."
+            .to_string();
+    }
+    explain_connect_failure(outcome, log)
 }
 
 fn selected_server_matches(actual: &str, expected: Option<&str>) -> bool {
@@ -2115,7 +2210,7 @@ async fn connect_and_verify(
                 record(session, name, proto, outcome, None, None).await;
             }
         }
-        let detail = explain_connect_failure(outcome, &log);
+        let detail = connect_failure_message(started, outcome, &log).await;
         tracing::warn!(
             "{} did not connect: {detail}",
             expected.as_deref().unwrap_or("that server")
@@ -2172,6 +2267,33 @@ mod tests {
             ),
             "Error: server selection is not available for this account"
         );
+    }
+
+    #[test]
+    fn a_bare_systemexit_is_never_the_detail_while_anything_else_exists() {
+        // What the CLI printed on 2026-09-11 when the protun plugin refused
+        // the connect: a traceback tail and nothing else. The fallback must
+        // walk back past it to a line with content.
+        assert_eq!(
+            super::connect_failure_detail(
+                "Connecting...\nTraceback (most recent call last):\nSystemExit: 1"
+            ),
+            "Connecting..."
+        );
+        // And when it is literally all there is, honesty beats emptiness.
+        assert_eq!(super::connect_failure_detail("SystemExit: 1"), "SystemExit: 1");
+    }
+
+    #[test]
+    fn hopping_to_the_server_you_are_on_is_a_no_op_request() {
+        assert!(super::same_server_hop(Some("SG-FREE#2"), "SG-FREE#2"));
+        assert!(super::same_server_hop(Some("SG-FREE#2"), "sg-free#2"));
+        assert!(!super::same_server_hop(Some("SG-FREE#2"), "SG-FREE#13"));
+        // A country pattern is not a no-op: `hop JP` asks for somewhere in
+        // Japan, not necessarily the same JP server.
+        assert!(!super::same_server_hop(Some("JP-FREE#11"), "JP"));
+        // Not connected to anything: nothing to short-circuit.
+        assert!(!super::same_server_hop(None, "SG-FREE#2"));
     }
 
     #[test]

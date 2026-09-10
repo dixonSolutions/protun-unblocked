@@ -12,7 +12,7 @@ persisted per-network knowledge about servers.
 ## Layout
 
 ```
-crates/pvpn-core/   rank, probe, geo, serverlist, state, config, proc, link, intent
+crates/pvpn-core/   rank, probe, geo, serverlist, state, config, proc, link, intent, lock
 crates/pvpn/        the CLI: connect, verify, blocklist, session, narration
 lib/                Python shims loaded into protonvpn via PYTHONPATH
 system/             opt-in suspend/resume recovery (see always-on.md)
@@ -122,6 +122,34 @@ traffic is verified. It includes VPN-plugin retries and therefore predicts the
 wait a user experiences better than TLS handshake latency. Older state and
 history files load with this field absent and learn it on their next successful
 connection.
+
+### One connect at a time
+
+NetworkManager's `protun` plugin allows exactly one active connection, so two
+overlapping connects do not double the odds of a tunnel — they guarantee a
+refusal: `The 'protun' plugin only supports a single active connection`, which
+the CLI surfaces as a bare `SystemExit: 1`. Measured on 2026-09-11: a manual
+`pvpn hop` overlapped `pvpn-autoconnect`'s `pvpn up`, the hop's connect was
+refused, and the hop's failure cleanup then tore down the working tunnel the
+autoconnect had just built.
+
+`up`, `hop`, `try`, `best --connect` and `down` now hold an flock on
+`$XDG_RUNTIME_DIR/pvpn-connect.lock` for their whole duration
+(`pvpn-core::lock`). A second command waits, saying who it is waiting for —
+the holder writes its pid and command line into the file — and Ctrl-C during
+the wait exits outright, because a waiter has touched nothing and holds
+nothing. The kernel releases the lock when the holder dies for any reason, so
+a stale lock cannot exist. `down` alone gives up waiting after 30 seconds and
+tears down regardless: it is the off switch, and an off switch that waits out
+someone else's whole connect is broken in the other direction.
+
+The same incident drives two smaller rules. Disconnecting waits until
+NetworkManager has actually let go of the old profile — Proton's state machine
+saying `Disconnected` is not that, and connecting on top of a half-torn-down
+profile is the refusal above — with a direct `nmcli` deactivation as the
+fallback the narration always claimed was happening. And `pvpn hop` naming the
+server you are already on is a no-op: it verifies the tunnel is carrying and
+keeps it, rather than tearing a working tunnel down to rebuild it.
 
 ## There was a daemon; it is gone
 
