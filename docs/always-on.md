@@ -120,6 +120,8 @@ sudo resolvectl revert ipv6leakintrf0
 |---|---|---|
 | `~/.local/bin/pvpn-autoconnect` | you | waits for a real link, then `pvpn up`, bounded |
 | `~/.config/systemd/user/pvpn-autoconnect.service` | you | runs the above with no timeout |
+| `~/.config/systemd/user/pvpn-watch.service` | you | one `pvpn watch`: is the tunnel still carrying? |
+| `~/.config/systemd/user/pvpn-watch.timer` | you | fires the above every two minutes |
 | `/usr/local/sbin/pvpn-dns-unsnap` | root | withdraws the stale `~.` / `::1` claim |
 | `/usr/local/sbin/pvpn-kick-user` | root | hands the reconnect to the logged-in user |
 | `/etc/systemd/system/pvpn-recover.service` | root | the two above, on every resume |
@@ -162,13 +164,47 @@ deliberately a different shape:
 
 | pvpnd did | this does |
 |---|---|
-| polled `protonvpn status` every 5 seconds | nothing runs between events |
+| polled `protonvpn status` every 5 seconds | asks every 2 minutes, and asks the *network*, not the client |
 | retried forever, failing *at* you | at most 3 attempts, then it stops |
 | persisted `want_up`, so a reboot resumed the fight | persists only `want_down`, which never starts anything |
 | a service you did not know you had | opt-in, and `pvpn-autoconnect --status` says so |
 
-Nothing is running right now because of this feature. A resume or a link
-coming up starts one bounded attempt, which exits.
+Nothing is resident. A resume or a link coming up starts one bounded attempt,
+which exits; `pvpn-watch.timer` starts one short-lived check, which exits.
+
+### Why there is a timer at all
+
+The first row of that table is the concession, so it is worth being plain
+about what bought it. Every other hook here reacts to an event. The failure
+they cannot see has no event:
+
+| time | what happened on `wifi:detnsw`, 2026-09-15 |
+|---|---|
+| 07:57:35 | `tunnel established`; traffic verified; `pvpn` exits |
+| 08:00:35 | `supervisor: timer elapsed ToDo=RetryEndpoint(…:443, WireguardTcp)` |
+| 08:00:40 | `systemd-resolved` starts cycling feature sets on `10.2.0.1` |
+| 08:02:43 | the user gives up and runs `pvpn down` |
+
+The middlebox killed the TCP carrier three minutes in and the client's retry
+never re-established it. No link changed, nothing suspended, NetworkManager
+stayed `activated` and `proton0` kept its routes — so no dispatcher script
+ran, no resume hook fired, and nothing was written to the history. Two
+minutes of hanging DNS, and tomorrow's ranking still believed that server was
+the best one here.
+
+There is no event to hook. Somebody has to ask on a clock.
+
+What keeps it from being `pvpnd` is what it asks and what it is allowed to
+do. `pvpnd` polled the *client* for its opinion — the opinion that was wrong
+in the table above. `pvpn watch` sends a packet and waits for an answer, exits
+at once when no tunnel is up, holds no state between firings, and records what
+it finds whether or not it is allowed to reconnect. `pvpn-autoconnect --off`
+stops it reconnecting; it goes on telling you.
+
+```bash
+systemctl --user disable --now pvpn-watch.timer   # stop it asking entirely
+systemctl --user list-timers pvpn-watch.timer     # when it next will
+```
 
 It also does not undo a deliberate `pvpn down`, awake or locked. `pvpn down`
 writes `~/.local/share/pvpn/down-by-user`; `pvpn up` and `pvpn hop` clear it.
@@ -199,15 +235,26 @@ All of these are read-only and safe while connected:
 pvpn-autoconnect --status                 # on, or off
 systemctl is-enabled pvpn-recover.service
 systemctl --user start pvpn-autoconnect.service   # no-ops while a tunnel is up
+systemctl --user list-timers pvpn-watch.timer
+pvpn watch --check                        # asks now, changes nothing
 journalctl --user -u pvpn-autoconnect.service -n 20
+journalctl --user -u pvpn-watch.service -n 20
 journalctl -u pvpn-recover.service -n 20
 ```
 
 With a tunnel up, `pvpn-dns-unsnap` returns immediately without touching
 anything — it checks `ip route get` first, and only a route through
-`proton0` counts as proof of a tunnel. NetworkManager reporting "activated"
-and `pvpn status` reporting connected are both true of a tunnel that is
-carrying nothing.
+`proton0` counts as proof of a tunnel.
+
+That last sentence is true of `pvpn-dns-unsnap`'s question and false of
+everyone else's, which is the trap this whole page circles. A route through
+`proton0` proves traffic is *going into* a tunnel. It proves nothing about
+anything coming back, because a session the network killed keeps its device
+and its routes. NetworkManager reporting "activated" is wrong in the same
+way. `pvpn-autoconnect` used to decide "there is already a tunnel, nothing to
+do" from the route alone, and would cheerfully exit 0 over a tunnel that had
+not passed a packet in two minutes; it now probes before it believes itself,
+and `pvpn status` prints the answer.
 
 ## Limits
 

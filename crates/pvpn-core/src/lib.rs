@@ -15,6 +15,7 @@ pub mod display;
 pub mod geo;
 pub mod intent;
 pub mod link;
+pub mod lock;
 pub mod net;
 pub mod paths;
 pub mod pipeline;

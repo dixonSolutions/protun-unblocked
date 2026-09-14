@@ -12,14 +12,14 @@ persisted per-network knowledge about servers.
 ## Layout
 
 ```
-crates/pvpn-core/   rank, probe, geo, serverlist, state, config, proc, link, intent
-crates/pvpn/        the CLI: connect, verify, blocklist, session, narration
+crates/pvpn-core/   rank, probe, geo, serverlist, state, config, proc, link, intent, lock
+crates/pvpn/        the CLI: connect, verify, watch, blocklist, session, narration
 lib/                Python shims loaded into protonvpn via PYTHONPATH
 system/             opt-in suspend/resume recovery (see always-on.md)
 legacy/             the previous bash tool, and the removed daemon
 ```
 
-Two of those exist only to answer one question — *when a tunnel carries no
+Three of those exist only to answer one question — *when a tunnel carries no
 traffic, whose fault is it?* — because getting that wrong is silent and
 compounding:
 
@@ -35,6 +35,16 @@ compounding:
   seconds instead of the full ninety-second settle window — but it never
   ends one on a clock alone, because every tunnel this tool ever wrote off
   on a timeout turned out to be merely slow.
+- **`pvpn::watch`** asks the same question about a tunnel that is already
+  established, which `verify` structurally cannot: `verify` returns the
+  moment a fresh tunnel proves itself, and then the process exits. A tunnel
+  killed an hour later left no trace anywhere — measured on `wifi:detnsw`,
+  a protun-tcp carrier died three minutes in and `proton0` kept its routes,
+  so every route-based check on the machine went on reporting a healthy
+  tunnel while DNS hung. `watch` reuses `verify`'s definition of "carrying"
+  (`carrying_now`) so the two cannot drift, confirms a bad answer three
+  times before acting, and consults `link` before blaming a server for what
+  was really the wifi.
 
 Immediately before each `up` attempt, the CLI separately proves that the
 configured local DNS resolver answers and that ordinary HTTPS works without
@@ -123,6 +133,34 @@ wait a user experiences better than TLS handshake latency. Older state and
 history files load with this field absent and learn it on their next successful
 connection.
 
+### One connect at a time
+
+NetworkManager's `protun` plugin allows exactly one active connection, so two
+overlapping connects do not double the odds of a tunnel — they guarantee a
+refusal: `The 'protun' plugin only supports a single active connection`, which
+the CLI surfaces as a bare `SystemExit: 1`. Measured on 2026-09-11: a manual
+`pvpn hop` overlapped `pvpn-autoconnect`'s `pvpn up`, the hop's connect was
+refused, and the hop's failure cleanup then tore down the working tunnel the
+autoconnect had just built.
+
+`up`, `hop`, `try`, `best --connect` and `down` now hold an flock on
+`$XDG_RUNTIME_DIR/pvpn-connect.lock` for their whole duration
+(`pvpn-core::lock`). A second command waits, saying who it is waiting for —
+the holder writes its pid and command line into the file — and Ctrl-C during
+the wait exits outright, because a waiter has touched nothing and holds
+nothing. The kernel releases the lock when the holder dies for any reason, so
+a stale lock cannot exist. `down` alone gives up waiting after 30 seconds and
+tears down regardless: it is the off switch, and an off switch that waits out
+someone else's whole connect is broken in the other direction.
+
+The same incident drives two smaller rules. Disconnecting waits until
+NetworkManager has actually let go of the old profile — Proton's state machine
+saying `Disconnected` is not that, and connecting on top of a half-torn-down
+profile is the refusal above — with a direct `nmcli` deactivation as the
+fallback the narration always claimed was happening. And `pvpn hop` naming the
+server you are already on is a no-op: it verifies the tunnel is carrying and
+keeps it, rather than tearing a working tunnel down to rebuild it.
+
 ## There was a daemon; it is gone
 
 `pvpnd` was a long-running user service with a supervisor loop that polled
@@ -177,6 +215,25 @@ writes a `down-by-user` marker that `pvpn up` and `pvpn hop` clear, so a
 suspend cannot put back a tunnel you just turned off. `want_up` fought you;
 `want_down` can only ever cause less to happen. See
 [always-on.md](always-on.md).
+
+One thing did come back on a clock, and it is worth naming the concession.
+`--always-on` installs `pvpn-watch.timer`, which runs `pvpn watch` every two
+minutes. The daemon's polling is the single practice this document argues
+hardest against, so the difference has to carry weight:
+
+| `pvpnd`'s supervisor | `pvpn-watch.timer` |
+|---|---|
+| resident process, five-second loop | a process that starts, asks, and exits |
+| asked `protonvpn status` — the client's opinion | sends a packet and waits for an answer |
+| rebuilt a tunnel that was never there | exits immediately when no tunnel is up |
+| held `want_up` across reboots | holds nothing between firings |
+| silent about what it decided | records every verdict in `pvpn history` |
+
+The last two rows are the point. A supervisor rebuilds tunnels because it
+believes one *should* exist; this only ever examines one that already does,
+and what it mostly produces is not a reconnect but a line in the history
+saying that a server which connects here does not necessarily stay connected
+here. Nothing else on the machine was writing that down.
 
 ## State — `~/.local/share/pvpn/state.json`
 

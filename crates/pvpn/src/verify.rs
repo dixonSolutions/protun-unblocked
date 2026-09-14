@@ -87,6 +87,36 @@ const LINK_DOWN_CONFIRMATIONS: u32 = 2;
 /// timing out should not stretch a one-second poll into ten.
 const PROBE_TIMEOUT_SECS: u64 = 2;
 
+/// Is the tunnel carrying traffic *right now*?
+///
+/// The same gate [`verify`] uses to return [`Verdict::Carrying`], minus the
+/// loop: a Proton profile that NetworkManager calls active, a route table
+/// that sends packets into a tunnel device, and something on the far side
+/// answering. All three, because each one alone has been wrong here — see
+/// [`proc::verified_tunnel_active`] for the first two.
+///
+/// Split out because the interesting question about a tunnel is not only
+/// asked at connect time. `verify` answers it once, while a connect is in
+/// flight, and then the process exits; everything that wants to ask later —
+/// `pvpn status`, `pvpn watch` — needs the same answer without a settle
+/// window attached to it. Having two spellings of "carrying" is how the two
+/// drift apart, and the drift is always in the direction of the cheap one
+/// (routes only) quietly saying yes to a dead tunnel.
+pub async fn carrying_now(timeout: Duration) -> bool {
+    blocking(proc::verified_tunnel_active).await && net::net_works_raced(timeout).await
+}
+
+/// Is a tunnel *set up* — profile active, routes pointing into it — whatever
+/// it is carrying?
+///
+/// The other half of the pair. `carrying_now` says whether it works;
+/// this says whether there is one to be disappointed by. Together they
+/// separate "the VPN is off" from "the VPN is on and dead", which are the
+/// two states a route-only check reports identically.
+pub async fn tunnel_is_up() -> bool {
+    blocking(proc::verified_tunnel_active).await
+}
+
 /// Watch a fresh tunnel until it proves itself, someone declares it dead,
 /// or `settle` runs out.
 ///
@@ -105,10 +135,7 @@ pub async fn verify(started: DateTime<Utc>, settle: Duration, network: &str) -> 
         // Positive NetworkManager evidence gates success. A stale Proton
         // status plus ordinary internet on the physical uplink must never
         // be mistaken for verified VPN traffic.
-        let tunnel_active = blocking(proc::verified_tunnel_active).await;
-        let traffic = async {
-            tunnel_active && net::net_works_raced(Duration::from_secs(PROBE_TIMEOUT_SECS)).await
-        };
+        let traffic = carrying_now(Duration::from_secs(PROBE_TIMEOUT_SECS));
         let log = blocking(proc::ProtonLogSnapshot::recent);
         let (traffic_ok, log) = tokio::join!(traffic, log);
 

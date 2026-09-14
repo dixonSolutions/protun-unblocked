@@ -609,7 +609,23 @@ install_always_on() {
     install -m644 "$SRC/system/pvpn-autoconnect.user.service" \
         "$HOME/.config/systemd/user/pvpn-autoconnect.service"
     ok "$HOME/.config/systemd/user/pvpn-autoconnect.service"
+
+    # The health check. Everything else here reacts to an event — a resume, a
+    # link coming up. This is the one thing on a clock, because the failure it
+    # catches has no event: the network kills a working tunnel's session and
+    # the routing table goes on describing a tunnel.
+    install -m644 "$SRC/system/pvpn-watch.user.service" \
+        "$HOME/.config/systemd/user/pvpn-watch.service"
+    ok "$HOME/.config/systemd/user/pvpn-watch.service"
+    install -m644 "$SRC/system/pvpn-watch.user.timer" \
+        "$HOME/.config/systemd/user/pvpn-watch.timer"
+    ok "$HOME/.config/systemd/user/pvpn-watch.timer"
     systemctl --user daemon-reload 2>/dev/null || true
+    if systemctl --user enable --now pvpn-watch.timer >/dev/null 2>&1; then
+        ok "pvpn-watch.timer asks every two minutes whether the tunnel carries"
+    else
+        warn "could not enable pvpn-watch.timer"
+    fi
 
     # Root half: the DNS repair, the resume hook, and the link-up trigger.
     sudo install -m755 -o root -g root "$SRC/system/pvpn-dns-unsnap" \
@@ -638,16 +654,21 @@ install_always_on() {
     install_lid_lock
     echo
     note "Stop it reconnecting for you at any time:  pvpn-autoconnect --off"
+    note "Check the tunnel yourself, any time:       pvpn watch --check"
+    note "Stop the periodic check:                   systemctl --user disable --now pvpn-watch.timer"
     note "What it does and why:                      docs/always-on.md"
 }
 
 remove_always_on() {
     head_ "Removing the always-on hooks"
     systemctl --user stop pvpn-autoconnect.service 2>/dev/null || true
+    systemctl --user disable --now pvpn-watch.timer 2>/dev/null || true
     rm -f "$HOME/.config/systemd/user/pvpn-autoconnect.service" \
+          "$HOME/.config/systemd/user/pvpn-watch.service" \
+          "$HOME/.config/systemd/user/pvpn-watch.timer" \
           "$BIN/pvpn-autoconnect"
     systemctl --user daemon-reload 2>/dev/null || true
-    ok "user reconnect removed"
+    ok "user reconnect and health check removed"
 
     if sudo -v 2>/dev/null; then
         sudo systemctl disable --now pvpn-recover.service 2>/dev/null || true

@@ -12,10 +12,11 @@ a server that works are not spent again tomorrow.
 
 ```
 pvpn up        connect          pvpn status   where am I exiting?
-pvpn best      rank servers     pvpn apps     what skips the tunnel?
-pvpn hop       change server    pvpn try      try every protocol
-pvpn down      disconnect       vpn-check     will a VPN work on this wifi?
-pvpn login     sign in          pvpn fix      privileged cleanup (sudo)
+pvpn best      rank servers     pvpn watch    is the tunnel still carrying?
+pvpn hop       change server    pvpn apps     what skips the tunnel?
+pvpn down      disconnect       pvpn try      try every protocol
+pvpn login     sign in          vpn-check     will a VPN work on this wifi?
+pvpn fix       privileged cleanup (sudo)
 
 pvpn servers   everything this network has taught us, in one table
 pvpn history   every connect attempt here: what, how long, how it went
@@ -113,6 +114,31 @@ watching it work is most of how you tell "slow" from "blocked".
 client that lost its session keeps reporting the server it lost while
 every packet leaves in the clear; status says so, and exits non-zero.
 
+It also sends a packet and waits for an answer, because the routing table
+has its own blind spot. When the network kills a working session, the
+tunnel device stays up and the routes keep pointing into it — so every
+check that reads routing alone still says "connected" while DNS hangs.
+Measured on a school wifi: protun-tcp carried for three minutes, the
+carrier died at 08:00:35, and nothing on the machine noticed for the two
+minutes it took a human to give up. `pvpn status` now ends with
+
+```
+Traffic: carrying        # or: Traffic: NOT carrying
+```
+
+and `pvpn watch` acts on the bad answer — it records the death against
+that server, which blocks it and sends the reconnect somewhere else:
+
+```bash
+pvpn watch                # check; if it died, record it and reconnect
+pvpn watch --check        # check and report only, change nothing
+```
+
+With `--always-on` installed, a timer runs `pvpn watch` every two minutes.
+That is the one periodic thing in the tool, and it exists because the
+failure it catches is itself periodic; it exits immediately when no tunnel
+is up. Stop it with `systemctl --user disable --now pvpn-watch.timer`.
+
 To see what it picked and why, or to choose differently:
 
 ```bash
@@ -128,7 +154,8 @@ pvpn hop SG-FREE#12       # that exact server
 Bare `pvpn hop` does not hand the choice back to Proton. It works down the
 list this network has already taught it — **servers proven to carry traffic
 here first**, then the measured rank — and keeps going if one fails, up to
-four servers. Naming one gets you that one, and one attempt.
+four servers. Naming one gets you that one, and one attempt. Naming the one
+you are already on is a no-op: it verifies the tunnel and keeps it.
 
 ## Verifying a tunnel
 
@@ -252,6 +279,14 @@ stray `pvpnksintrf0`, and optionally blackholing Proton's API in
   See [docs/flatpak.md](docs/flatpak.md).
 - **Self-resurrecting tunnels.** Proton's NM profile is created with
   autoconnect on. `pvpn down` clears that flag.
+- **Two connects at once do not exist.** NetworkManager's protun plugin
+  allows exactly one active connection, so an overlapping second connect —
+  yours and `pvpn-autoconnect`'s, say — is a guaranteed refusal, not a race
+  anyone wins. `up`, `hop`, `try` and `down` hold an flock
+  (`$XDG_RUNTIME_DIR/pvpn-connect.lock`) for their whole duration; a second
+  command waits its turn, saying whose it is waiting on, and Ctrl-C while
+  waiting just exits. `down` alone stops waiting after 30s and tears down
+  anyway — it is the off switch.
 - **Blocked API for login.** `pvpn login` routes account traffic through Tor
   when needed, with a shim that forces aiohttp onto its threaded resolver.
 

@@ -1,0 +1,35 @@
+# Installed as ~/.config/systemd/user/pvpn-watch.timer.
+#
+# This is the one periodic thing in the tool, and it exists because the
+# failure it catches is itself periodic: on wifi:detnsw the middlebox killed a
+# working protun-tcp carrier three minutes in, and nothing that reads the
+# routing table can tell that apart from a healthy tunnel. Somebody has to ask
+# the question on a clock.
+#
+# It is not the deleted daemon. Nothing stays resident, nothing holds
+# `want_up`, and nothing here has an opinion about whether a tunnel *should*
+# exist — `pvpn watch` exits at once when none does. It only ever asks whether
+# the tunnel you already have is still working.
+[Unit]
+Description=Ask every two minutes whether the Proton tunnel still carries
+Documentation=https://github.com/dixonSolutions/protun-unblocked
+
+[Timer]
+# Two minutes. The measured case went from working to dead in under three, so
+# a five-minute interval would have let most of that outage happen anyway; a
+# thirty-second one would spend more of the day probing than it saves.
+OnUnitActiveSec=2min
+# Not on boot: the tunnel is not up yet and pvpn-recover/pvpn-autoconnect own
+# that moment. One minute after login is the first useful time to ask.
+OnStartupSec=1min
+# Without this every laptop with this installed probes on the same second.
+RandomizedDelaySec=20
+# A check skipped while suspended is not worth catching up on — the tunnel
+# state on resume has nothing to do with the one that was missed, and
+# pvpn-recover already handles resume.
+Persistent=false
+AccuracySec=15s
+Unit=pvpn-watch.service
+
+[Install]
+WantedBy=timers.target

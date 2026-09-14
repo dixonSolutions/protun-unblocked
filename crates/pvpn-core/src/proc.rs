@@ -1223,6 +1223,15 @@ const KEYRING_LOCKED_MARKERS: [&str; 3] = [
     "Keyring is locked",
 ];
 
+/// NetworkManager's protun plugin allows exactly one active connection, so
+/// a connect asked for on top of one that is still tearing down — or one
+/// another process just built — is refused outright. The CLI surfaces that
+/// refusal as a bare `SystemExit: 1`; the reason only ever reaches this
+/// log, inside a GLib.GError traceback line that carries no timestamp of
+/// its own. Measured 2026-09-11: `The 'protun' plugin only supports a
+/// single active connection. (4)`.
+const SINGLE_ACTIVE_MARKER: &str = "only supports a single active connection";
+
 /// How much of the log tail to read. Comfortably more than one connect
 /// attempt writes, far less than the whole file.
 const LOG_TAIL_BYTES: u64 = 256 * 1024;
@@ -1274,6 +1283,23 @@ impl ProtonLogSnapshot {
     pub fn session_death_since(&self, since: chrono::DateTime<chrono::Utc>) -> Option<String> {
         find_session_death(&self.text, since)
     }
+
+    /// Did NetworkManager refuse a connect because a protun connection was
+    /// still held? Like the keyring markers, the line that says so is a
+    /// traceback body with no timestamp, so the nearest preceding Proton
+    /// timestamp is carried forward.
+    pub fn single_active_conflict_since(&self, since: chrono::DateTime<chrono::Utc>) -> bool {
+        let mut last_ts = None;
+        for line in self.text.lines() {
+            if let Some(ts) = line_timestamp(line) {
+                last_ts = Some(ts);
+            }
+            if line.contains(SINGLE_ACTIVE_MARKER) && last_ts.is_some_and(|ts| ts >= since) {
+                return true;
+            }
+        }
+        false
+    }
 }
 
 /// Did Proton log a certificate failure since `since`?
@@ -1299,6 +1325,16 @@ pub fn cert_failure_since(since: chrono::DateTime<chrono::Utc>) -> bool {
 /// truth: you are still signed in; Secret Service would not unlock.
 pub fn keyring_locked_since(since: chrono::DateTime<chrono::Utc>) -> bool {
     ProtonLogSnapshot::recent().keyring_locked_since(since)
+}
+
+/// Did NetworkManager refuse this attempt's connect because a protun
+/// connection was still held?
+///
+/// This is what turns the CLI's bare `SystemExit: 1` into the truth: the
+/// previous tunnel had not finished tearing down — or another process had
+/// just built one — and the plugin allows only one.
+pub fn single_active_conflict_since(since: chrono::DateTime<chrono::Utc>) -> bool {
+    ProtonLogSnapshot::recent().single_active_conflict_since(since)
 }
 
 /// Lines that mean the session this attempt built is over.
@@ -1779,6 +1815,47 @@ keyring.errors.KeyringLocked: Failed to unlock the collection!
             let after = "2026-09-09T22:00:00+00:00".parse().unwrap();
             assert!(!super::keyring_locked_since(after));
         });
+    }
+
+    /// Verbatim from the refused `SG-FREE#2` connect on 2026-09-11: the
+    /// CLI's stderr said only `SystemExit: 1`; this is what the log had.
+    const SINGLE_ACTIVE_LOG: &str = "\
+2026-09-10T22:06:14.488245+00:00 | proton.vpn.core.vpnconnector:479 | INFO | CONN:STATE_CHANGED | Connecting
+2026-09-10T22:06:14.623088+00:00 | proton.vpn.backend.networkmanager.core.networkmanager:85 | INFO | VPN server REACHABLE.
+2026-09-10T22:06:14.660179+00:00 | proton.vpn.backend.networkmanager.core.networkmanager:125 | ERROR | Error starting NetworkManager connection.
+Traceback (most recent call last):
+  File \"/usr/lib/python3/dist-packages/proton/vpn/backend/networkmanager/core/networkmanager.py\", line 116, in start
+    vpn_connection = await loop.run_in_executor(
+gi.repository.GLib.GError: nm-manager-error-quark: The 'protun' plugin only supports a single active connection. (4)
+";
+
+    #[test]
+    fn a_single_active_refusal_in_the_window_is_seen() {
+        // The GError line itself has no timestamp; the attempt's own
+        // ERROR line above it is what places it in the window.
+        with_log(SINGLE_ACTIVE_LOG, || {
+            let before = "2026-09-10T22:06:12+00:00".parse().unwrap();
+            assert!(super::single_active_conflict_since(before));
+        });
+    }
+
+    #[test]
+    fn a_single_active_refusal_from_an_earlier_attempt_is_not_this_ones() {
+        with_log(SINGLE_ACTIVE_LOG, || {
+            let after = "2026-09-10T22:07:00+00:00".parse().unwrap();
+            assert!(!super::single_active_conflict_since(after));
+        });
+    }
+
+    #[test]
+    fn an_ordinary_log_is_not_a_single_active_refusal() {
+        with_log(
+            "2026-09-10T22:06:14+00:00 | proton.vpn.core.vpnconnector:479 | INFO | CONN:STATE_CHANGED | Connected\n",
+            || {
+                let before = "2026-09-10T22:06:00+00:00".parse().unwrap();
+                assert!(!super::single_active_conflict_since(before));
+            },
+        );
     }
 
     use super::*;

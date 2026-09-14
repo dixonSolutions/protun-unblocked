@@ -69,17 +69,47 @@ esac
 # turning the VPN off would turn it back on again.
 [[ -e "$DOWN_MARKER" ]] && exit 0
 
-# One connect at a time — pvpn has no inter-process lock of its own, and two
-# overlapping connects are what strand the kill switch.
+# One autoconnect at a time. The connects themselves are serialised by
+# pvpn's own lock (crates/pvpn-core/src/lock.rs): an overlap with a manual
+# `pvpn up`/`hop` waits its turn instead of fighting — two overlapping
+# connects are what strand the kill switch, and the protun plugin refuses
+# the second one outright. This flock only keeps two of *this script* from
+# queueing connects nobody needs.
 runtime="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 exec 9>"$runtime/pvpn-autoconnect.lock" || exit 0
 flock -n 9 || exit 0
 
-# Only a route through the tunnel proves a tunnel. NetworkManager reporting
-# "activated", and `pvpn status` reporting connected, are both true of a
-# tunnel that is carrying nothing.
+# A route through the tunnel, *and* something coming back through it.
+#
+# The route alone was the old test, and it is the same mistake NetworkManager
+# and Proton's own client make: a tunnel whose session the network killed
+# keeps its device and its routes. Measured 2026-09-15 on detnsw — protun-tcp
+# carried for three minutes, the middlebox killed the carrier, and this
+# function went on returning true over a tunnel that had not passed a packet
+# in two minutes, so autoconnect exited 0 with nothing to show for it.
+#
+# The route is checked first because it is free and it is the cheaper "no".
+# The probe only runs when there is something for it to be about.
 tunnel_up() {
+    tunnel_routed && tunnel_carries
+}
+
+# The cheap half on its own, for the places that only need to know whether a
+# tunnel *exists* — the wait loop below, which must not spend six seconds per
+# iteration probing one.
+tunnel_routed() {
     ip route get 1.1.1.1 2>/dev/null | grep -qE 'dev proton[0-9]*'
+}
+
+# Does anything answer through it? Two endpoints, whichever replies first, so
+# a healthy tunnel costs one round trip. Deliberately not a ping: ICMP is
+# dropped wholesale on the networks this tool exists for.
+tunnel_carries() {
+    local url
+    for url in https://www.gstatic.com/generate_204 http://detectportal.firefox.com/success.txt; do
+        curl -s -4 --noproxy '*' --max-time 3 -o /dev/null "$url" && return 0
+    done
+    return 1
 }
 
 # A default route that is not the tunnel's own — i.e. something real to
@@ -91,14 +121,21 @@ underlay_up() {
 
 # On resume NetworkManager reassociates several seconds after the kernel
 # comes back, so wait for the link rather than failing a connect against a
-# network that is not there yet.
+# network that is not there yet. Only the cheap route test runs in here: a
+# tunnel that is merely *present* is enough to stop waiting, and whether it
+# is any good is one question asked once, below.
 for ((i = 0; i < LINK_WAIT; i++)); do
-    tunnel_up && exit 0
+    tunnel_routed && break
     underlay_up && break
     sleep 1
 done
-underlay_up || exit 0
+
+# A tunnel that is up and carrying is the whole job already done.
 tunnel_up && exit 0
+
+# Past here something needs rebuilding — either there was no tunnel, or there
+# was one and it has stopped carrying. Both need an underlay to build over.
+underlay_up || exit 0
 
 pvpn_bin="$(command -v pvpn || echo "$HOME/.local/bin/pvpn")"
 [[ -x "$pvpn_bin" ]] || { echo "pvpn not found on PATH" >&2; exit 1; }

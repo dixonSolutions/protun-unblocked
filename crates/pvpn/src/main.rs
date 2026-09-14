@@ -15,6 +15,7 @@ mod login;
 mod narrate;
 mod session;
 mod verify;
+mod watch;
 
 use clap::{Parser, Subcommand};
 use pvpn_core::display;
@@ -109,6 +110,32 @@ pvpn best — find the fastest servers your account can use
     /// Show connection state and protocol
     #[command(alias = "st")]
     Status,
+    /// Check a tunnel that is already up, and put it back if it died
+    #[command(after_help = "\
+pvpn watch — is the tunnel that is up still carrying?
+
+  pvpn watch              check; if it died, record it and reconnect
+  pvpn watch --check      check and report only, change nothing
+  pvpn watch --no-reconnect   record what it finds, but do not reconnect
+
+Everything else on this machine answers \"is there a tunnel\" by reading the
+routing table, and a tunnel whose session the network killed still has
+routes. Measured on wifi:detnsw: protun-tcp carried for three minutes, the
+carrier died, and `pvpn status` went on saying Connected while DNS hung.
+
+Only a packet that comes back can tell those apart, so this sends some. A
+tunnel found dead is recorded against its server — it connected here, it
+just did not stay — which blocks it and sends the reconnect elsewhere.
+
+Nothing runs in the background. This is one process that exits.")]
+    Watch {
+        /// Report only: record nothing, reconnect nothing
+        #[arg(long, short = 'c')]
+        check: bool,
+        /// Record what it finds, but do not reconnect
+        #[arg(long)]
+        no_reconnect: bool,
+    },
     /// Show your current public IP
     Ip,
     /// Sign in to your Proton account
@@ -291,7 +318,8 @@ pvpn - simple Proton VPN control
   pvpn best --connect  rank them, then connect to the best
   pvpn hop [match] [proto]  switch server; optionally one matching e.g. JP, SG-FREE#12
   pvpn down            disconnect and restore normal internet
-  pvpn status          show connection state and protocol
+  pvpn status          show connection state, protocol, and whether it carries
+  pvpn watch           check a tunnel that is up; reconnect if it died
   pvpn ip              show your current public IP
   pvpn login [email]   sign in to your Proton account
   pvpn login --browser browser bridge (CAPTCHA in browser → CLI session)
@@ -323,6 +351,14 @@ Choosing a server:
   from the server you are on, trying servers proven to work here before
   ones that merely measured quickly.
 
+Is it actually working:
+  pvpn status             also probes: `Traffic: carrying` or `NOT carrying`
+  pvpn watch              same probe, and puts a dead tunnel back
+  A tunnel whose session the network killed keeps its routes, so everything
+  that answers from the routing table alone — NetworkManager, Proton's own
+  client, `pvpn status` before this — reports it as connected while DNS
+  hangs. Both of these send packets and wait for an answer.
+
 What this network taught us:
   pvpn servers            every server, its status and its record here
   pvpn history            every connect attempt, and how long it took
@@ -337,6 +373,13 @@ Nothing runs in the background. A tunnel stays up until you run
 Default protocol: protun-tls (Stealth) — required on DPI/filtered wifi.
 Others: protun-udp, protun-tcp, protun-smart, openvpn-tcp, openvpn-udp, wireguard
 ";
+
+/// How long `pvpn down` waits for a connect already in flight before
+/// tearing down anyway. `up`/`hop` wait without a cap — overlapping
+/// connects are what the lock exists to prevent — but `down` is the off
+/// switch, and an off switch that waits minutes is broken in the other
+/// direction.
+const DOWN_LOCK_PATIENCE: std::time::Duration = std::time::Duration::from_secs(30);
 
 fn main() {
     let cli = match Cli::try_parse() {
@@ -403,18 +446,42 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
                 return Ok(2);
             }
             let mut session = Session::load()?;
+            let _guard = pvpn_core::lock::acquire().await;
             Ok(report(
                 run_interruptible(connect::up(&mut session, None)).await,
             ))
         }),
-        Command::Down => block_on(async move { Ok(report(connect::down().await)) }),
+        Command::Down => block_on(async move {
+            let _guard = pvpn_core::lock::acquire_bounded(DOWN_LOCK_PATIENCE).await;
+            Ok(report(connect::down().await))
+        }),
         Command::Hop { pattern, protocol } => block_on(async move {
             let mut session = Session::load()?;
+            let _guard = pvpn_core::lock::acquire().await;
             Ok(report(
                 run_interruptible(connect::hop(&mut session, pattern, protocol)).await,
             ))
         }),
         Command::Status => block_on(cmd_status()),
+        Command::Watch {
+            check,
+            no_reconnect,
+        } => block_on(async move {
+            if check {
+                let health = watch::check().await;
+                println!("{}", capitalise(&health.describe()));
+                return Ok(i32::from(matches!(health, watch::Health::Dead { .. })));
+            }
+            let mut session = Session::load()?;
+            // No lock here on purpose. `watch` takes one itself, but only
+            // around the reconnect it may decide on: the check that comes
+            // first is read-only, and making a manual `pvpn up` queue behind
+            // a routine health check would be the tool getting in its own
+            // way.
+            Ok(report(
+                run_interruptible(watch::watch(&mut session, !no_reconnect)).await,
+            ))
+        }),
         Command::Ip => block_on(cmd_ip()),
         Command::Best {
             connect,
@@ -452,7 +519,10 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
             }
         }
         Command::Apps { fix, verify, apps } => apps_cmd::cmd_apps(fix, verify, &apps),
-        Command::Try => block_on(login::cmd_try()),
+        Command::Try => block_on(async move {
+            let _guard = pvpn_core::lock::acquire().await;
+            login::cmd_try().await
+        }),
         Command::Protocols => login::cmd_protocols(),
         Command::Fix { hosts, unhosts } => login::cmd_fix(hosts, unhosts),
         Command::Cert { renew } => block_on(cmd_cert(renew)),
@@ -467,6 +537,38 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
 }
 
 /// Print the outcome of a connect/disconnect and turn it into an exit code.
+/// What the `Traffic:` line says, or `None` when the probe was not run.
+///
+/// Its own function because the distinction it draws is the point of the
+/// whole screen: `tunneled` and `carrying` disagree exactly when something is
+/// wrong, and a status that quietly prints nothing in that case is the status
+/// that reported `Connected` over a tunnel that had been dead for two minutes.
+fn traffic_line(carrying: Option<bool>) -> Option<&'static str> {
+    match carrying {
+        Some(true) => Some("carrying"),
+        Some(false) => Some("NOT carrying"),
+        None => None,
+    }
+}
+
+const DEAD_TUNNEL_ADVICE: &str = "\
+The tunnel is up and your traffic is going into it, but nothing is
+coming back — DNS and every connection will hang rather than fail fast.
+Nothing is leaking; nothing is working either.
+
+Usually the network killed the session and the client did not notice.
+Run: pvpn watch      (records it against this server, then reconnects)
+Or:  pvpn hop        (straight to a different server)";
+
+/// Sentence-case a lowercase description for a line of its own.
+fn capitalise(text: &str) -> String {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
 fn report(report: connect::UpReport) -> i32 {
     if report.ok {
         println!("{}", report.message);
@@ -560,6 +662,19 @@ async fn cmd_status() -> anyhow::Result<i32> {
             "Nothing is actually tunneled — your traffic is going out in the clear.\n\
              Proton still reports a server. Run: pvpn up   (or: pvpn down)"
         );
+        code = 1;
+    }
+
+    // The tunnel exists and the routes point into it. Does anything come
+    // back? This is the question the screen never used to ask, and the one
+    // that separates a working tunnel from the thing that replaced it three
+    // minutes in.
+    if let Some(line) = traffic_line(status.carrying) {
+        println!("Traffic: {line}");
+    }
+    if status.carrying == Some(false) {
+        eprintln!();
+        eprintln!("{DEAD_TUNNEL_ADVICE}");
         code = 1;
     }
     if let Some(dev) = &status.stray_route {
@@ -1090,6 +1205,7 @@ async fn cmd_best(
         print_rank(&result, json)?;
         if do_connect {
             let mut session = Session::load()?;
+            let _guard = pvpn_core::lock::acquire().await;
             return Ok(report(
                 run_interruptible(connect::up(&mut session, None)).await,
             ));
@@ -1111,6 +1227,7 @@ async fn cmd_best(
     print_rank(&result, json)?;
 
     if do_connect {
+        let _guard = pvpn_core::lock::acquire().await;
         return Ok(report(
             run_interruptible(connect::up(&mut session, None)).await,
         ));
@@ -1131,4 +1248,47 @@ fn print_rank(result: &pipeline::RankResult, json: bool) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A tunnel that carries and one that does not must never print the same
+    /// line. This is the regression that mattered: on 2026-09-15 the screen
+    /// said `Status: Connected` for both, and the only way to tell them apart
+    /// was to watch a browser hang.
+    #[test]
+    fn carrying_and_not_carrying_read_differently() {
+        assert_eq!(traffic_line(Some(true)), Some("carrying"));
+        assert_eq!(traffic_line(Some(false)), Some("NOT carrying"));
+        assert_ne!(traffic_line(Some(true)), traffic_line(Some(false)));
+    }
+
+    /// No probe, no claim. Printing `carrying` because nothing said otherwise
+    /// is how the old screen lied.
+    #[test]
+    fn an_unasked_question_gets_no_line() {
+        assert_eq!(traffic_line(None), None);
+    }
+
+    /// The advice has to name the command that actually fixes it.
+    #[test]
+    fn the_dead_tunnel_advice_says_what_to_run() {
+        assert!(DEAD_TUNNEL_ADVICE.contains("pvpn watch"));
+        assert!(DEAD_TUNNEL_ADVICE.contains("pvpn hop"));
+    }
+
+    #[test]
+    fn capitalise_leaves_an_empty_string_alone() {
+        assert_eq!(capitalise(""), "");
+        assert_eq!(capitalise("no tunnel is up"), "No tunnel is up");
+    }
+
+    /// Both new commands have to appear in the help, or nobody finds them.
+    #[test]
+    fn usage_mentions_the_health_check() {
+        assert!(USAGE.contains("pvpn watch"));
+        assert!(USAGE.contains("carrying"));
+    }
 }
