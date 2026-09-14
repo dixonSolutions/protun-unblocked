@@ -38,6 +38,26 @@ pub fn is_down_by_user(data_dir: &Path) -> bool {
     down_marker(data_dir).exists()
 }
 
+/// The file whose presence means "never rebuild the tunnel for me".
+///
+/// Written by `pvpn-autoconnect --off`, and a stronger statement than
+/// [`down_marker`]: that one says "off right now", this one says "off, and
+/// stop offering". Lives in the *config* directory rather than the data one
+/// because it is a preference, not an observation.
+pub fn autoconnect_off_marker(config_dir: &Path) -> PathBuf {
+    config_dir.join("autoconnect-off")
+}
+
+/// Has the user opted out of anything reconnecting on their behalf?
+///
+/// Read by the health check before it acts, never before it *looks*. Opting
+/// out of automatic reconnects is not opting out of being told the tunnel is
+/// dead — suppressing the diagnosis along with the cure is how someone ends
+/// up staring at a `Connected` that has meant nothing for ten minutes.
+pub fn autoconnect_is_off(config_dir: &Path) -> bool {
+    autoconnect_off_marker(config_dir).exists()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -56,6 +76,30 @@ mod tests {
     fn absent_by_default() {
         let dir = tmp();
         assert!(!is_down_by_user(&dir));
+        assert!(!autoconnect_is_off(&dir));
+    }
+
+    /// Two different questions, two different files. Turning the tunnel off
+    /// for now must not read as opting out of reconnects forever.
+    #[test]
+    fn down_by_user_is_not_autoconnect_off() {
+        let dir = tmp();
+        mark_down(&dir);
+        assert!(is_down_by_user(&dir));
+        assert!(
+            !autoconnect_is_off(&dir),
+            "`pvpn down` must not read as `pvpn-autoconnect --off`"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn autoconnect_off_is_seen_when_the_file_is_there() {
+        let dir = tmp();
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::write(autoconnect_off_marker(&dir), b"");
+        assert!(autoconnect_is_off(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

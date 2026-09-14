@@ -12,10 +12,11 @@ a server that works are not spent again tomorrow.
 
 ```
 pvpn up        connect          pvpn status   where am I exiting?
-pvpn best      rank servers     pvpn apps     what skips the tunnel?
-pvpn hop       change server    pvpn try      try every protocol
-pvpn down      disconnect       vpn-check     will a VPN work on this wifi?
-pvpn login     sign in          pvpn fix      privileged cleanup (sudo)
+pvpn best      rank servers     pvpn watch    is the tunnel still carrying?
+pvpn hop       change server    pvpn apps     what skips the tunnel?
+pvpn down      disconnect       pvpn try      try every protocol
+pvpn login     sign in          vpn-check     will a VPN work on this wifi?
+pvpn fix       privileged cleanup (sudo)
 
 pvpn servers   everything this network has taught us, in one table
 pvpn history   every connect attempt here: what, how long, how it went
@@ -112,6 +113,31 @@ watching it work is most of how you tell "slow" from "blocked".
 `pvpn status` checks the routing table, not just what Proton believes. A
 client that lost its session keeps reporting the server it lost while
 every packet leaves in the clear; status says so, and exits non-zero.
+
+It also sends a packet and waits for an answer, because the routing table
+has its own blind spot. When the network kills a working session, the
+tunnel device stays up and the routes keep pointing into it — so every
+check that reads routing alone still says "connected" while DNS hangs.
+Measured on a school wifi: protun-tcp carried for three minutes, the
+carrier died at 08:00:35, and nothing on the machine noticed for the two
+minutes it took a human to give up. `pvpn status` now ends with
+
+```
+Traffic: carrying        # or: Traffic: NOT carrying
+```
+
+and `pvpn watch` acts on the bad answer — it records the death against
+that server, which blocks it and sends the reconnect somewhere else:
+
+```bash
+pvpn watch                # check; if it died, record it and reconnect
+pvpn watch --check        # check and report only, change nothing
+```
+
+With `--always-on` installed, a timer runs `pvpn watch` every two minutes.
+That is the one periodic thing in the tool, and it exists because the
+failure it catches is itself periodic; it exits immediately when no tunnel
+is up. Stop it with `systemctl --user disable --now pvpn-watch.timer`.
 
 To see what it picked and why, or to choose differently:
 

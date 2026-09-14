@@ -1,0 +1,34 @@
+# Installed as ~/.config/systemd/user/pvpn-watch.service — a *user* unit, for
+# the same reason pvpn-autoconnect is one: pvpn reads Proton's session from the
+# SSO keyring and needs the user bus.
+#
+# Started only by pvpn-watch.timer. There is no [Install] section here; the
+# timer is the thing that gets enabled.
+[Unit]
+Description=Check that the Proton tunnel is still carrying traffic
+Documentation=https://github.com/dixonSolutions/protun-unblocked
+
+[Service]
+Type=oneshot
+# `pvpn watch` exits immediately when no tunnel is up, so a firing on an
+# unconnected laptop costs one route lookup. When a tunnel *is* up it sends
+# one probe; only a tunnel that looks dead pays for the confirmations.
+ExecStart=%h/.local/bin/pvpn watch
+# No Restart=. A failed check means the tunnel is being rebuilt or could not
+# be; either way the next firing asks again, and a restart loop would queue
+# connects on top of each other — which is what strands the kill switch.
+#
+# Generous, because a failed check ends in a full `pvpn up`, and protun-tls on
+# a filtered network can take a minute and a half. pvpn is never killed
+# mid-connect: that leaves the kill switch holding the default route and takes
+# all internet with it.
+TimeoutStartSec=600
+# `pvpn` traps SIGINT and only SIGINT: on it, it tears the half-built tunnel
+# down and puts normal routing back (`run_interruptible` -> `connect::restore`).
+# It does not trap SIGTERM, which is what systemd sends by default on a stop or
+# a start timeout — and a pvpn killed partway through a connect leaves the kill
+# switch holding the default route, which takes all internet with it until
+# somebody runs `pvpn fix`. So ask systemd to send the signal pvpn can act on.
+KillSignal=SIGINT
+# Long enough for that teardown to finish before SIGKILL follows.
+TimeoutStopSec=90

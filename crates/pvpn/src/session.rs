@@ -7,8 +7,17 @@
 //! resource is `state.json`, which is written atomically.
 
 use pvpn_core::config::Config;
-use pvpn_core::proc;
 use pvpn_core::state::State;
+use pvpn_core::{net, proc};
+use std::time::Duration;
+
+/// Per-endpoint budget for the `pvpn status` reachability probe.
+///
+/// Shorter than [`net::NET_PROBE_TIMEOUT_SECS`], because the endpoints are
+/// raced and a working tunnel answers one of them in well under a second.
+/// The cost of this number is only ever paid when the tunnel is broken —
+/// which is the case worth waiting two seconds to be sure about.
+const STATUS_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub struct Session {
     pub config: Config,
@@ -25,6 +34,20 @@ pub struct Status {
     /// lost its session keeps reporting the server it lost while every
     /// packet leaves in the clear.
     pub tunneled: bool,
+    /// Does anything actually get *through* the tunnel right now?
+    ///
+    /// `None` when the question was not asked — nothing claimed to be up,
+    /// or the caller said not to probe.
+    ///
+    /// `tunneled` and this are two different questions and the gap between
+    /// them is not theoretical. Measured 2026-09-15 on `wifi:detnsw`:
+    /// protun-tcp carried for three minutes, the middlebox killed the TCP
+    /// carrier at 08:00:35, the client's `RetryEndpoint` never re-established
+    /// it — and because `proton0` stayed up with the routes still pointing
+    /// into it, `tunneled` went on saying yes for the two minutes it took to
+    /// give up and run `pvpn down`. Only a packet that comes back can tell
+    /// those apart.
+    pub carrying: Option<bool>,
     /// A leak-guard interface left holding a default route with no tunnel
     /// behind it, blackholing whichever address family it owns.
     ///
@@ -74,7 +97,18 @@ impl Session {
         }
     }
 
+    /// Ask everything, including whether the tunnel carries.
     pub async fn status(&self) -> Status {
+        self.status_with_probe(Some(STATUS_PROBE_TIMEOUT)).await
+    }
+
+    /// `probe` is the per-endpoint budget for the reachability check, or
+    /// `None` to skip it.
+    ///
+    /// Skipping is for callers that cannot afford a round trip, not a
+    /// default: a status that only reads routes is the one that reported
+    /// `Connected` at 08:02 over a tunnel that had been dead since 08:00.
+    pub async fn status_with_probe(&self, probe: Option<Duration>) -> Status {
         let result = blocking(|| proc::protonvpn_status().ok()).await;
         let stdout = result.as_ref().map(|r| r.stdout.as_str()).unwrap_or("");
         let network_manager_server = blocking(proc::active_proton_server).await;
@@ -89,11 +123,20 @@ impl Session {
         } else {
             blocking(proc::stray_leak_route).await
         };
+        // Only worth a round trip when there is a tunnel for it to be about.
+        // With nothing up, a failed probe says the wifi is down and a
+        // successful one says it is not — neither is this command's business,
+        // and both would cost every `pvpn status` a network call.
+        let carrying = match probe {
+            Some(timeout) if tunneled => Some(net::net_works_raced(timeout).await),
+            _ => None,
+        };
         Status {
             connected,
             server_desc,
             protocol,
             tunneled,
+            carrying,
             stray_route,
         }
     }

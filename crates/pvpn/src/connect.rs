@@ -579,6 +579,34 @@ async fn record(
     }
 }
 
+/// File the death of a tunnel that had already been verified working.
+///
+/// The connect path records what it learns *while* connecting and then the
+/// process exits, so a tunnel killed later left no trace at all: measured
+/// 2026-09-15, JP-FREE#11 carried for three minutes on `wifi:detnsw`, the
+/// carrier died, and the history still says `ok` — which means the ranker
+/// picks it again tomorrow, and again the day after.
+///
+/// `detail` is Proton's own words when its log has any, and `None` when the
+/// only evidence is that nothing comes back. Goes through the same
+/// [`record`] as every other outcome, so a death found by the watcher blocks
+/// the server, removes its saved profile and shows up in `pvpn history`
+/// exactly as one found during a connect.
+pub(crate) async fn record_post_connect_outcome(
+    session: &mut Session,
+    server: &str,
+    protocol: &str,
+    outcome: ConnectOutcome,
+    detail: Option<String>,
+    alive_for: Option<Duration>,
+) {
+    let verdict = detail.map(|detail| Verdict::SessionDied {
+        after: alive_for.unwrap_or_default(),
+        detail,
+    });
+    record(session, server, protocol, outcome, verdict.as_ref(), None).await;
+}
+
 async fn diagnose(since: chrono::DateTime<Utc>, log: Option<&str>) -> ConnectOutcome {
     if blocking(move || proc::cert_failure_since(since)).await {
         return ConnectOutcome::CertificateExpired;

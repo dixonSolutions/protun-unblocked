@@ -13,13 +13,13 @@ persisted per-network knowledge about servers.
 
 ```
 crates/pvpn-core/   rank, probe, geo, serverlist, state, config, proc, link, intent, lock
-crates/pvpn/        the CLI: connect, verify, blocklist, session, narration
+crates/pvpn/        the CLI: connect, verify, watch, blocklist, session, narration
 lib/                Python shims loaded into protonvpn via PYTHONPATH
 system/             opt-in suspend/resume recovery (see always-on.md)
 legacy/             the previous bash tool, and the removed daemon
 ```
 
-Two of those exist only to answer one question — *when a tunnel carries no
+Three of those exist only to answer one question — *when a tunnel carries no
 traffic, whose fault is it?* — because getting that wrong is silent and
 compounding:
 
@@ -35,6 +35,16 @@ compounding:
   seconds instead of the full ninety-second settle window — but it never
   ends one on a clock alone, because every tunnel this tool ever wrote off
   on a timeout turned out to be merely slow.
+- **`pvpn::watch`** asks the same question about a tunnel that is already
+  established, which `verify` structurally cannot: `verify` returns the
+  moment a fresh tunnel proves itself, and then the process exits. A tunnel
+  killed an hour later left no trace anywhere — measured on `wifi:detnsw`,
+  a protun-tcp carrier died three minutes in and `proton0` kept its routes,
+  so every route-based check on the machine went on reporting a healthy
+  tunnel while DNS hung. `watch` reuses `verify`'s definition of "carrying"
+  (`carrying_now`) so the two cannot drift, confirms a bad answer three
+  times before acting, and consults `link` before blaming a server for what
+  was really the wifi.
 
 Immediately before each `up` attempt, the CLI separately proves that the
 configured local DNS resolver answers and that ordinary HTTPS works without
@@ -205,6 +215,25 @@ writes a `down-by-user` marker that `pvpn up` and `pvpn hop` clear, so a
 suspend cannot put back a tunnel you just turned off. `want_up` fought you;
 `want_down` can only ever cause less to happen. See
 [always-on.md](always-on.md).
+
+One thing did come back on a clock, and it is worth naming the concession.
+`--always-on` installs `pvpn-watch.timer`, which runs `pvpn watch` every two
+minutes. The daemon's polling is the single practice this document argues
+hardest against, so the difference has to carry weight:
+
+| `pvpnd`'s supervisor | `pvpn-watch.timer` |
+|---|---|
+| resident process, five-second loop | a process that starts, asks, and exits |
+| asked `protonvpn status` — the client's opinion | sends a packet and waits for an answer |
+| rebuilt a tunnel that was never there | exits immediately when no tunnel is up |
+| held `want_up` across reboots | holds nothing between firings |
+| silent about what it decided | records every verdict in `pvpn history` |
+
+The last two rows are the point. A supervisor rebuilds tunnels because it
+believes one *should* exist; this only ever examines one that already does,
+and what it mostly produces is not a reconnect but a line in the history
+saying that a server which connects here does not necessarily stay connected
+here. Nothing else on the machine was writing that down.
 
 ## State — `~/.local/share/pvpn/state.json`
 

@@ -14,3 +14,12 @@ Type=oneshot
 # overlapping connects are what strand the kill switch.
 ExecStart=%h/.local/bin/pvpn-autoconnect
 TimeoutStartSec=600
+# `pvpn` traps SIGINT and only SIGINT: on it, it tears the half-built tunnel
+# down and puts normal routing back (`run_interruptible` -> `connect::restore`).
+# It does not trap SIGTERM, which is what systemd sends by default on a stop or
+# a start timeout — and a pvpn killed partway through a connect leaves the kill
+# switch holding the default route, which takes all internet with it until
+# somebody runs `pvpn fix`. So ask systemd to send the signal pvpn can act on.
+KillSignal=SIGINT
+# Long enough for that teardown to finish before SIGKILL follows.
+TimeoutStopSec=90
