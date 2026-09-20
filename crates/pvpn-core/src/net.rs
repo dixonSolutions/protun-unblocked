@@ -165,6 +165,150 @@ pub async fn net_works_raced(timeout: Duration) -> bool {
     first_url_works(&urls, timeout).await
 }
 
+/// The probe endpoints with their addresses looked up in advance.
+///
+/// Verifying a fresh tunnel by hostname made the DNS lookup part of the
+/// measurement, and the wrong part. The moment a protun profile activates,
+/// the resolver is pointed through the tunnel — before the WireGuard
+/// handshake has finished, so the first lookups go into a tunnel that
+/// cannot yet answer and sit there for systemd-resolved's per-server
+/// timeout. Measured on `wifi:detnsw`, 2026-09-21: `tunnel established`
+/// 0.75s after activation, traffic verified 4.7s after it, the difference
+/// being lookups and connections that were sent before the tunnel was
+/// ready and had to time out before anything was retried.
+///
+/// Resolving on the ordinary network *before* routes change costs a few
+/// milliseconds and means each later probe is one TCP connect: it either
+/// completes in a round trip or fails fast and is retried on the next poll.
+/// The proof is unchanged — a packet leaves through the tunnel device and
+/// something on the far side answers — and DNS through the tunnel is still
+/// checked by everything that runs after the connect.
+#[derive(Debug, Clone, Default)]
+pub struct ProbeSet {
+    /// `(url, Some("host:port:ip"))` for curl's `--resolve`, or `None`
+    /// where the lookup failed and the hostname has to do.
+    targets: Vec<(String, Option<String>)>,
+}
+
+impl ProbeSet {
+    /// Look every probe host up now, on whatever network is current.
+    ///
+    /// Bounded: a resolver that is not answering must not delay the connect
+    /// it is meant to speed up. A failed lookup falls back to the hostname
+    /// for that one probe, exactly as before.
+    pub async fn resolve(timeout: Duration) -> Self {
+        let mut lookups = JoinSet::new();
+        for (index, url) in NET_PROBE_URLS.iter().enumerate() {
+            let url = (*url).to_string();
+            lookups.spawn(async move {
+                let resolved = tokio::time::timeout(timeout, resolve_url(&url))
+                    .await
+                    .ok()
+                    .flatten();
+                (index, url, resolved)
+            });
+        }
+        let mut targets: Vec<(usize, String, Option<String>)> = Vec::new();
+        while let Some(result) = lookups.join_next().await {
+            if let Ok(entry) = result {
+                targets.push(entry);
+            }
+        }
+        targets.sort_by_key(|(index, _, _)| *index);
+        Self {
+            targets: targets
+                .into_iter()
+                .map(|(_, url, resolved)| (url, resolved))
+                .collect(),
+        }
+    }
+
+    /// Plain hostnames, no lookups done: what every caller had before.
+    pub fn unresolved() -> Self {
+        Self {
+            targets: NET_PROBE_URLS
+                .iter()
+                .map(|url| ((*url).to_string(), None))
+                .collect(),
+        }
+    }
+
+    /// One probe, already resolved. For tests that stand up their own
+    /// listener; not used by anything that connects.
+    #[doc(hidden)]
+    pub fn only_for_tests(url: String, resolved: String) -> Self {
+        Self {
+            targets: vec![(url, Some(resolved))],
+        }
+    }
+
+    /// How many of the probes have an address to go straight to.
+    pub fn resolved_count(&self) -> usize {
+        self.targets
+            .iter()
+            .filter(|(_, resolved)| resolved.is_some())
+            .count()
+    }
+
+    /// Does anything answer, going by address where one is known?
+    pub async fn any_answers(&self, timeout: Duration) -> bool {
+        let mut checks = JoinSet::new();
+        for (url, resolved) in &self.targets {
+            checks.spawn(curl_ok_resolved(url.clone(), resolved.clone(), timeout));
+        }
+        while let Some(result) = checks.join_next().await {
+            if matches!(result, Ok(true)) {
+                checks.abort_all();
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// `host:port:ip` for curl's `--resolve`, from the URL's host and scheme.
+async fn resolve_url(url: &str) -> Option<String> {
+    let rest = url.split_once("://")?;
+    let (scheme, rest) = rest;
+    let host = rest.split('/').next()?;
+    let (host, port) = match host.rsplit_once(':') {
+        Some((h, p)) if p.chars().all(|c| c.is_ascii_digit()) => (h, p.parse::<u16>().ok()?),
+        _ => (host, if scheme == "https" { 443 } else { 80 }),
+    };
+    let mut addrs = tokio::net::lookup_host((host, port)).await.ok()?;
+    let ip = addrs.find(|addr| addr.is_ipv4())?.ip();
+    Some(format!("{host}:{port}:{ip}"))
+}
+
+async fn curl_ok_resolved(url: String, resolved: Option<String>, timeout: Duration) -> bool {
+    let mut command = tokio::process::Command::new("curl");
+    command
+        .arg("-s")
+        .arg("-4")
+        .arg("--noproxy")
+        .arg("*")
+        .arg("-o")
+        .arg("/dev/null")
+        .arg("--max-time")
+        .arg(format!("{:.3}", timeout.as_secs_f64()))
+        .kill_on_drop(true)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if let Some(resolved) = resolved {
+        command.arg("--resolve").arg(resolved);
+    }
+    command.arg(url);
+    let Ok(mut child) = command.spawn() else {
+        return false;
+    };
+    tokio::time::timeout(timeout + Duration::from_millis(250), child.wait())
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .is_some_and(|status| status.success())
+}
+
 /// Poll `net_works` until `settle` elapses. Returns as soon as traffic
 /// flows. Running out of the window is *not* a reason to tear a tunnel
 /// down — every tunnel written off as dead turned out to be merely slow.
@@ -368,6 +512,45 @@ x-pm-date: 26 Aug 2026 23:59:33 GMT\r\n\r\n200";
         assert!(super::NET_PROBE_URLS
             .iter()
             .any(|u| u.contains("cloudflare.com")));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_probe_set_resolves_the_local_hosts_database_without_the_internet() {
+        // `localhost` is in every hosts file, so this exercises the lookup
+        // and the `host:port:ip` formatting offline.
+        let resolved = super::resolve_url("http://localhost:8/x").await;
+        assert_eq!(resolved.as_deref(), Some("localhost:8:127.0.0.1"));
+        let https = super::resolve_url("https://localhost").await;
+        assert_eq!(https.as_deref(), Some("localhost:443:127.0.0.1"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unresolved_probe_set_is_the_plain_hostname_list() {
+        let set = super::ProbeSet::unresolved();
+        assert_eq!(set.resolved_count(), 0);
+        assert_eq!(set.targets.len(), super::NET_PROBE_URLS.len());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_resolved_probe_goes_straight_to_the_address() {
+        // A listener on 127.0.0.1 answering for a name that does not resolve
+        // there: only `--resolve` can reach it, so a success proves the
+        // pre-resolved address was used and no lookup happened.
+        let fast = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = fast.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let (mut stream, _) = fast.accept().unwrap();
+            let mut request = [0; 256];
+            let _ = stream.read(&mut request);
+            let _ = stream.write_all(b"HTTP/1.1 204 No Content\r\n\r\n");
+        });
+        let set = super::ProbeSet {
+            targets: vec![(
+                format!("http://pvpn-probe.invalid:{port}/generate_204"),
+                Some(format!("pvpn-probe.invalid:{port}:127.0.0.1")),
+            )],
+        };
+        assert!(set.any_answers(Duration::from_secs(2)).await);
     }
 
     #[tokio::test(flavor = "multi_thread")]

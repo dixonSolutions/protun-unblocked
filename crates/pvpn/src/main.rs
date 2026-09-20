@@ -204,10 +204,18 @@ five-day window in which `pvpn up` renews it through the tunnel for free.
 Past that, renewal has to happen before any tunnel exists — which on a
 network that blocks Proton's API means Tor.
 ")]
+    /// The chores a verified tunnel earns, run detached by a connect:
+    /// the Flatpak audit and the certificate renewal, if due.
+    #[command(name = "after-connect", hide = true)]
+    AfterConnect,
     Cert {
         /// Renew it now, without connecting (routing untouched)
         #[arg(long, short = 'r')]
         renew: bool,
+        /// Only if Proton's renewal point has passed, and quietly. What a
+        /// connect starts in the background once its tunnel is carrying.
+        #[arg(long, hide = true, requires = "renew")]
+        if_due: bool,
     },
     /// Servers measured fast on this network
     Fast,
@@ -405,6 +413,7 @@ fn main() {
     };
 
     narrate::init();
+    let began = std::time::Instant::now();
     let code = match run(cli) {
         Ok(code) => code,
         Err(err) => {
@@ -412,6 +421,7 @@ fn main() {
             1
         }
     };
+    tracing::debug!("exiting after {:.3}s", began.elapsed().as_secs_f64());
     std::process::exit(code);
 }
 
@@ -530,7 +540,11 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
         }),
         Command::Protocols => login::cmd_protocols(),
         Command::Fix { hosts, unhosts } => login::cmd_fix(hosts, unhosts),
-        Command::Cert { renew } => block_on(cmd_cert(renew)),
+        Command::AfterConnect => block_on(async {
+            let session = Session::load()?;
+            Ok(connect::after_connect(&session.config).await)
+        }),
+        Command::Cert { renew, if_due } => block_on(cmd_cert(renew, if_due)),
         Command::Fast => block_on(cmd_fast()),
         Command::Working => block_on(cmd_working()),
         Command::Blocked => block_on(cmd_blocked()),
@@ -674,7 +688,7 @@ async fn cmd_status() -> anyhow::Result<i32> {
     // The one piece of state that fails every server at once, and the one
     // nothing else here would show. A lapsed certificate reads on this
     // screen as a healthy disconnected client.
-    if let Some(cert) = session::blocking(pvpn_core::cert::status).await {
+    if let Some(cert) = session::blocking(pvpn_core::cert::status_fast).await {
         let now = chrono::Utc::now();
         println!("Certificate: {}", cert.describe(now));
         if cert.unusable(now) {
@@ -731,8 +745,14 @@ async fn cmd_status() -> anyhow::Result<i32> {
 /// modes need separating. "Every server connects and dies" and "the
 /// credential they all share has lapsed" look identical from the outside,
 /// and only one of them is worth trying another server for.
-async fn cmd_cert(renew: bool) -> anyhow::Result<i32> {
+async fn cmd_cert(renew: bool, if_due: bool) -> anyhow::Result<i32> {
     let session = Session::load()?;
+    if if_due {
+        // The background renewal a connect or a health check started. Not
+        // interactive, nothing to print unless something is done — see
+        // `connect::spawn_background_renewal`.
+        return Ok(connect::renew_if_due(&session.config).await);
+    }
     let Some(before) = session::blocking(pvpn_core::cert::status).await else {
         eprintln!(
             "Could not read the certificate from the keyring.\n\

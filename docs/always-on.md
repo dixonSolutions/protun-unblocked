@@ -201,6 +201,16 @@ at once when no tunnel is up, holds no state between firings, and records what
 it finds whether or not it is allowed to reconnect. `pvpn-autoconnect --off`
 stops it reconnecting; it goes on telling you.
 
+One more thing it does when the answer is "carrying": it starts
+`pvpn cert --renew --if-due`, detached, which reads the remembered
+certificate expiry (`~/.local/share/pvpn/cert.json`) and exits unless
+Proton's renewal point has passed — in which case it renews through the
+tunnel that is up right now, while that is still one cheap API call, and
+writes what happened to `~/.local/share/pvpn/cert-renew.log`. A carrying
+tunnel is the moment renewal is free, and a check every two minutes means
+the five-day window is never missed for want of a connect falling inside it.
+A failed renewal is not retried for fifteen minutes.
+
 ```bash
 systemctl --user disable --now pvpn-watch.timer   # stop it asking entirely
 systemctl --user list-timers pvpn-watch.timer     # when it next will

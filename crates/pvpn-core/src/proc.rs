@@ -158,6 +158,77 @@ pub fn protonvpn_status() -> anyhow::Result<RunResult> {
     run("protonvpn", &["status"])
 }
 
+/// What Proton's client believes it is connected to, read from the file it
+/// keeps for that purpose rather than by asking it.
+///
+/// `protonvpn status` is a Python start plus Proton's whole import graph:
+/// 3.7s measured on 2026-09-21, and `pvpn up` ran it on every connect where
+/// NetworkManager had no active profile — which is every connect from a
+/// clean disconnect, the common case. What it reports comes from
+/// `~/.cache/Proton/VPN/connection/connection_persistence.json`, which the
+/// client writes when a connection starts and removes when one is torn
+/// down (`VPNConnection.add_persistence` / `remove_persistence`). Reading
+/// that file answers the same question in microseconds. It is absent when
+/// the client considers itself disconnected, and a tunnel this tool
+/// activated over D-Bus never appears in it at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistedConnection {
+    pub server: Option<String>,
+    pub protocol: String,
+}
+
+pub fn proton_persistence_path() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".cache/Proton/VPN/connection/connection_persistence.json")
+}
+
+pub fn proton_client_persisted() -> Option<PersistedConnection> {
+    let text = std::fs::read_to_string(proton_persistence_path()).ok()?;
+    parse_persisted_connection(&text)
+}
+
+fn parse_persisted_connection(text: &str) -> Option<PersistedConnection> {
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    let server = value
+        .get("server")
+        .and_then(|server| {
+            server
+                .get("server_name")
+                .or_else(|| server.get("name"))
+                .and_then(|name| name.as_str())
+        })
+        .map(str::to_string);
+    Some(PersistedConnection {
+        server,
+        protocol: value
+            .get("protocol")
+            .and_then(|p| p.as_str())
+            .unwrap_or_default()
+            .to_string(),
+    })
+}
+
+/// Does Proton's client think it has a connection? See
+/// [`proton_client_persisted`].
+pub fn proton_client_believes_connected() -> bool {
+    proton_persistence_path().is_file()
+}
+
+/// Tell Proton's client to disconnect — but only if it has something to
+/// disconnect. When its persistence file is absent it has nothing, and
+/// `protonvpn disconnect` would cost a Python start plus, on a network that
+/// blackholes the API, three seconds waiting on a location request, to do
+/// nothing. A tunnel activated over D-Bus is deactivated over D-Bus or
+/// nmcli by every caller anyway. Returns whether the client was asked.
+pub fn protonvpn_disconnect_if_needed() -> bool {
+    if !proton_client_believes_connected() {
+        return false;
+    }
+    let _ = protonvpn_disconnect();
+    true
+}
+
 pub fn protonvpn_disconnect() -> anyhow::Result<RunResult> {
     run("protonvpn", &["disconnect"])
 }
@@ -625,25 +696,81 @@ fn profile_protocol_from_fields(fields: &str) -> Option<String> {
             .map(str::trim)
     };
     let service = value("vpn.service-type")?;
+    // nmcli prints `vpn.data` as `key = value, key = value`, escaping the
+    // commas inside values as `\,`. Only the two keys anyone reads here are
+    // pulled out; `settings` is JSON and its commas need unescaping.
     let data = value("vpn.data").unwrap_or_default();
-    let kind = service.rsplit('.').next()?;
+    let mut map = std::collections::HashMap::new();
+    if data.contains("proto-tcp = yes") {
+        map.insert("proto-tcp".to_string(), "yes".to_string());
+    }
+    if let Some(rest) = data.split_once("settings = ").map(|(_, rest)| rest) {
+        map.insert("settings".to_string(), rest.replace("\\,", ","));
+    }
+    protocol_from_profile(service, &map)
+}
+
+/// The protocol a profile runs, from its NetworkManager service type and
+/// `vpn.data`.
+///
+/// `None` is still an honest answer — an unfamiliar backend, or a protun
+/// profile whose settings cannot be read — and every caller treats it as
+/// "do not record a protocol" rather than guessing. But protun profiles
+/// *do* say which transport they are: the plugin's `settings` JSON lists
+/// the ports per peer, and a peer with only `tcp-ports` is `protun-tcp`,
+/// with only `tls-ports` is `protun-tls`. That answer matters twice over:
+/// it is what the history records for a D-Bus activation, and it is how the
+/// hot path knows a saved profile uses a transport this network has been
+/// seen to pass.
+pub fn protocol_from_profile(
+    service_type: &str,
+    data: &std::collections::HashMap<String, String>,
+) -> Option<String> {
+    let kind = service_type.rsplit('.').next()?;
     match kind {
         "openvpn" => Some(
             // NetworkManager's OpenVPN plugin is UDP unless told otherwise,
             // and which one it is decides whether this profile can work at
             // all on a network that drops VPN UDP.
-            if data.contains("proto-tcp = yes") {
+            if data.get("proto-tcp").is_some_and(|v| v == "yes") {
                 "openvpn-tcp".to_string()
             } else {
                 "openvpn-udp".to_string()
             },
         ),
         "wireguard" => Some("wireguard".to_string()),
-        // Proton's Stealth backends do not distinguish their transport in
-        // anything readable here, and guessing between `protun-tls` and
-        // `protun-tcp` is exactly the guess that caused the damage above.
+        "protun" => protun_protocol_from_settings(data.get("settings")?),
         _ => None,
     }
+}
+
+/// `protun-tcp` / `protun-tls` / `protun-udp` from the plugin's own peer
+/// settings. A peer offering more than one transport is `protun-smart` —
+/// the plugin picks — and nothing readable says which it will choose, so
+/// that one stays unrecorded.
+fn protun_protocol_from_settings(settings_json: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(settings_json.trim()).ok()?;
+    let peer = value.get("peers")?.as_array()?.first()?;
+    let has = |key: &str| {
+        peer.get(key)
+            .and_then(|ports| ports.as_array())
+            .is_some_and(|ports| !ports.is_empty())
+    };
+    match (has("tcp-ports"), has("tls-ports"), has("udp-ports")) {
+        (true, false, false) => Some("protun-tcp".to_string()),
+        (false, true, false) => Some("protun-tls".to_string()),
+        (false, false, true) => Some("protun-udp".to_string()),
+        _ => None,
+    }
+}
+
+/// `protun-tcp` and `protun-tls` are both `protun`; `openvpn-udp` and
+/// `openvpn-tcp` are both `openvpn`. The family is what a NetworkManager
+/// profile's service type names, and the level at which "this network has
+/// been seen to pass it" is worth asking when a profile does not say which
+/// transport it is.
+pub fn protocol_family(protocol: &str) -> &str {
+    protocol.split('-').next().unwrap_or(protocol)
 }
 
 /// The protocol the currently-active Proton profile is actually using.
@@ -759,10 +886,27 @@ pub fn disconnect_preserving_verified_connection(server: &str) -> anyhow::Result
         anyhow::bail!("NetworkManager could not configure {server}'s saved profile");
     }
 
-    let disconnected = protonvpn_disconnect()?;
-    if !disconnected.success {
+    // Proton's exit code is not the evidence here; NetworkManager letting
+    // go of the profile is. Measured 2026-09-21 08:30 on `wifi:detnsw`:
+    // `protonvpn disconnect` removed the JP-FREE#33 profile at :15.35 and
+    // logged `Disconnected`, then went on to ask the API for its location —
+    // blackholed on that machine — and exited non-zero for it. Trusting the
+    // exit code deleted the clone that had just been made, so the next
+    // `pvpn up` had no proven profile to activate and spent twenty-nine
+    // seconds in Proton's client instead of one on the hot path. The
+    // same evidence rule as everywhere else in this tool: ask the thing
+    // that owns the state.
+    protonvpn_disconnect_if_needed();
+    let mut released = wait_for_profile_release(&source_uuid, Duration::from_secs(3));
+    if !released {
+        // The client did not manage it: deactivate directly, as `restore`
+        // would, and ask again.
+        let _ = run("nmcli", &["con", "down", &source_uuid]);
+        released = wait_for_profile_release(&source_uuid, Duration::from_secs(3));
+    }
+    if !released {
         nmcli_delete_connection(&temporary_uuid);
-        anyhow::bail!("Proton could not disconnect {server}");
+        anyhow::bail!("NetworkManager is still holding {server}'s tunnel");
     }
     let renamed = run(
         "nmcli",
@@ -780,6 +924,25 @@ pub fn disconnect_preserving_verified_connection(server: &str) -> anyhow::Result
     }
 
     Ok(true)
+}
+
+/// Wait until NetworkManager no longer lists `uuid` as active, or give up
+/// after `patience`. Polled, because deactivation is asynchronous and the
+/// plugin holds the old connection for a moment after it is asked to stop.
+fn wait_for_profile_release(uuid: &str, patience: Duration) -> bool {
+    let deadline = Instant::now() + patience;
+    loop {
+        let still_active = active_proton_connection_uuids()
+            .map(|active| active.iter().any(|u| u == uuid))
+            .unwrap_or(true);
+        if !still_active {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 /// Remove inactive maintained copies after a real connection proves the
@@ -1184,7 +1347,13 @@ pub fn active_network_key() -> String {
             return key;
         }
     }
-    if let Some(ssid) = active_wifi_ssid() {
+    // The bus first, nmcli only if the bus cannot be reached: this runs at
+    // the start of every command, and the two answers are the same SSID.
+    let ssid = match crate::dbus::active_wifi_ssid_checked() {
+        Ok(ssid) => ssid,
+        Err(()) => active_wifi_ssid(),
+    };
+    if let Some(ssid) = ssid {
         return format!("wifi:{ssid}");
     }
     if let Some(dev) = active_wired_device() {
@@ -1466,10 +1635,10 @@ mod tests {
             Some("openvpn-tcp")
         );
 
-        // The one that matters: Proton's Stealth backends do not say which
-        // transport they are, and guessing between protun-tls and protun-tcp
-        // is what filed a profile activation as a protun-tls success and made
-        // every later connect take a minute.
+        // A protun profile whose settings cannot be read says nothing, and
+        // nothing is what gets recorded: guessing between protun-tls and
+        // protun-tcp is what filed a profile activation as a protun-tls
+        // success and made every later connect take a minute.
         let protun = "vpn.service-type:org.freedesktop.NetworkManager.protun\n\
                       vpn.data:remote = 1.2.3.4:443\n";
         assert_eq!(
@@ -1478,6 +1647,49 @@ mod tests {
             "no answer beats a confident wrong one"
         );
         assert_eq!(profile_protocol_from_fields(""), None);
+    }
+
+    #[test]
+    fn protons_persisted_connection_names_the_server_and_protocol() {
+        // The shape `ConnectionPersistence.save` writes: `ConnectionParameters`
+        // with the `VPNServer` dataclass under `server`.
+        let text = r#"{"connection_id": "abc", "backend": "networkmanager", "protocol": "protun-tcp", "server": {"server_ip": "149.88.103.161", "domain": "node-jp-58.protonvpn.net", "server_name": "JP-FREE#11", "server_id": "x", "label": "0"}}"#;
+        assert_eq!(
+            parse_persisted_connection(text),
+            Some(PersistedConnection {
+                server: Some("JP-FREE#11".into()),
+                protocol: "protun-tcp".into(),
+            })
+        );
+        assert_eq!(parse_persisted_connection("not json"), None);
+    }
+
+    #[test]
+    fn a_protun_profile_names_its_transport_through_nmclis_escaping() {
+        // Verbatim `nmcli -t -f vpn.service-type,vpn.data con show` for
+        // `ProtonVPN JP-FREE#33` on 2026-09-21: nmcli escapes the commas in
+        // the settings JSON as `\,`.
+        let tcp = "vpn.service-type:org.freedesktop.NetworkManager.protun\n\
+                   vpn.data:private-key-flags = 1, settings = {\"version\": 1\\, \"peers\": [{\"id\": \"JP-FREE#33\"\\, \"endpoint\": \"149.88.103.161\"\\, \"public-key\": \"qhEO\"\\, \"udp-ports\": []\\, \"tcp-ports\": [443]\\, \"tls-ports\": []\\, \"priority\": 0}]\\, \"pcap-file\": null}\n";
+        assert_eq!(profile_protocol_from_fields(tcp).as_deref(), Some("protun-tcp"));
+
+        let tls = r#"{"version": 1, "peers": [{"id": "SG-FREE#2", "udp-ports": [], "tcp-ports": [], "tls-ports": [443], "priority": 0}]}"#;
+        assert_eq!(
+            protun_protocol_from_settings(tls).as_deref(),
+            Some("protun-tls")
+        );
+        // Several transports on offer means the plugin chooses, and nothing
+        // readable says which — so nothing is claimed.
+        let smart = r#"{"version": 1, "peers": [{"id": "SG-FREE#2", "udp-ports": [51820], "tcp-ports": [443], "tls-ports": [443], "priority": 0}]}"#;
+        assert_eq!(protun_protocol_from_settings(smart), None);
+    }
+
+    #[test]
+    fn protocol_families_group_the_transports_a_profile_can_run() {
+        assert_eq!(protocol_family("protun-tcp"), "protun");
+        assert_eq!(protocol_family("protun-tls"), "protun");
+        assert_eq!(protocol_family("openvpn-udp"), "openvpn");
+        assert_eq!(protocol_family("wireguard"), "wireguard");
     }
 
     /// Verbatim from `~/.cache/Proton/VPN/logs/vpn-cli.log` for the

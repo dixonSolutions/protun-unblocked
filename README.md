@@ -231,7 +231,10 @@ commands you already ran: every `pvpn best` pays for the latencies, every
 `pvpn up` and `pvpn hop` pays for the verdicts.
 
 Every connect also checks that your Flatpak apps are on the tunnel and puts
-back any that a proxy setting had taken off it:
+back any that a proxy setting had taken off it — after the connect has
+returned, in a short-lived `pvpn after-connect` process that also renews the
+client certificate when Proton's renewal point has passed. What it did is in
+`~/.local/share/pvpn/after-connect.log`.
 
 ```bash
 pvpn apps                 # anything routed around the tunnel?

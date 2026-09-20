@@ -118,6 +118,12 @@ const TOR_SOCKS: &str = "socks5h://127.0.0.1:9050";
 /// rather than assert success — see [`status`] for why an exit code is not
 /// evidence here.
 pub fn renew(via_tor: bool, timeout: Duration) -> anyhow::Result<CertStatus> {
+    let renewed = renew_uncached(via_tor, timeout)?;
+    remember(&renewed);
+    Ok(renewed)
+}
+
+fn renew_uncached(via_tor: bool, timeout: Duration) -> anyhow::Result<CertStatus> {
     let shim = crate::paths::shim_dir().to_string_lossy().to_string();
     let budget = if via_tor {
         crate::proc::API_TIMEOUT_TOR_SECS
@@ -235,7 +241,139 @@ pub fn status() -> Option<CertStatus> {
     if !result.success {
         return None;
     }
-    parse(&result.stdout)
+    let status = parse(&result.stdout)?;
+    remember(&status);
+    Some(status)
+}
+
+// --- the remembered expiry --------------------------------------------------
+//
+// Reading the keyring means starting Python and importing Proton's loader:
+// 320ms, measured 2026-09-21, on a connect that otherwise takes under a
+// second. The two timestamps it returns change only when a certificate is
+// issued — by a renewal, which this module performs and so can record, or
+// by a sign-in, which clears the record — so between issues they can be
+// kept on disk and read in microseconds.
+//
+// The one thing a remembered copy must never do is vouch for a certificate
+// past the point Proton wanted it renewed. So the fast reader trusts the
+// file only while `refresh_at` is still ahead; once it is not, the keyring
+// is asked again and the answer replaces the file. A copy that has gone
+// stale therefore costs one Python start and then stops being stale.
+
+/// Where the last-read expiry lives, beside `state.json`.
+pub fn cache_path() -> std::path::PathBuf {
+    crate::config::Config::data_dir().join("cert.json")
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct Remembered {
+    expires_at: DateTime<Utc>,
+    refresh_at: DateTime<Utc>,
+    read_at: DateTime<Utc>,
+    /// When a renewal was last *attempted*, whatever came of it. What keeps
+    /// a renewal that cannot succeed here — API blocked, no Tor — from being
+    /// retried by every health check that runs.
+    #[serde(default)]
+    last_renewal_attempt: Option<DateTime<Utc>>,
+}
+
+fn read_remembered(path: &std::path::Path) -> Option<Remembered> {
+    let text = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+fn write_remembered(path: &std::path::Path, remembered: &Remembered) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let tmp = path.with_extension("json.tmp");
+    if serde_json::to_vec_pretty(remembered)
+        .ok()
+        .and_then(|bytes| std::fs::write(&tmp, bytes).ok())
+        .is_some()
+    {
+        let _ = std::fs::rename(&tmp, path);
+    }
+}
+
+/// Record a status just read from the keyring or returned by a renewal.
+pub fn remember(status: &CertStatus) {
+    remember_at(&cache_path(), status, Utc::now());
+}
+
+fn remember_at(path: &std::path::Path, status: &CertStatus, now: DateTime<Utc>) {
+    let previous = read_remembered(path);
+    write_remembered(
+        path,
+        &Remembered {
+            expires_at: status.expires_at,
+            refresh_at: status.refresh_at,
+            read_at: now,
+            // A renewal attempt made before *this* certificate was issued
+            // is not evidence about renewing this one.
+            last_renewal_attempt: previous
+                .filter(|p| p.expires_at == status.expires_at)
+                .and_then(|p| p.last_renewal_attempt),
+        },
+    );
+}
+
+/// Forget the remembered expiry — after a sign-out or a sign-in, when the
+/// certificate in the keyring is no longer the one that was read.
+pub fn forget() {
+    let _ = std::fs::remove_file(cache_path());
+}
+
+/// The remembered status, if there is one and it can still be trusted.
+///
+/// Trusted means Proton's own renewal point has not passed: up to then the
+/// certificate is exactly as the file says, and nothing this tool does can
+/// have changed it without also updating the file.
+pub fn remembered(now: DateTime<Utc>) -> Option<CertStatus> {
+    remembered_at(&cache_path(), now)
+}
+
+fn remembered_at(path: &std::path::Path, now: DateTime<Utc>) -> Option<CertStatus> {
+    let r = read_remembered(path)?;
+    let status = CertStatus {
+        expires_at: r.expires_at,
+        refresh_at: r.refresh_at,
+    };
+    (!status.renewal_due(now)).then_some(status)
+}
+
+/// What the file says, whether or not it may still be trusted — for a
+/// caller that only wants to *describe* the situation, never act on it.
+pub fn remembered_ignoring_due(_now: DateTime<Utc>) -> Option<CertStatus> {
+    let r = read_remembered(&cache_path())?;
+    Some(CertStatus {
+        expires_at: r.expires_at,
+        refresh_at: r.refresh_at,
+    })
+}
+
+/// The expiry, from the file when the file can still be trusted and from
+/// the keyring otherwise. `None` means the keyring could not be read and
+/// there was no trustworthy copy — the same "we do not know" as [`status`].
+pub fn status_fast() -> Option<CertStatus> {
+    remembered(Utc::now()).or_else(status)
+}
+
+/// Note that a renewal is being attempted now, for [`renewal_attempted_within`].
+pub fn note_renewal_attempt() {
+    let path = cache_path();
+    if let Some(mut r) = read_remembered(&path) {
+        r.last_renewal_attempt = Some(Utc::now());
+        write_remembered(&path, &r);
+    }
+}
+
+/// Was a renewal of the *current* certificate tried less than `within` ago?
+pub fn renewal_attempted_within(within: chrono::Duration, now: DateTime<Utc>) -> bool {
+    read_remembered(&cache_path())
+        .and_then(|r| r.last_renewal_attempt)
+        .is_some_and(|at| now - at < within)
 }
 
 fn parse(stdout: &str) -> Option<CertStatus> {
@@ -319,5 +457,46 @@ mod tests {
         assert!(!detnsw().renewal_due(at("2026-08-28T05:00:00Z")));
         // And it was still merely due, not fatal, on the days between.
         assert!(!detnsw().unusable(at("2026-08-29T05:00:00Z")));
+    }
+
+    fn scratch_file(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("pvpn-cert-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("cert.json")
+    }
+
+    #[test]
+    fn a_remembered_expiry_is_trusted_until_protons_renewal_point() {
+        let path = scratch_file("trusted");
+        let read_at = at("2026-08-26T22:20:19Z");
+        remember_at(&path, &detnsw(), read_at);
+        // Two days in: still before refresh_at, so the file answers.
+        assert_eq!(remembered_at(&path, at("2026-08-28T05:00:00Z")), Some(detnsw()));
+        // Past the renewal point the file is no longer allowed to vouch —
+        // the keyring has to be asked, however much slower that is.
+        assert_eq!(remembered_at(&path, at("2026-08-29T05:00:00Z")), None);
+        // And certainly not once it has lapsed.
+        assert_eq!(remembered_at(&path, at("2026-08-30T22:42:39Z")), None);
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn nothing_remembered_means_nothing_is_vouched_for() {
+        let path = scratch_file("missing");
+        assert_eq!(remembered_at(&path, at("2026-08-28T05:00:00Z")), None);
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn a_renewal_replaces_what_was_remembered() {
+        let path = scratch_file("renewed");
+        remember_at(&path, &detnsw(), at("2026-08-26T22:20:19Z"));
+        let renewed = CertStatus {
+            expires_at: at("2026-09-27T22:10:50Z"),
+            refresh_at: at("2026-09-23T04:10:50Z"),
+        };
+        remember_at(&path, &renewed, at("2026-09-20T22:10:51Z"));
+        assert_eq!(remembered_at(&path, at("2026-09-21T00:00:00Z")), Some(renewed));
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 }

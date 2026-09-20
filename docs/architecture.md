@@ -119,13 +119,87 @@ Python client startup, and repeated protocol discovery. If D-Bus or the saved
 profile is unavailable, the existing `nmcli` and Proton client path remains the
 fallback.
 
+The tunnel itself is not where the time goes. Measured on `wifi:detnsw`,
+2026-09-21: NetworkManager's `connection-activate` to the protun plugin's
+`tunnel established` is 0.70s — the plugin's first handshake probe is lost
+behind the transparent proxy and its retry fires at 0.5s — and a `pvpn up`
+from a clean disconnect now takes 1.05s end to end: 0.06s of preflight,
+0.10s for NetworkManager to start the plugin, the plugin's 0.70s, one round
+trip for the first probe to answer, and 0.07s to record the result. Before
+this work the same connect took between 4.7s and 29s, and everything in the
+difference was this tool's own overhead. Each piece was removed for a reason
+it is worth keeping (`RUST_LOG=pvpn=debug pvpn up` prints the `t+…s` split):
+
+- **Only a profile that runs a transport this network passes is a
+  candidate.** The proven list is per server; the saved profile's backend
+  is whatever it was when the profile was saved. On 2026-09-21 the best
+  proven server's profile was OpenVPN over UDP, on a network that drops VPN
+  UDP, and the fast path waited thirty-five seconds for a handshake that was
+  never coming before starting Proton's client. A protun profile says which
+  transport it is — its `settings` JSON lists the ports per peer — and
+  `State::profile_protocol_is_plausible` requires the family (`protun`,
+  `openvpn`, `wireguard`) to appear among this network's recent successes.
+  Up to three qualifying profiles are tried before Proton's client is.
+- **The certificate's expiry is remembered, not re-read.** Reading it means
+  starting Python and importing Proton's loader — 320ms — and the two
+  timestamps change only when a certificate is issued. They are kept in
+  `~/.local/share/pvpn/cert.json`, trusted until Proton's own renewal point,
+  and cleared by a sign-in or sign-out. Past that point the keyring is asked
+  again and the file replaced, so a stale copy costs one Python start and
+  then stops being stale.
+- **The probe endpoints are looked up before the routes change.** Activating
+  a protun profile points the resolver through the tunnel before the
+  WireGuard handshake has finished, so the first hostname lookups sat in
+  the tunnel for systemd-resolved's timeout: the tunnel was established at
+  0.75s and verified at 4.7s. `net::ProbeSet` resolves the three probe hosts
+  on the ordinary network first, and each probe is then one TCP connect via
+  curl's `--resolve`. Rounds are fired every 100ms without waiting for the
+  previous one, and the first to answer ends the verification.
+- **A proven server's patience is its own record.** The ninety-second settle
+  window is right for a server that has never been timed here. For one whose
+  history says it carries in a second, ten seconds of silence is a verdict,
+  not slowness: the window is four times the server's recorded time, never
+  under ten seconds and never over the configured settle, so a dead proven
+  server costs seconds before the next one is tried.
+- **Proton's client is asked nothing on the way in.** `protonvpn status` is
+  3.7s of Python, and `up` ran it on every connect from a clean disconnect
+  to learn whether the client still believed it had a tunnel. What it
+  reports comes from `~/.cache/Proton/VPN/connection/connection_persistence.json`,
+  written when the client starts a connection and removed when it tears one
+  down; that file is read directly (`proc::proton_client_persisted`), and
+  `protonvpn disconnect` — another Python start — is only run when the file
+  says there is something for the client to disconnect. A tunnel this tool
+  activated over D-Bus is never in that file and is deactivated over D-Bus.
+  `pvpn status` reads the same file and dropped from 4.5s to 0.6s for it.
+- **Nothing that does not need the terminal waits at it.** The Flatpak audit
+  (one `flatpak info` per installed app — three seconds of CPU on the test
+  machine) and the certificate renewal (a Python start, two API probes, and
+  the request itself, over Tor where the API is blocked) run as `pvpn
+  after-connect` in a process of their own, detached from the terminal's
+  process group so Ctrl-C cannot cut them off, narrating into
+  `~/.local/share/pvpn/after-connect.log`. It does its two jobs and exits;
+  nothing polls, nothing holds state, nothing reconnects. `pvpn watch` starts
+  the renewal half of it (`pvpn cert --renew --if-due`, log at
+  `cert-renew.log`) whenever it finds the tunnel carrying, so the renewal
+  window is never missed for want of a connect falling inside it; a renewal
+  that fails is not retried for fifteen minutes.
+
 Success is never inferred from activation alone. NetworkManager must report an
 active Proton tunnel and one of several independent internet probes must pass.
 Those probes race rather than queue, so a filtered endpoint cannot delay a
 healthy endpoint. DNS and ordinary-internet preflight checks likewise run
-concurrently before routes change. Fixed post-disconnect sleeps were replaced
-with bounded readiness polling; the command continues as soon as the old
-tunnel is actually gone.
+concurrently before routes change — and concurrently with the probe lookups
+and the certificate check, since none of the three needs the others. Fixed
+post-disconnect sleeps were replaced with bounded readiness polling; the
+command continues as soon as the old tunnel is actually gone.
+
+The saved profile the hot path activates exists because a teardown preserved
+it, and that preservation used to trust `protonvpn disconnect`'s exit code.
+On 2026-09-21 the client removed the profile, logged `Disconnected`, then
+exited non-zero because its follow-up location request hit the `/etc/hosts`
+blackhole — and the clone that had just been made was deleted for it, so the
+next connect took the slow path. Preservation now waits for NetworkManager to
+release the profile, and deactivates it directly if the client did not.
 
 The latency stored as `ready_ms` starts before activation and ends only when
 traffic is verified. It includes VPN-plugin retries and therefore predicts the
@@ -301,7 +375,12 @@ rather than asking for sudo at use time — four under `/etc` and
 `/usr/local/sbin`, listed in [always-on.md](always-on.md), removable with
 `setup.sh --no-always-on`.
 
-Use `pvpn fix` (and `pvpn fix --hosts` / `pvpn fix --unhosts`) for those.
+Use `pvpn fix` (and `pvpn fix --unhosts`) for those. `pvpn fix --hosts` still
+exists but is no longer suggested anywhere: the shim already fails blocked API
+calls in two seconds, and the blackhole also blocks the API *through* the
+tunnel, where it is reachable — which sends every certificate renewal over Tor
+and, measured 2026-09-21, makes `protonvpn disconnect` exit non-zero after it
+has succeeded.
 
 ## Logs
 

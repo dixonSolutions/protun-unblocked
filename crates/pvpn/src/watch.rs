@@ -175,11 +175,19 @@ pub async fn watch(session: &mut Session, reconnect: bool) -> UpReport {
     }
 
     match health {
-        Health::Carrying => UpReport {
-            ok: true,
-            message: "Tunnel is carrying traffic.".to_string(),
-            server: None,
-        },
+        Health::Carrying => {
+            // A tunnel that carries is the cheap moment to renew the
+            // certificate, and this check runs every two minutes — so
+            // between them, the renewal window is never missed for want of
+            // a connect happening to fall inside it. Costs a fork; the child
+            // reads the remembered expiry and exits unless something is due.
+            connect::renew_in_background_if_due();
+            UpReport {
+                ok: true,
+                message: "Tunnel is carrying traffic.".to_string(),
+                server: None,
+            }
+        }
         Health::NoTunnel => UpReport {
             ok: true,
             message: "No tunnel is up — nothing to watch.".to_string(),
