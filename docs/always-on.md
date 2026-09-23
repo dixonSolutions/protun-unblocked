@@ -227,12 +227,50 @@ The two are deliberately different files. `pvpn up` releases the hold from a
 `pvpn down`; it does not quietly re-enable autoconnect for someone who turned
 it off on purpose.
 
+## Only on networks you chose
+
+A laptop that resumes on a different wifi from the one it slept on is the
+common case, not the edge one. Rebuilding the tunnel there is a decision
+nobody made — and on a network that refuses every connect, it is two
+minutes of no internet you did not ask for. So both reconnect paths, the
+resume/link hook and `pvpn watch`, first ask whether this network is one
+you chose, set in `~/.config/pvpn/config.toml`:
+
+```toml
+autoconnect_networks = "started"                  # default
+autoconnect_networks = "all"
+autoconnect_networks = ["detnsw", "wired:eth0"]   # SSIDs, or network keys
+```
+
+| value | reconnects on |
+|---|---|
+| `"started"` | the network where you last ran `pvpn up` or `pvpn hop` yourself |
+| `"all"` | any network with a link |
+| a list | those networks: a bare SSID, or a key as `pvpn servers` prints it (`wifi:…`, `wired:…`) |
+
+`"started"` follows you only when you ask it to. Each `pvpn up` or `pvpn hop`
+you type writes the network's key to `~/.local/share/pvpn/autoconnect-network`;
+the hook's own reconnects run with `PVPN_AUTOCONNECT=1` and never write it,
+so an automatic reconnect cannot move the line it was checked against. Until
+you have run `pvpn up` somewhere, `"started"` reconnects nowhere.
+
+Outside the chosen networks the resume still repairs DNS, and `pvpn watch`
+still checks and records a dead tunnel — it just does not rebuild one. This
+gates *automatic* reconnects only; a `pvpn up` you type works anywhere.
+
+`setup.sh --always-on` asks which of the three you want, or takes
+`--autoconnect-networks=started|all|"ssid1,ssid2"`. To check where you are:
+
+```bash
+pvpn-autoconnect --status   # ...and whether this network is covered, and why
+```
+
 ## Checking it works
 
 All of these are read-only and safe while connected:
 
 ```bash
-pvpn-autoconnect --status                 # on, or off
+pvpn-autoconnect --status                 # on, or off, and whether this network is covered
 systemctl is-enabled pvpn-recover.service
 systemctl --user start pvpn-autoconnect.service   # no-ops while a tunnel is up
 systemctl --user list-timers pvpn-watch.timer

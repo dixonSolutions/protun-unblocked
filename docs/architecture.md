@@ -281,6 +281,7 @@ blocked_retry_after_hours = 24
 country = ""
 free_only = false
 fix_apps = true
+autoconnect_networks = "started"  # or "all", or ["ssid", "wired:eth0"]; see always-on.md
 ```
 
 Keys left over from the daemon (`auto_reconnect`, `reconnect_attempts`,

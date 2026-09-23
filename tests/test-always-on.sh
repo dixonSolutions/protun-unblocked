@@ -282,6 +282,54 @@ else
     fail "setup.sh reloads logind in place" "no reload found"
 fi
 
+printf '\n  -- setup.sh: autoconnect_networks --\n'
+
+# The two installer functions, lifted out of setup.sh and run against a
+# throwaway HOME. Nothing else in setup.sh runs.
+FNS="$WORK/autoconnect-fns.sh"
+{
+    echo 'ok(){ echo "ok $1"; }; warn(){ echo "warn $1"; }; note(){ :; }'
+    sed -n '/^autoconnect_networks_toml() {/,/^}/p; /^choose_autoconnect_networks() {/,/^}/p' \
+        "$REPO/setup.sh"
+} > "$FNS"
+setup_choice() {
+    HOME="$WORK/home" AUTOCONNECT_NETWORKS="$1" \
+        bash -c 'set -euo pipefail; source "$1"; choose_autoconnect_networks </dev/null' _ "$FNS" \
+        >/dev/null 2>&1
+}
+SETUP_CFG="$WORK/home/.config/pvpn/config.toml"
+
+setup_choice started
+if [[ ! -e "$SETUP_CFG" ]]; then
+    pass "the default writes no config"
+else
+    fail "the default writes no config" "$(cat "$SETUP_CFG")"
+fi
+
+setup_choice 'home wifi, R&D|lab'
+assert_eq "a list keeps spaces and odd characters" \
+    'autoconnect_networks = ["home wifi", "R&D|lab"]' "$(cat "$SETUP_CFG")"
+
+printf 'settle_secs = 60\n' >> "$SETUP_CFG"
+setup_choice all
+assert_eq "a new choice replaces the old line and keeps the rest" \
+    $'settle_secs = 60\nautoconnect_networks = "all"' "$(cat "$SETUP_CFG")"
+
+setup_choice ""
+assert_eq "no flag and no terminal keeps an existing choice" \
+    $'settle_secs = 60\nautoconnect_networks = "all"' "$(cat "$SETUP_CFG")"
+
+# What setup writes, pvpn must read. Only when a build is lying around:
+# this suite does not compile anything itself.
+PVPN_BUILT="$(ls -t "$REPO"/target/{debug,release}/pvpn 2>/dev/null | head -1)"
+if [[ -n "$PVPN_BUILT" ]]; then
+    setup_choice 'home wifi, R&D|lab'
+    got="$(XDG_CONFIG_HOME="$WORK/home/.config" XDG_DATA_HOME="$WORK/home/.local/share" \
+        PVPN_NETWORK='wifi:R&D|lab' "$PVPN_BUILT" autoconnect-check)"
+    assert_eq "pvpn reads the list setup wrote" \
+        "allowed: wifi:R&D|lab is in autoconnect_networks" "$got"
+fi
+
 printf '\n  -- unit files --\n'
 
 for unit in system/pvpn-recover.service system/pvpn-autoconnect.user.service; do

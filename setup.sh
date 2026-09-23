@@ -7,6 +7,8 @@
 #   ./setup.sh --no-wizard     install only (skip login / vpn-check prompts)
 #   ./setup.sh --always-on     also recover the tunnel after suspend/link change
 #   ./setup.sh --no-always-on  remove those recovery hooks again
+#   ./setup.sh --always-on --autoconnect-networks=started|all|"ssid1,ssid2"
+#                              where it may reconnect for you (asked if omitted)
 #
 # Auto-installs proton-vpn-cli via apt (Debian/Ubuntu) or dnf (Fedora).
 # If repo.protonvpn.com is blocked, downloads and refreshes that repo
@@ -40,6 +42,7 @@ NO_WIZARD=0
 ALWAYS_ON=0
 NO_ALWAYS_ON=0
 LID_LOCK=ask
+AUTOCONNECT_NETWORKS=
 for arg in "$@"; do
     case "$arg" in
         --uninstall)   # handled below
@@ -49,8 +52,9 @@ for arg in "$@"; do
         --no-always-on) NO_ALWAYS_ON=1 ;;
         --lid-lock)    LID_LOCK=yes ;;
         --no-lid-lock) LID_LOCK=no ;;
+        --autoconnect-networks=*) AUTOCONNECT_NETWORKS="${arg#*=}" ;;
         -h|--help)
-            sed -n '3,24p' "$0" | sed 's/^# \?//'
+            sed -n '3,26p' "$0" | sed 's/^# \?//'
             exit 0
             ;;
         *)
@@ -593,6 +597,78 @@ install_lid_lock() {
     warn "a closed lid now stays awake — heat in a bag, and battery drain"
 }
 
+# `autoconnect_networks` as a TOML value: "started", "all", or a list.
+autoconnect_networks_toml() {
+    local choice="$1" item out=()
+    case "$choice" in
+        started|all) printf '"%s"' "$choice"; return 0 ;;
+        "") return 1 ;;
+    esac
+    local IFS=','
+    for item in $choice; do
+        item="${item#"${item%%[![:space:]]*}"}"; item="${item%"${item##*[![:space:]]}"}"
+        [[ -z "$item" ]] && continue
+        item="${item//\\/\\\\}"; item="${item//\"/\\\"}"
+        out+=("\"$item\"")
+    done
+    [[ ${#out[@]} -gt 0 ]] || return 1
+    local joined="${out[0]}"
+    for item in "${out[@]:1}"; do joined+=", $item"; done
+    printf '[%s]' "$joined"
+}
+
+# Where the resume hook and `pvpn watch` may rebuild the tunnel for you.
+# The default ("started") needs no config line at all, so a file is only
+# written for a different choice, and an existing choice is never replaced
+# without --autoconnect-networks saying so.
+choose_autoconnect_networks() {
+    local cfg="$HOME/.config/pvpn/config.toml" choice="$AUTOCONNECT_NETWORKS" reply value
+    local current=""
+    [[ -f "$cfg" ]] && current="$(grep -E '^[[:space:]]*autoconnect_networks[[:space:]]*=' "$cfg" | tail -1)"
+
+    if [[ -z "$choice" ]]; then
+        if [[ -n "$current" ]]; then
+            ok "keeping ${current#"${current%%[![:space:]]*}"}"
+            return 0
+        fi
+        if [[ -t 0 ]]; then
+            echo
+            echo "  Which networks should it reconnect you on by itself?"
+            echo "    1) only where you last ran \`pvpn up\` (default)"
+            echo "    2) every network"
+            echo "    3) a list of Wi-Fi names"
+            read -r -p "  [1/2/3] " reply || true
+            case "${reply:-1}" in
+                2) choice=all ;;
+                3) read -r -p "  Wi-Fi names, comma-separated: " choice || true ;;
+                *) choice=started ;;
+            esac
+        else
+            choice=started
+        fi
+    fi
+
+    if ! value="$(autoconnect_networks_toml "$choice")"; then
+        warn "no networks given — leaving the default (where you last ran pvpn up)"
+        return 0
+    fi
+
+    mkdir -p "$(dirname "$cfg")"
+    # Drop any earlier line and append the new one: no sed replacement, so
+    # an SSID with `&` or `|` in it is written exactly as typed.
+    if [[ -n "$current" ]]; then
+        grep -vE '^[[:space:]]*autoconnect_networks[[:space:]]*=' "$cfg" > "$cfg.tmp" || true
+        mv "$cfg.tmp" "$cfg"
+    fi
+    if [[ -n "$current" || "$value" != '"started"' ]]; then
+        printf 'autoconnect_networks = %s\n' "$value" >> "$cfg"
+    fi
+    ok "autoconnect_networks = $value"
+    [[ "$value" == '"started"' ]] && \
+        note "run \`pvpn up\` once on the network it should come back on"
+    return 0
+}
+
 install_always_on() {
     head_ "Always-on: recovering after suspend and link changes"
 
@@ -652,6 +728,7 @@ install_always_on() {
     fi
 
     install_lid_lock
+    choose_autoconnect_networks
     echo
     note "Stop it reconnecting for you at any time:  pvpn-autoconnect --off"
     note "Check the tunnel yourself, any time:       pvpn watch --check"
