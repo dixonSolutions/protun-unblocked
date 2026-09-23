@@ -270,6 +270,23 @@ pub async fn watch(session: &mut Session, reconnect: bool) -> UpReport {
                 };
             }
 
+            let network = session.network().to_string();
+            let started = pvpn_core::scope::started_network(&Config::data_dir());
+            if let Err(why) = pvpn_core::scope::allowed(
+                &session.config.autoconnect_networks,
+                &network,
+                started.as_deref(),
+            ) {
+                return UpReport {
+                    ok: false,
+                    message: format!(
+                        "{server} is up and carrying nothing — recorded against it here.{said}\n\
+                         Not reconnecting: {why}. Run `pvpn up`."
+                    ),
+                    server: Some(server),
+                };
+            }
+
             // `connect::up` does not take the connect lock — every caller in
             // `main` takes it for them — so this has to, and it has to be
             // taken here rather than around the whole command. A health check

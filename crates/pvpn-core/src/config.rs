@@ -34,6 +34,9 @@ pub struct Config {
     pub best_timeout_secs: u64,
     /// Put Flatpak apps back on the tunnel after a successful connect.
     pub fix_apps: bool,
+    /// Where the resume hook and `pvpn watch` may rebuild the tunnel for
+    /// you: `"started"`, `"all"`, or a list of networks. See [`crate::scope`].
+    pub autoconnect_networks: crate::scope::AutoconnectNetworks,
 }
 
 impl Default for Config {
@@ -52,6 +55,7 @@ impl Default for Config {
             refresh_timeout_secs: 600,
             best_timeout_secs: 90,
             fix_apps: true,
+            autoconnect_networks: Default::default(),
         }
     }
 }

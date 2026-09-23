@@ -22,6 +22,7 @@ pub mod pipeline;
 pub mod probe;
 pub mod proc;
 pub mod rank;
+pub mod scope;
 pub mod serverlist;
 pub mod state;
 

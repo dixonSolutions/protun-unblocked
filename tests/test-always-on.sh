@@ -73,6 +73,18 @@ echo "$tool \$*" >> "\$CALLS"
 exit 0
 EOF
     done
+    # pvpn also answers `autoconnect-check`: SCOPE=deny is a network
+    # autoconnect_networks does not cover. And it records whether the `up`
+    # it was given came from the hook, which must say so.
+    cat > "$bin/pvpn" <<'EOF'
+#!/bin/sh
+if [ "$1" = autoconnect-check ]; then
+    [ "${SCOPE:-allow}" = deny ] && { echo "not here: wifi:cafe is not in autoconnect_networks"; exit 3; }
+    echo "allowed: wifi:home is where you last ran pvpn up"; exit 0
+fi
+echo "pvpn $*${PVPN_AUTOCONNECT:+ (autoconnect)}" >> "$CALLS"
+exit 0
+EOF
     chmod +x "$bin"/*
 }
 
@@ -168,13 +180,13 @@ run_ac() {
 run_ac_connect() {
     CALLS="$1"; export CALLS; : > "$CALLS"
     XDG_CONFIG_HOME="$CFG" XDG_DATA_HOME="$DATA" XDG_RUNTIME_DIR="$WORK" \
-        TUNNEL="${2:-down}" PVPN_AUTOCONNECT_ATTEMPTS=1 PATH="$BIN:$PATH" \
+        TUNNEL="${2:-down}" SCOPE="${3:-allow}" PVPN_AUTOCONNECT_ATTEMPTS=1 PATH="$BIN:$PATH" \
         "$AC" >/dev/null 2>&1
 }
 
-assert_eq "default is on" "on" "$(run_ac --status | awk '{print $1}')"
+assert_eq "default is on" "on" "$(run_ac --status | awk 'NR == 1 {print $1}')"
 run_ac --off >/dev/null
-assert_eq "--off is remembered" "off" "$(run_ac --status | awk '{print $1}')"
+assert_eq "--off is remembered" "off" "$(run_ac --status | awk 'NR == 1 {print $1}')"
 if [[ -e "$CFG/pvpn/autoconnect-off" ]]; then
     pass "--off leaves an inspectable marker"
 else
@@ -186,12 +198,12 @@ run_ac_connect "$WORK/calls.ac" down
 assert_eq "while off: attempts nothing" "" "$(cat "$WORK/calls.ac")"
 
 run_ac --on >/dev/null
-assert_eq "--on restores it" "on" "$(run_ac --status | awk '{print $1}')"
+assert_eq "--on restores it" "on" "$(run_ac --status | awk 'NR == 1 {print $1}')"
 
 # The positive case, which also proves the fake pvpn above is the one being
 # reached -- otherwise the "attempts nothing" test could pass vacuously.
 run_ac_connect "$WORK/calls.ac2" down
-if grep -q '^pvpn up$' "$WORK/calls.ac2"; then
+if grep -q '^pvpn up (autoconnect)$' "$WORK/calls.ac2"; then
     pass "while on and no tunnel: runs pvpn up"
 else
     fail "while on and no tunnel: runs pvpn up" "calls: $(cat "$WORK/calls.ac2")"
@@ -204,6 +216,19 @@ if grep -q '^pvpn ' "$WORK/calls.ac3"; then
     fail "while a tunnel is up: never runs pvpn" "calls: $(cat "$WORK/calls.ac3")"
 else
     pass "while a tunnel is up: never runs pvpn"
+fi
+
+# Only on networks autoconnect_networks allows.
+run_ac_connect "$WORK/calls.scope" down deny
+if grep -q '^pvpn up' "$WORK/calls.scope"; then
+    fail "on a network outside autoconnect_networks: runs nothing" "calls: $(cat "$WORK/calls.scope")"
+else
+    pass "on a network outside autoconnect_networks: runs nothing"
+fi
+if [[ "$(run_ac --status)" == *"allowed: wifi:home"* ]]; then
+    pass "--status says whether this network is covered"
+else
+    fail "--status says whether this network is covered" "$(run_ac --status)"
 fi
 
 out="$(run_ac --nonsense 2>&1)"; rc=$?
@@ -226,7 +251,7 @@ fi
 # script reconnects again once it is gone.)
 rm -f "$DATA/pvpn/down-by-user"
 run_ac_connect "$WORK/calls.up" down
-if grep -q '^pvpn up$' "$WORK/calls.up"; then
+if grep -q '^pvpn up (autoconnect)$' "$WORK/calls.up"; then
     pass "after pvpn up: resume reconnects again"
 else
     fail "after pvpn up: resume reconnects again" "calls: $(cat "$WORK/calls.up")"

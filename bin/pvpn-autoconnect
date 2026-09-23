@@ -10,6 +10,10 @@
 # A deliberate `pvpn down` is never undone: it leaves a marker that survives
 # a suspend, and only `pvpn up` or `pvpn hop` clears it.
 #
+# It only reconnects on networks `autoconnect_networks` allows in
+# ~/.config/pvpn/config.toml: "started" (default — wherever you last ran
+# `pvpn up`), "all", or a list such as ["detnsw", "wired:eth0"].
+#
 # This is not the old pvpnd. It does not poll, it holds no `want_up`, and it
 # is not running right now. Something that already happened starts it — a
 # resume, or a physical link coming up — and it makes a few attempts and
@@ -48,10 +52,15 @@ case "${1:-}" in
         else
             echo "on   (disable with: pvpn-autoconnect --off)"
         fi
+        pvpn_bin="$(command -v pvpn || echo "$HOME/.local/bin/pvpn")"
+        if [[ -x "$pvpn_bin" ]] && scope="$("$pvpn_bin" autoconnect-check 2>/dev/null; true)" \
+            && [[ -n "$scope" ]]; then
+            echo "     $scope"
+        fi
         exit 0
         ;;
     -h|--help)
-        sed -n '3,11p' "$0" | sed 's/^# \?//'
+        sed -n '3,15p' "$0" | sed 's/^# \?//'
         exit 0
         ;;
     "") ;;
@@ -139,6 +148,17 @@ underlay_up || exit 0
 
 pvpn_bin="$(command -v pvpn || echo "$HOME/.local/bin/pvpn")"
 [[ -x "$pvpn_bin" ]] || { echo "pvpn not found on PATH" >&2; exit 1; }
+
+# Only on a network you chose (autoconnect_networks). Asked after the wait
+# above, so the answer is about the network we actually landed on.
+if ! scope="$("$pvpn_bin" autoconnect-check)"; then
+    echo "$scope"
+    exit 0
+fi
+
+# Tells pvpn this `up` is ours, not the user's, so it does not move the
+# "started" network it was just checked against.
+export PVPN_AUTOCONNECT=1
 
 # Bounded. protun-tcp lands in seconds on a friendly network and protun-tls
 # can take a minute and a half on a filtered one, so pvpn is never given a

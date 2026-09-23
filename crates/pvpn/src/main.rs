@@ -306,6 +306,9 @@ or a session the far end tore down actually shows up.
         #[arg(long, short = 'n', default_value_t = 50)]
         lines: u32,
     },
+    /// May the tunnel be rebuilt for you on this network? (for pvpn-autoconnect)
+    #[command(name = "autoconnect-check", hide = true)]
+    AutoconnectCheck,
     /// This message
     Help,
 }
@@ -447,6 +450,7 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
             }
             let mut session = Session::load()?;
             let _guard = pvpn_core::lock::acquire().await;
+            remember_where_asked();
             Ok(report(
                 run_interruptible(connect::up(&mut session, None)).await,
             ))
@@ -458,6 +462,7 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
         Command::Hop { pattern, protocol } => block_on(async move {
             let mut session = Session::load()?;
             let _guard = pvpn_core::lock::acquire().await;
+            remember_where_asked();
             Ok(report(
                 run_interruptible(connect::hop(&mut session, pattern, protocol)).await,
             ))
@@ -533,6 +538,38 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
         Command::History { lines, all, json } => block_on(cmd_history(lines, all, json)),
         Command::Forget { all, server } => block_on(cmd_forget(all, server)),
         Command::Logs { follow, lines } => cmd_logs(follow, lines),
+        Command::AutoconnectCheck => cmd_autoconnect_check(),
+    }
+}
+
+/// A person asked for a tunnel here, so this is the network the default
+/// `autoconnect_networks = "started"` rebuilds it on. Not when the hook is
+/// the one asking: its reconnects must not move the goalposts they check.
+fn remember_where_asked() {
+    use pvpn_core::scope;
+    if !scope::launched_by_autoconnect() {
+        let network = pvpn_core::proc::active_network_key();
+        scope::record_started(&pvpn_core::config::Config::data_dir(), &network);
+    }
+}
+
+/// Exit 0 with the reason when a reconnect may happen on this network, 3
+/// with the reason when not. Read by `pvpn-autoconnect` before it connects.
+fn cmd_autoconnect_check() -> anyhow::Result<i32> {
+    use pvpn_core::config::Config;
+    use pvpn_core::scope;
+    let config = Config::load(&Config::default_path())?;
+    let network = pvpn_core::proc::active_network_key();
+    let started = scope::started_network(&Config::data_dir());
+    match scope::allowed(&config.autoconnect_networks, &network, started.as_deref()) {
+        Ok(why) => {
+            println!("allowed: {why}");
+            Ok(0)
+        }
+        Err(why) => {
+            println!("not here: {why}");
+            Ok(3)
+        }
     }
 }
 

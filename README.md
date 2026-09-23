@@ -302,6 +302,7 @@ stray `pvpnksintrf0`, and optionally blackholing Proton's API in
 | `blocked_retry_after_hours` | 24 | re-try a blocked server after this long |
 | `country` / `PVPN_BEST_COUNTRY` | | optional country filter |
 | `fix_apps` / `PVPN_FIX_APPS` | true | put Flatpak apps back on the tunnel |
+| `autoconnect_networks` | `"started"` | where a resume or `pvpn watch` may rebuild the tunnel: `"started"` (where you last ran `pvpn up`/`hop`), `"all"`, or a list like `["detnsw", "wired:eth0"]` |
 | `PVPN_NETWORK` | | pin the network key instead of deriving it from the SSID |
 
 Persisted observations live in `~/.local/share/pvpn/state.json` — per
@@ -347,7 +348,10 @@ rather than suspend. It is event-driven and bounded — not the old `pvpnd`
 supervisor.
 
 A deliberate `pvpn down` is never undone, awake or locked: it holds until
-you run `pvpn up`. `pvpn-autoconnect --off` stops the reconnect entirely.
+you run `pvpn up`. Nor does it follow you: by default it only reconnects on the
+network where you last ran `pvpn up` — set `autoconnect_networks` to
+`"all"` or a list to change that, and `pvpn-autoconnect --status` says
+whether the network you are on is covered. `pvpn-autoconnect --off` stops the reconnect entirely.
 [docs/always-on.md](docs/always-on.md) has the evidence and the reasoning.
 
 ## Limits — read before filing a bug
