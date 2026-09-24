@@ -361,13 +361,15 @@ PY
 
 install_proton_dnf() {
     head_ "Installing proton-vpn-cli (dnf)"
+    # Ask rpm rather than parsing /etc/fedora-release: remixes rename that
+    # line ("Ultramarine Linux release 44 (Flying Fish)"), so a fixed word
+    # position reads "release" and asks Proton for a repo that does not exist.
     local fedora_ver
-    if [[ -r /etc/fedora-release ]]; then
-        fedora_ver="$(awk '{print $3}' /etc/fedora-release)"
-    else
-        fedora_ver="$(rpm -E %fedora 2>/dev/null || true)"
+    fedora_ver="$(rpm -E %fedora 2>/dev/null || true)"
+    if [[ ! "$fedora_ver" =~ ^[0-9]+$ && -r /etc/fedora-release ]]; then
+        fedora_ver="$(grep -oE '[0-9]+' /etc/fedora-release | head -1 || true)"
     fi
-    if [[ -z "${fedora_ver:-}" || "$fedora_ver" == "%fedora" ]]; then
+    if [[ ! "${fedora_ver:-}" =~ ^[0-9]+$ ]]; then
         bad "Could not detect Fedora version"
         exit 1
     fi
@@ -390,12 +392,18 @@ install_proton_dnf() {
     fi
 
     sudo dnf install -y "$rpm"
+    # Proton's Fedora repo does not split packages the way its Debian repo
+    # does: there is no python3-proton-vpn-lib or -network-manager here, and
+    # asking for them fails the whole transaction. The NetworkManager backend
+    # and the Stealth (nm-protun) plugin both ship inside
+    # python3-proton-vpn-api-core, which proton-vpn-cli requires.
+    # NetworkManager-openvpn comes from Fedora itself, for the OpenVPN fallback.
+    local -a pkgs=(proton-vpn-cli python3-proton-vpn-api-core NetworkManager-openvpn)
     # Accept Proton's repo key non-interactively when possible; fall back to prompt.
     sudo dnf "${proxy[@]}" check-update --refresh || true
-    if ! sudo dnf "${proxy[@]}" install -y proton-vpn-cli python3-proton-vpn-lib \
-            python3-proton-vpn-network-manager; then
+    if ! sudo dnf "${proxy[@]}" install -y "${pkgs[@]}"; then
         warn "Retrying proton-vpn-cli install (accept the OpenPGP key if prompted)..."
-        sudo dnf "${proxy[@]}" install proton-vpn-cli python3-proton-vpn-lib
+        sudo dnf "${proxy[@]}" install "${pkgs[@]}"
     fi
     ok "proton-vpn-cli + protocol backends"
 }
@@ -432,8 +440,9 @@ install_proton() {
             ensure_stealth_backend_apt "${opts[@]}" || true
             ;;
         dnf)
-            # Best-effort on Fedora; package name may lag Debian unstable.
-            sudo dnf install -y python3-proton-vpn-lib proton-vpn-linux 2>/dev/null || true
+            # On Fedora Stealth ships inside python3-proton-vpn-api-core, so
+            # an older install only needs that package brought up to date.
+            sudo dnf install -y python3-proton-vpn-api-core || true
             ;;
     esac
 }
@@ -951,7 +960,11 @@ EOF
         fi
     else
         warn "Stealth (protun-tls) backend missing — cannot use primary protocol."
-        note "Install: python3-proton-vpn-lib + proton-vpn-linux, then re-run setup."
+        if [[ "$PM" == dnf ]]; then
+            note "Install: sudo dnf install python3-proton-vpn-api-core, then re-run setup."
+        else
+            note "Install: python3-proton-vpn-lib + proton-vpn-linux, then re-run setup."
+        fi
         connect_proto="openvpn-tcp"
         /usr/bin/python3 - <<'PY' 2>/dev/null || true
 import json, pathlib
