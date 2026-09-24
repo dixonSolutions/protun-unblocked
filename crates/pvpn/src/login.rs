@@ -18,7 +18,24 @@ fn need_tor() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Every sign-in path drives Proton's own CLI or its Python library, which
+/// arrive together in the proton-vpn-cli package. Without it the helper dies
+/// on `import proton` with a traceback that says nothing about what to do.
+fn need_proton_cli() -> anyhow::Result<()> {
+    let on_path = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).any(|d| d.join("protonvpn").is_file()))
+        .unwrap_or(false);
+    if !on_path {
+        anyhow::bail!(
+            "Proton's VPN client (proton-vpn-cli) is not installed - pvpn wraps it.\n  \
+             Install it with:  ./setup.sh   (from the protun-unblocked checkout)"
+        );
+    }
+    Ok(())
+}
+
 pub fn cmd_login(email: Option<String>, browser: bool) -> anyhow::Result<i32> {
+    need_proton_cli()?;
     let _ = paths::ensure_shim()?;
     if browser {
         return cmd_login_bridge(email);
