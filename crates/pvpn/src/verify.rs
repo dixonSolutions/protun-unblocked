@@ -198,7 +198,8 @@ pub async fn verify_with(
     // below, so an answer is noticed the moment it arrives rather than at
     // the next poll. Restarted only if an answer turns out not to have come
     // through a tunnel.
-    let mut prover = Box::pin(prove_traffic(probes.clone(), begin));
+    let mut prover: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> =
+        Box::pin(prove_traffic(probes.clone(), begin));
 
     loop {
         let poll = if begin.elapsed() < FAST_POLL_WINDOW {
@@ -221,7 +222,21 @@ pub async fn verify_with(
                         after: begin.elapsed(),
                     };
                 }
-                prover = Box::pin(prove_traffic(probes.clone(), begin));
+                // Ask again, but only after a poll interval, and never past
+                // the deadline. This used to restart at once and `continue`
+                // straight past the deadline check below — and ordinary
+                // internet answers every round, so a profile that came up
+                // on the physical device kept the connect verifying forever.
+                if Instant::now() >= deadline {
+                    return Verdict::Quiet {
+                        after: begin.elapsed(),
+                    };
+                }
+                let probes = probes.clone();
+                prover = Box::pin(async move {
+                    tokio::time::sleep(poll).await;
+                    prove_traffic(probes, begin).await
+                });
                 continue;
             }
             _ = &mut evidence_due => {}
@@ -340,6 +355,38 @@ mod tests {
             .await
             .expect("an answering endpoint must end the prover");
         assert!(began.elapsed() < PROVE_ROUND_TIMEOUT);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn answers_that_skip_the_tunnel_cannot_outlast_the_deadline() {
+        // Every round answers, but not through a tunnel — the physical
+        // uplink, or a profile activated on it. That is a leak, not a
+        // verdict, and it must end at the deadline like silence does.
+        if blocking(proc::verified_tunnel_active).await {
+            return; // a real tunnel is up; the premise does not hold here
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let mut stream = stream;
+                let mut request = [0; 256];
+                let _ = std::io::Read::read(&mut stream, &mut request);
+                let _ = std::io::Write::write_all(&mut stream, b"HTTP/1.1 204 No Content\r\n\r\n");
+            }
+        });
+        let probes = net::ProbeSet::only_for_tests(
+            format!("http://pvpn-leak.invalid:{port}/generate_204"),
+            format!("pvpn-leak.invalid:{port}:127.0.0.1"),
+        );
+        let network = blocking(proc::active_network_key).await;
+        let verdict = tokio::time::timeout(
+            Duration::from_secs(15),
+            verify_with(Utc::now(), Duration::from_secs(1), &network, probes),
+        )
+        .await
+        .expect("a leak must not keep verify going past its deadline");
+        assert!(!verdict.carrying(), "an answer outside the tunnel is not carrying");
     }
 
     #[tokio::test(flavor = "multi_thread")]
