@@ -264,6 +264,18 @@ the hook's own reconnects run with `PVPN_AUTOCONNECT=1` and never write it,
 so an automatic reconnect cannot move the line it was checked against. Until
 you have run `pvpn up` somewhere, `"started"` reconnects nowhere.
 
+And the opposite list, for the network you connect on by hand but never want
+fought over:
+
+```toml
+autoconnect_never = ["ratradinternet"]            # never these, whatever the above says
+```
+
+`autoconnect_never` is checked first and wins over every mode, `"all"`
+included — so running `pvpn up` on that network once cannot quietly make it
+the `"started"` one. The window's Preferences → Autoconnect has a single
+"Never reconnect automatically here" switch for the network you are on.
+
 Outside the chosen networks the resume still repairs DNS, and `pvpn watch`
 still checks and records a dead tunnel — it just does not rebuild one. This
 gates *automatic* reconnects only; a `pvpn up` you type works anywhere.

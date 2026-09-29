@@ -12,6 +12,8 @@
 //! autoconnect_networks = "started"              # default: where you last ran pvpn up/hop
 //! autoconnect_networks = "all"                  # anywhere with a link
 //! autoconnect_networks = ["detnsw", "wired:eth0"]  # these, by SSID or network key
+//!
+//! autoconnect_never = ["ratradinternet"]        # never these, whatever the above says
 //! ```
 //!
 //! Like [`crate::intent`], this can only ever cause *less* to happen. It
@@ -85,13 +87,21 @@ fn matches(entry: &str, network: &str) -> bool {
 /// May a reconnect happen on `network`? `Ok` carries why it may, `Err` why
 /// not — both are printed, because "it didn't reconnect" with no reason is
 /// the bug report this exists to prevent.
+///
+/// `never` is checked first and wins over everything, `"all"` included: a
+/// network somebody named there is one they do not want a tunnel rebuilt on,
+/// and running `pvpn up` on it once must not quietly change that.
 pub fn allowed(
     scope: &AutoconnectNetworks,
+    never: &[String],
     network: &str,
     started: Option<&str>,
 ) -> Result<String, String> {
     if network == "offline" {
         return Err("no network is up".to_string());
+    }
+    if never.iter().any(|entry| matches(entry, network)) {
+        return Err(format!("{network} is in autoconnect_never"));
     }
     match scope {
         AutoconnectNetworks::Mode(Mode::All) => {
@@ -133,30 +143,44 @@ mod tests {
 
     #[test]
     fn started_allows_only_the_recorded_network() {
-        assert!(allowed(&started(), "wifi:home", Some("wifi:home")).is_ok());
-        assert!(allowed(&started(), "wifi:cafe", Some("wifi:home")).is_err());
+        assert!(allowed(&started(), &[], "wifi:home", Some("wifi:home")).is_ok());
+        assert!(allowed(&started(), &[], "wifi:cafe", Some("wifi:home")).is_err());
     }
 
     /// Never having asked for a tunnel is not permission to build one.
     #[test]
     fn started_with_nothing_recorded_refuses() {
-        assert!(allowed(&started(), "wifi:home", None).is_err());
+        assert!(allowed(&started(), &[], "wifi:home", None).is_err());
     }
 
     #[test]
     fn all_allows_any_real_network() {
         let all = AutoconnectNetworks::Mode(Mode::All);
-        assert!(allowed(&all, "wifi:anything", None).is_ok());
-        assert!(allowed(&all, "offline", None).is_err());
+        assert!(allowed(&all, &[], "wifi:anything", None).is_ok());
+        assert!(allowed(&all, &[], "offline", None).is_err());
     }
 
     #[test]
     fn list_matches_bare_ssids_and_full_keys() {
         let list = AutoconnectNetworks::List(vec!["detnsw".into(), "wired:eth0".into()]);
-        assert!(allowed(&list, "wifi:detnsw", None).is_ok());
-        assert!(allowed(&list, "wired:eth0", None).is_ok());
-        assert!(allowed(&list, "wifi:eth0", None).is_err());
-        assert!(allowed(&list, "wifi:cafe", None).is_err());
+        assert!(allowed(&list, &[], "wifi:detnsw", None).is_ok());
+        assert!(allowed(&list, &[], "wired:eth0", None).is_ok());
+        assert!(allowed(&list, &[], "wifi:eth0", None).is_err());
+        assert!(allowed(&list, &[], "wifi:cafe", None).is_err());
+    }
+
+    /// A network on the never list stays off even where it would otherwise
+    /// be the recorded one, or everywhere is allowed.
+    #[test]
+    fn never_wins_over_every_mode() {
+        let never = vec!["ratradinternet".to_string()];
+        let all = AutoconnectNetworks::Mode(Mode::All);
+        let here = "wifi:ratradinternet";
+        assert!(allowed(&all, &never, here, None).is_err());
+        assert!(allowed(&started(), &never, here, Some(here)).is_err());
+        let list = AutoconnectNetworks::List(vec!["ratradinternet".into()]);
+        assert!(allowed(&list, &never, here, None).is_err());
+        assert!(allowed(&all, &never, "wifi:detnsw", None).is_ok());
     }
 
     #[test]

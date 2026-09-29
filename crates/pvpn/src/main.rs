@@ -575,7 +575,12 @@ fn cmd_autoconnect_check() -> anyhow::Result<i32> {
     let config = Config::load(&Config::default_path())?;
     let network = pvpn_core::proc::active_network_key();
     let started = scope::started_network(&Config::data_dir());
-    match scope::allowed(&config.autoconnect_networks, &network, started.as_deref()) {
+    match scope::allowed(
+        &config.autoconnect_networks,
+        &config.autoconnect_never,
+        &network,
+        started.as_deref(),
+    ) {
         Ok(why) => {
             println!("allowed: {why}");
             Ok(0)

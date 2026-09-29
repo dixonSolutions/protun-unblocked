@@ -37,6 +37,9 @@ pub struct Config {
     /// Where the resume hook and `pvpn watch` may rebuild the tunnel for
     /// you: `"started"`, `"all"`, or a list of networks. See [`crate::scope`].
     pub autoconnect_networks: crate::scope::AutoconnectNetworks,
+    /// Networks nothing may rebuild the tunnel on for you, whatever
+    /// `autoconnect_networks` says. SSIDs or network keys.
+    pub autoconnect_never: Vec<String>,
 }
 
 impl Default for Config {
@@ -56,6 +59,7 @@ impl Default for Config {
             best_timeout_secs: 90,
             fix_apps: true,
             autoconnect_networks: Default::default(),
+            autoconnect_never: Vec::new(),
         }
     }
 }

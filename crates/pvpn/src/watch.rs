@@ -282,6 +282,7 @@ pub async fn watch(session: &mut Session, reconnect: bool) -> UpReport {
             let started = pvpn_core::scope::started_network(&Config::data_dir());
             if let Err(why) = pvpn_core::scope::allowed(
                 &session.config.autoconnect_networks,
+                &session.config.autoconnect_never,
                 &network,
                 started.as_deref(),
             ) {
