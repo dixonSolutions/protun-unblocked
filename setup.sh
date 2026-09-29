@@ -9,6 +9,8 @@
 #   ./setup.sh --no-always-on  remove those recovery hooks again
 #   ./setup.sh --always-on --autoconnect-networks=started|all|"ssid1,ssid2"
 #                              where it may reconnect for you (asked if omitted)
+#   ./setup.sh --gui           also install the GTK build libraries for the window
+#   ./setup.sh --no-gui        skip the window (pvpn-gui) entirely
 #
 # Auto-installs proton-vpn-cli via apt (Debian/Ubuntu) or dnf (Fedora).
 # If repo.protonvpn.com is blocked, downloads and refreshes that repo
@@ -19,6 +21,7 @@
 #   ~/.local/bin/pvpn          the CLI (one binary, nothing runs in the background)
 #   ~/.local/bin/vpn-check
 #   ~/.local/share/pvpn/       Python shims (sitecustomize, sign-in)
+#   ~/.local/bin/pvpn-gui      the window + tray (when GTK4/libadwaita are there)
 #
 # --always-on is the one exception: it needs sudo and writes root-owned files
 # under /etc and /usr/local/sbin. It is opt-in and never runs by default.
@@ -43,6 +46,7 @@ ALWAYS_ON=0
 NO_ALWAYS_ON=0
 LID_LOCK=ask
 AUTOCONNECT_NETWORKS=
+GUI=auto
 for arg in "$@"; do
     case "$arg" in
         --uninstall)   # handled below
@@ -52,9 +56,11 @@ for arg in "$@"; do
         --no-always-on) NO_ALWAYS_ON=1 ;;
         --lid-lock)    LID_LOCK=yes ;;
         --no-lid-lock) LID_LOCK=no ;;
+        --gui)         GUI=yes ;;
+        --no-gui)      GUI=no ;;
         --autoconnect-networks=*) AUTOCONNECT_NETWORKS="${arg#*=}" ;;
         -h|--help)
-            sed -n '3,26p' "$0" | sed 's/^# \?//'
+            sed -n '3,28p' "$0" | sed 's/^# \?//'
             exit 0
             ;;
         *)
@@ -508,7 +514,9 @@ install_pvpn() {
     local cargo
     cargo="$(find_cargo)"
     note "Building release binaries (first time can take a minute)..."
-    (cd "$SRC" && "$cargo" build --release --locked)
+    # Only the CLI here: the window needs GTK's development files, and a
+    # machine without them must still get a working pvpn.
+    (cd "$SRC" && "$cargo" build --release --locked -p pvpn)
     install -m755 "$SRC/target/release/pvpn"  "$BIN/pvpn";  ok "$BIN/pvpn"
     install -m755 "$SRC/bin/vpn-check" "$BIN/vpn-check"; ok "$BIN/vpn-check"
     install -m644 "$SRC/lib/sitecustomize.py" "$LIB/";   ok "$LIB/sitecustomize.py"
@@ -530,6 +538,67 @@ install_pvpn() {
             export PATH="$BIN:$PATH"
             ;;
     esac
+}
+
+# --- the window ---------------------------------------------------------
+
+GUI_ID="io.github.dixonsolutions.ProtunUnblocked"
+APPS_DIR="$HOME/.local/share/applications"
+ICONS_DIR="$HOME/.local/share/icons/hicolor"
+
+gui_build_deps_present() {
+    command -v pkg-config >/dev/null 2>&1 \
+        && pkg-config --exists 'gtk4 >= 4.16' 'libadwaita-1 >= 1.7'
+}
+
+install_gui_build_deps() {
+    case "$PM" in
+        apt) sudo DEBIAN_FRONTEND=noninteractive apt-get install -y pkg-config libgtk-4-dev libadwaita-1-dev ;;
+        dnf) sudo dnf install -y pkgconf-pkg-config gtk4-devel libadwaita-devel ;;
+        *)   return 1 ;;
+    esac
+}
+
+# pvpn-gui: a window and tray icon over pvpn. Optional — everything it does,
+# pvpn does from a terminal — so a missing GTK is a note, not a failure.
+install_gui() {
+    [[ "$GUI" == no ]] && return 0
+    head_ "Installing the window (pvpn-gui)"
+    if ! gui_build_deps_present; then
+        if [[ "$GUI" == yes ]]; then
+            install_gui_build_deps || { warn "Could not install GTK4/libadwaita build files"; return 0; }
+        else
+            warn "GTK4 >= 4.16 / libadwaita >= 1.7 development files not found — skipping the window"
+            case "$PM" in
+                apt) note "  sudo apt install libgtk-4-dev libadwaita-1-dev, then ./setup.sh --gui" ;;
+                dnf) note "  sudo dnf install gtk4-devel libadwaita-devel, then ./setup.sh --gui" ;;
+            esac
+            return 0
+        fi
+    fi
+    local cargo
+    cargo="$(find_cargo)" || return 0
+    (cd "$SRC" && "$cargo" build --release --locked -p pvpn-gui) || { warn "pvpn-gui did not build"; return 0; }
+    install -m755 "$SRC/target/release/pvpn-gui" "$BIN/pvpn-gui"; ok "$BIN/pvpn-gui"
+    local data="$SRC/crates/pvpn-gui/data"
+    install -Dm644 "$data/$GUI_ID.desktop" "$APPS_DIR/$GUI_ID.desktop"
+    sed -i "s|^Exec=pvpn-gui|Exec=$BIN/pvpn-gui|" "$APPS_DIR/$GUI_ID.desktop"
+    ok "$APPS_DIR/$GUI_ID.desktop"
+    install -Dm644 "$data/icons/$GUI_ID.svg" "$ICONS_DIR/scalable/apps/$GUI_ID.svg"
+    install -Dm644 "$data/icons/$GUI_ID-symbolic.svg" "$ICONS_DIR/symbolic/apps/$GUI_ID-symbolic.svg"
+    ok "icon installed"
+    command -v gtk-update-icon-cache >/dev/null 2>&1 \
+        && gtk-update-icon-cache -q -t "$ICONS_DIR" 2>/dev/null || true
+    command -v update-desktop-database >/dev/null 2>&1 \
+        && update-desktop-database -q "$APPS_DIR" 2>/dev/null || true
+    note "Open \"Protun Unblocked\" from your apps, or run: pvpn-gui"
+    note "The tray icon needs an AppIndicator host (on GNOME: the AppIndicator extension)."
+}
+
+remove_gui() {
+    rm -f "$BIN/pvpn-gui" "$APPS_DIR/$GUI_ID.desktop" \
+        "$ICONS_DIR/scalable/apps/$GUI_ID.svg" "$ICONS_DIR/symbolic/apps/$GUI_ID-symbolic.svg" \
+        "${XDG_CONFIG_HOME:-$HOME/.config}/autostart/$GUI_ID.desktop"
 }
 
 # --- Flatpak routing --------------------------------------------------
@@ -996,6 +1065,7 @@ if [[ "${1:-}" == "--uninstall" ]]; then
     rm -f "$HOME/.config/systemd/user/pvpnd.service"
     systemctl --user daemon-reload 2>/dev/null || true
     rm -f "$BIN/pvpn" "$BIN/pvpnd" "$BIN/vpn-check"
+    remove_gui
     rm -rf "$LIB"
     c '1;32' "Removed pvpn. Your Proton config in ~/.config/Proton was left alone."
     echo "Settings and server lists left at ~/.config/pvpn and ~/.local/share/pvpn/state.json"
@@ -1033,6 +1103,7 @@ if everything_ready; then
     # output.
     install_proton
     install_pvpn >/dev/null   # refresh scripts from this checkout
+    install_gui
     fix_flatpak_routing
     if (( ALWAYS_ON )) || always_on_installed; then
         install_always_on || true
@@ -1058,6 +1129,7 @@ if [[ "$(command -v python3)" != "/usr/bin/python3" ]]; then
 fi
 
 install_pvpn
+install_gui
 fix_flatpak_routing
 if (( ALWAYS_ON )) || always_on_installed; then
     install_always_on || true

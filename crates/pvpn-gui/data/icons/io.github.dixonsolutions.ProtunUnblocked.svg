@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Protun Unblocked: an orb with a tunnel through it. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <defs>
+    <radialGradient id="orb" cx="42" cy="36" r="92" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#8ff0c4"/>
+      <stop offset="0.38" stop-color="#26a88f"/>
+      <stop offset="0.78" stop-color="#1c4f8f"/>
+      <stop offset="1" stop-color="#1a2a5c"/>
+    </radialGradient>
+    <radialGradient id="glow" cx="64" cy="64" r="62" gradientUnits="userSpaceOnUse">
+      <stop offset="0.82" stop-color="#57e3a8" stop-opacity="0.55"/>
+      <stop offset="1" stop-color="#57e3a8" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="tunnel" x1="64" y1="40" x2="64" y2="98" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#d7fff0"/>
+    </linearGradient>
+    <radialGradient id="light" cx="64" cy="74" r="16" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#fffbe0"/>
+      <stop offset="0.6" stop-color="#ffe98a"/>
+      <stop offset="1" stop-color="#f6c343"/>
+    </radialGradient>
+    <linearGradient id="shine" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.55"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+    <clipPath id="ball"><circle cx="64" cy="64" r="52"/></clipPath>
+  </defs>
+  <circle cx="64" cy="64" r="62" fill="url(#glow)"/>
+  <circle cx="64" cy="64" r="52" fill="url(#orb)"/>
+  <g clip-path="url(#ball)" fill="none" stroke="#ffffff" stroke-opacity="0.22" stroke-width="2">
+    <ellipse cx="64" cy="64" rx="22" ry="52"/>
+    <ellipse cx="64" cy="64" rx="42" ry="52"/>
+    <path d="M12 46 H116 M8 64 H120 M12 82 H116"/>
+  </g>
+  <!-- the tunnel: an arch, with light at the far end -->
+  <path d="M40 98 V66 a24 24 0 0 1 48 0 V98 Z" fill="#0f1f3d" fill-opacity="0.55"/>
+  <path d="M40 98 V66 a24 24 0 0 1 48 0 V98" fill="none" stroke="url(#tunnel)" stroke-width="7" stroke-linecap="round"/>
+  <path d="M52 98 V72 a12 12 0 0 1 24 0 V98 Z" fill="url(#light)"/>
+  <ellipse cx="52" cy="34" rx="26" ry="14" fill="url(#shine)"/>
+  <circle cx="64" cy="64" r="52" fill="none" stroke="#ffffff" stroke-opacity="0.35" stroke-width="1.5"/>
+</svg>

@@ -1,0 +1,60 @@
+/* The orb: grey when off, amber and breathing while it works, green when
+   carrying, red when something claims a tunnel that is not there. */
+.orb {
+  min-width: 190px;
+  min-height: 190px;
+  border-radius: 9999px;
+  padding: 0;
+  color: white;
+  background-image: radial-gradient(circle at 35% 30%, #b8c2d0, #4d5566 72%);
+  box-shadow: 0 0 0 6px alpha(#4d5566, 0.22), 0 10px 30px alpha(black, 0.30);
+  transition: box-shadow 500ms ease, background-image 500ms ease;
+}
+.orb:hover { box-shadow: 0 0 0 10px alpha(#4d5566, 0.25), 0 10px 34px alpha(black, 0.35); }
+.orb:active { box-shadow: 0 0 0 3px alpha(#4d5566, 0.35), 0 4px 14px alpha(black, 0.3); }
+.orb.on {
+  background-image: radial-gradient(circle at 35% 30%, #8ff0b8, #1a8c52 72%);
+  box-shadow: 0 0 0 8px alpha(#2ec27e, 0.25), 0 0 44px alpha(#2ec27e, 0.55);
+}
+.orb.busy {
+  background-image: radial-gradient(circle at 35% 30%, #ffe680, #c88c0c 72%);
+  animation: orb-breathe 1.6s ease-in-out infinite;
+}
+.orb.dead {
+  background-image: radial-gradient(circle at 35% 30%, #ff9a90, #b21a1e 72%);
+  box-shadow: 0 0 0 8px alpha(#e01b24, 0.25), 0 0 40px alpha(#e01b24, 0.5);
+}
+@keyframes orb-breathe {
+  0%   { box-shadow: 0 0 0 4px alpha(#f5c211, 0.35), 0 0 18px alpha(#f5c211, 0.30); }
+  50%  { box-shadow: 0 0 0 18px alpha(#f5c211, 0.10), 0 0 56px alpha(#f5c211, 0.60); }
+  100% { box-shadow: 0 0 0 4px alpha(#f5c211, 0.35), 0 0 18px alpha(#f5c211, 0.30); }
+}
+.orb .orb-label { font-weight: 800; font-size: 15pt; text-shadow: 0 1px 2px alpha(black, 0.35); }
+.orb image { -gtk-icon-shadow: 0 1px 3px alpha(black, 0.35); }
+
+.phase-title { font-size: 20pt; font-weight: 800; }
+.phase-title.on { color: #26a269; }
+.phase-title.busy { color: #c88800; }
+.phase-title.dead { color: #c01c28; }
+
+.server-chip { border-radius: 9999px; padding: 4px 12px; }
+.server-chip.working { box-shadow: inset 0 0 0 1px alpha(#2ec27e, 0.7); }
+.server-chip.fast { box-shadow: inset 0 0 0 1px alpha(#3584e4, 0.7); }
+
+.rank-badge {
+  min-width: 26px;
+  border-radius: 9999px;
+  padding: 2px 6px;
+  font-weight: 800;
+  font-feature-settings: "tnum";
+  background: alpha(currentColor, 0.1);
+}
+.kind-working { color: #26a269; }
+.kind-fast { color: #1c71d8; }
+.kind-blocked { color: #c01c28; }
+.kind-known { color: alpha(currentColor, 0.6); }
+
+.globe-card { border-radius: 18px; }
+.mono { font-family: monospace; }
+.log-view { font-family: monospace; font-size: 9.5pt; }
+.progress-line { font-family: monospace; font-size: 9pt; opacity: 0.8; }
