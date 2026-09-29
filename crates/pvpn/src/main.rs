@@ -314,6 +314,10 @@ or a session the far end tore down actually shows up.
         #[arg(long, short = 'n', default_value_t = 50)]
         lines: u32,
     },
+    /// Open the window (Protun Unblocked) — what bare `pvpn` does
+    Gui,
+    /// Start just the tray icon, no window
+    Tray,
     /// May the tunnel be rebuilt for you on this network? (for pvpn-autoconnect)
     #[command(name = "autoconnect-check", hide = true)]
     AutoconnectCheck,
@@ -324,6 +328,9 @@ or a session the far end tore down actually shows up.
 const USAGE: &str = "\
 pvpn - simple Proton VPN control
 
+  pvpn                 open the window (Protun Unblocked); `pvpn help` for this
+  pvpn gui             same, explicitly
+  pvpn tray            just the tray icon
   pvpn up              connect to the fastest measured server
   pvpn best            rank the fastest servers you can use
   pvpn best --connect  rank them, then connect to the best
@@ -447,18 +454,64 @@ where
         .block_on(fut)
 }
 
+/// Bare `pvpn`: the window where there is a desktop to put it on, the
+/// usage text where there is not (a TTY-only session, ssh, `PVPN_NO_GUI=1`,
+/// or no `pvpn-gui` installed).
+fn cmd_bare() -> anyhow::Result<i32> {
+    use pvpn_core::gui;
+    if gui::graphical_session() && gui::gui_binary().is_some() {
+        match gui::open_window(&[]) {
+            Ok(()) => {
+                println!("Opening Protun Unblocked. `pvpn help` lists the commands.");
+                return Ok(0);
+            }
+            Err(err) => eprintln!("Could not open the window: {err}\n"),
+        }
+    }
+    print!("{USAGE}");
+    Ok(0)
+}
+
+fn cmd_gui(tray_only: bool) -> anyhow::Result<i32> {
+    use pvpn_core::gui;
+    if gui::gui_binary().is_none() {
+        eprintln!("pvpn-gui is not installed. Install it with: ./setup.sh --gui");
+        return Ok(1);
+    }
+    if !gui::graphical_session() {
+        eprintln!("No desktop session to open a window on (no DISPLAY or WAYLAND_DISPLAY).");
+        return Ok(1);
+    }
+    gui::open_window(if tray_only { &["--tray"] } else { &[] })?;
+    Ok(0)
+}
+
+/// A command that is about to build a tunnel brings the tray icon up, so
+/// there is something on screen to show it and to turn it off with — even
+/// when nobody opened the window. The guard waits briefly on drop for the
+/// request to leave.
+fn tray_for_connect() -> pvpn_core::gui::TrayRequest {
+    pvpn_core::gui::request_tray_in_background()
+}
+
 fn run(cli: Cli) -> anyhow::Result<i32> {
-    match cli.cmd.unwrap_or(Command::Help) {
+    let Some(cmd) = cli.cmd else {
+        return cmd_bare();
+    };
+    match cmd {
         Command::Help => {
             print!("{USAGE}");
             Ok(0)
         }
+        Command::Gui => cmd_gui(false),
+        Command::Tray => cmd_gui(true),
         Command::Up { rejected } => block_on(async move {
             if let Some(message) = connect::up_takes_no_arguments(&rejected) {
                 eprintln!("{message}");
                 return Ok(2);
             }
             let mut session = Session::load()?;
+            let _tray = tray_for_connect();
             let _guard = pvpn_core::lock::acquire().await;
             remember_where_asked();
             Ok(report(
@@ -471,6 +524,7 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
         }),
         Command::Hop { pattern, protocol } => block_on(async move {
             let mut session = Session::load()?;
+            let _tray = tray_for_connect();
             let _guard = pvpn_core::lock::acquire().await;
             remember_where_asked();
             Ok(report(
@@ -488,6 +542,9 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
                 return Ok(i32::from(matches!(health, watch::Health::Dead { .. })));
             }
             let mut session = Session::load()?;
+            // A tunnel is up for this to watch: that is when the tray
+            // belongs on screen, whoever started the tunnel.
+            let _tray = if verify::tunnel_is_up().await { Some(tray_for_connect()) } else { None };
             // No lock here on purpose. `watch` takes one itself, but only
             // around the reconnect it may decide on: the check that comes
             // first is read-only, and making a manual `pvpn up` queue behind
@@ -535,6 +592,7 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
         }
         Command::Apps { fix, verify, apps } => apps_cmd::cmd_apps(fix, verify, &apps),
         Command::Try => block_on(async move {
+            let _tray = tray_for_connect();
             let _guard = pvpn_core::lock::acquire().await;
             login::cmd_try().await
         }),
@@ -1247,6 +1305,7 @@ async fn cmd_best(
     let fixture =
         serverlist.or_else(|| std::env::var_os("PVPN_SERVERLIST").map(std::path::PathBuf::from));
     let offline = offline || fixture.is_some();
+    let _tray = (do_connect && !offline).then(tray_for_connect);
 
     // `--serverlist` / `--offline`: rank one file and nothing else. No
     // config, no state, no refresh — this is the path the tests use.

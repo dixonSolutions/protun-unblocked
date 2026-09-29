@@ -107,6 +107,7 @@ pub fn open(app: &Rc<App>, page: Option<&str>) {
     let dialog = adw::PreferencesDialog::builder().search_enabled(true).build();
     dialog.add(&general(app));
     dialog.add(&notifications(app));
+    dialog.add(&proton_page(app));
     dialog.add(&connection(app));
     dialog.add(&autoconnect(app, &dialog));
     dialog.add(&files(app));
@@ -126,6 +127,12 @@ fn general(app: &Rc<App>) -> adw::PreferencesPage {
         window.add(&switch_row("Tray icon", "In the top bar. On GNOME this needs the AppIndicator extension.", s.tray, move |v| {
             with_gui(&a, |g| g.tray = v);
             a.apply_tray();
+        }));
+    }
+    {
+        let a = app.clone();
+        window.add(&switch_row("Tray icon whenever pvpn connects", "pvpn up, hop and try bring the icon up even when this window was never opened", s.tray_with_pvpn, move |v| {
+            with_gui(&a, |g| g.tray_with_pvpn = v)
         }));
     }
     {
@@ -267,6 +274,168 @@ fn notifications(app: &Rc<App>) -> adw::PreferencesPage {
         kinds.add(&switch_row(title, subtitle, value, move |v| with_gui(&a, |g| *field(&mut g.notifications) = v)));
     }
     page.add(&kinds);
+    page
+}
+
+/// Proton's own client settings, through `protonvpn config set`.
+fn proton_page(app: &Rc<App>) -> adw::PreferencesPage {
+    use crate::proton::{self, Kind, SETTINGS};
+    let page = adw::PreferencesPage::builder().title("Proton VPN").icon_name("security-high-symbolic").name("proton").build();
+    let json = std::fs::read_to_string(proton::settings_path()).unwrap_or_default();
+    let initial = proton::from_settings_json(&json);
+    let group = adw::PreferencesGroup::builder()
+        .title("Proton VPN client")
+        .description("The settings Proton's own app has, applied with `protonvpn config set` so Proton's checks apply. They take effect on the next connect. Checking what your plan includes…")
+        .build();
+    let status = group.clone();
+
+    // Rows are built with what settings.json says, then corrected — and
+    // locked where the plan does not include them — once `config list`
+    // answers.
+    let rows: Rc<std::cell::RefCell<Vec<(&'static str, gtk::Widget)>>> = Rc::default();
+    // Changes made by this code, not the user, must not run a command.
+    let quiet = Rc::new(std::cell::Cell::new(true));
+    for setting in &SETTINGS {
+        let value = initial.get(setting.key).cloned().unwrap_or_default();
+        let run = {
+            let a = app.clone();
+            move |argv: Vec<String>| {
+                let a = a.clone();
+                glib::spawn_future_local(async move {
+                    let out = runner::capture(argv.clone()).await;
+                    a.log_output(&argv, &out);
+                    a.toast(&out.headline());
+                });
+            }
+        };
+        let widget: gtk::Widget = match setting.kind {
+            Kind::Choice(choices) => {
+                let labels: Vec<&str> = choices.iter().map(|c| c.0).collect();
+                let row = adw::ComboRow::builder().title(setting.title).subtitle(setting.subtitle).model(&gtk::StringList::new(&labels)).build();
+                row.set_selected(choices.iter().position(|c| c.1 == value).unwrap_or(0) as u32);
+                let key = setting.key;
+                let q = quiet.clone();
+                row.connect_selected_notify(move |r| {
+                    if !q.get() {
+                        run(proton::set_command(key, choices[r.selected() as usize].1, None));
+                    }
+                });
+                row.upcast()
+            }
+            Kind::Toggle => {
+                let row = adw::SwitchRow::builder().title(setting.title).subtitle(setting.subtitle).active(proton::is_on(&value)).build();
+                let key = setting.key;
+                let q = quiet.clone();
+                row.connect_active_notify(move |r| {
+                    if !q.get() {
+                        run(proton::set_command(key, if r.is_active() { "on" } else { "off" }, None));
+                    }
+                });
+                row.upcast()
+            }
+            Kind::Dns => {
+                let row = adw::ExpanderRow::builder()
+                    .title(setting.title)
+                    .subtitle(setting.subtitle)
+                    .show_enable_switch(true)
+                    .enable_expansion(proton::is_on(&value))
+                    .build();
+                let entry = adw::EntryRow::builder().title("Servers, e.g. 1.1.1.1, 9.9.9.9").text(proton::custom_dns_ips(&json).join(", ")).show_apply_button(true).build();
+                row.add_row(&entry);
+                let q = quiet.clone();
+                let e = entry.clone();
+                let run2 = run.clone();
+                row.connect_enable_expansion_notify(move |r| {
+                    if q.get() {
+                        return;
+                    }
+                    if r.enables_expansion() {
+                        let list = e.text().to_string();
+                        if !list.trim().is_empty() {
+                            run2(proton::set_command("custom-dns", "on", Some(&list)));
+                        }
+                    } else {
+                        run2(proton::set_command("custom-dns", "off", None));
+                    }
+                });
+                entry.connect_apply(move |e| run(proton::set_command("custom-dns", "on", Some(&e.text()))));
+                row.upcast()
+            }
+        };
+        group.add(&widget);
+        rows.borrow_mut().push((setting.key, widget));
+    }
+    page.add(&group);
+
+    let (rows2, q) = (rows.clone(), quiet.clone());
+    glib::spawn_future_local(async move {
+        let out = runner::capture(vec!["protonvpn".into(), "config".into(), "list".into()]).await;
+        let listed = proton::parse_config_list(&out.stdout);
+        if listed.is_empty() {
+            status.set_description(Some("The settings Proton's own app has, applied with `protonvpn config set`. Could not read `protonvpn config list`; showing settings.json."));
+            q.set(false);
+            return;
+        }
+        let mut locked = 0;
+        for (key, widget) in rows2.borrow().iter() {
+            let Some(value) = listed.get(*key) else { continue };
+            if value == proton::UPGRADE {
+                widget.set_sensitive(false);
+                widget.set_tooltip_text(Some("Not on your plan"));
+                locked += 1;
+                continue;
+            }
+            let setting = SETTINGS.iter().find(|s| s.key == *key).unwrap();
+            match setting.kind {
+                Kind::Choice(choices) => {
+                    if let (Ok(row), Some(i)) = (widget.clone().downcast::<adw::ComboRow>(), choices.iter().position(|c| c.1 == value)) {
+                        row.set_selected(i as u32);
+                    }
+                }
+                Kind::Toggle => {
+                    if let Ok(row) = widget.clone().downcast::<adw::SwitchRow>() {
+                        row.set_active(proton::is_on(value));
+                    }
+                }
+                Kind::Dns => {
+                    if let Ok(row) = widget.clone().downcast::<adw::ExpanderRow>() {
+                        row.set_enable_expansion(proton::is_on(value));
+                    }
+                }
+            }
+        }
+        status.set_description(Some(&if locked > 0 {
+            format!("The settings Proton's own app has, applied with `protonvpn config set`. They take effect on the next connect. {locked} need a paid plan.")
+        } else {
+            "The settings Proton's own app has, applied with `protonvpn config set`. They take effect on the next connect.".to_string()
+        }));
+        q.set(false);
+    });
+
+    let account = adw::PreferencesGroup::builder().title("Proton account").build();
+    let info = adw::ActionRow::builder().title("Account and plan").subtitle("protonvpn info").activatable(true).build();
+    info.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
+    {
+        let a = app.clone();
+        info.connect_activated(move |_| {
+            let a = a.clone();
+            glib::spawn_future_local(async move {
+                let out = runner::capture(vec!["protonvpn".into(), "info".into()]).await;
+                a.show_text("Proton account", &out.combined());
+            });
+        });
+    }
+    account.add(&info);
+    let upgrade = adw::ActionRow::builder().title("Plans").subtitle("account.protonvpn.com/pricing — sign out and in again afterwards").activatable(true).build();
+    upgrade.add_suffix(&gtk::Image::from_icon_name("adw-external-link-symbolic"));
+    {
+        let w = app.window.clone();
+        upgrade.connect_activated(move |_| {
+            gtk::UriLauncher::new("https://account.protonvpn.com/pricing").launch(Some(&w), gio::Cancellable::NONE, |_| {});
+        });
+    }
+    account.add(&upgrade);
+    page.add(&account);
     page
 }
 

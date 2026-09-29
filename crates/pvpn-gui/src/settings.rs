@@ -37,6 +37,9 @@ pub struct GuiSettings {
     pub notifications: Notifications,
     /// Show the icon in the top bar (needs an AppIndicator/SNI host).
     pub tray: bool,
+    /// `pvpn up`/`hop`/`try` bring the tray icon up (starting this app
+    /// without a window if it is not running).
+    pub tray_with_pvpn: bool,
     /// Closing the window keeps the tray icon running instead of quitting.
     pub close_to_tray: bool,
     /// Start with the session.
@@ -67,6 +70,7 @@ impl Default for GuiSettings {
         Self {
             notifications: Notifications::default(),
             tray: true,
+            tray_with_pvpn: true,
             close_to_tray: true,
             autostart: false,
             start_hidden: true,
@@ -147,7 +151,7 @@ pub fn apply_autostart(settings: &GuiSettings) -> anyhow::Result<()> {
         let exe = std::env::current_exe()
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|_| "pvpn-gui".into());
-        let hidden = if settings.start_hidden { " --hidden" } else { "" };
+        let hidden = if settings.start_hidden { " --tray" } else { "" };
         std::fs::write(
             &path,
             format!(

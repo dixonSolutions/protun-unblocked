@@ -29,10 +29,12 @@ pvpn forget    lift a block by hand
 See [docs/architecture.md](docs/architecture.md) for how it fits together,
 including why the daemon this used to have was removed.
 
-Prefer a window? **Protun Unblocked** (`pvpn-gui`) is a GTK4/libadwaita app
-over the same CLI: one orb to connect, a globe of the servers this network
-has ranked, a tray icon, and notifications you can switch on and off one by
-one. See [docs/gui.md](docs/gui.md).
+Prefer a window? Run bare `pvpn`. **Protun Unblocked** (`pvpn-gui`) is a
+GTK4/libadwaita app that wraps Proton VPN — Proton's countries, features and
+settings — with everything above on top: one orb to connect, a globe of the
+servers this network has ranked, a tray icon that comes up whenever `pvpn`
+connects, and notifications you can switch on and off one by one. It is in
+the app grid and on the desktop. See [docs/gui.md](docs/gui.md).
 
 ## Why this exists
 

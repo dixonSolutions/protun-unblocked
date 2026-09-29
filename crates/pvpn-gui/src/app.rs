@@ -170,8 +170,9 @@ impl App {
         bp.add_setter(&bottom, "reveal", Some(&true.to_value()));
         self.window.add_breakpoint(bp.clone());
 
-        let pages: [(&str, &str, &str, gtk::Widget); 5] = [
+        let pages: [(&str, &str, &str, gtk::Widget); 6] = [
             ("connect", "Connect", "network-vpn-symbolic", crate::pages::connect::build(self, &bp)),
+            ("countries", "Countries", "mark-location-symbolic", crate::pages::countries::build(self)),
             ("servers", "Servers", "view-list-bullet-symbolic", crate::pages::servers::build(self)),
             ("history", "History", "document-open-recent-symbolic", crate::pages::history::build(self)),
             ("logs", "Logs", "utilities-terminal-symbolic", crate::pages::logs::build(self)),
@@ -204,7 +205,7 @@ impl App {
             return;
         };
         let _ = std::fs::create_dir_all(&dir);
-        let pages = ["connect", "servers", "history", "logs", "system"];
+        let pages = ["connect", "countries", "servers", "history", "logs", "system"];
         let a = self.clone();
         glib::spawn_future_local(async move {
             a.present();
@@ -281,6 +282,7 @@ impl App {
         add("connect", Box::new(|a| a.toggle_connection()));
         add("hop", Box::new(|a| a.hop(None)));
         add("cancel", Box::new(|a| a.runner.cancel()));
+        add("tray", Box::new(|a| a.ensure_tray()));
         self.gapp.set_accels_for_action("app.quit", &["<Control>q"]);
         self.gapp.set_accels_for_action("app.preferences", &["<Control>comma"]);
         self.gapp.set_accels_for_action("app.refresh", &["<Control>r", "F5"]);
@@ -314,6 +316,17 @@ impl App {
         dialog.set_extra_child(Some(&label));
         dialog.add_response("close", "Close");
         dialog.present(Some(&self.window));
+    }
+
+    /// `app.tray` / `--tray`: show the tray icon, not the window. If the
+    /// icon is switched off there is nothing to show, and an instance that
+    /// was started only for it has no reason to stay.
+    pub fn ensure_tray(self: &Rc<Self>) {
+        if self.settings.borrow().tray {
+            self.apply_tray();
+        } else if !self.window.is_visible() {
+            self.quit();
+        }
     }
 
     pub fn present(&self) {

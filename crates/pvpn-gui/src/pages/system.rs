@@ -34,6 +34,18 @@ pub fn build(app: &Rc<App>) -> gtk::Widget {
         view.connect_clicked(move |_| a.run_to_dialog("Account", &["account", "--view"]));
     }
     who.add_suffix(&view);
+    let plan = button("Plan", "protonvpn info — Proton's own account summary");
+    {
+        let a = app.clone();
+        plan.connect_clicked(move |_| {
+            let a = a.clone();
+            glib::spawn_future_local(async move {
+                let out = crate::runner::capture(vec!["protonvpn".into(), "info".into()]).await;
+                a.show_text("Proton account", &out.combined());
+            });
+        });
+    }
+    who.add_suffix(&plan);
     account.add(&who);
     let signin = adw::ActionRow::builder()
         .title("Sign in")

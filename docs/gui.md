@@ -1,17 +1,37 @@
 # Protun Unblocked — the window
 
-`pvpn-gui` is a GTK4 + libadwaita front end for `pvpn`. It runs the
-installed `pvpn` for everything that changes the network, and reads what
-`pvpn` has written down for everything it shows. Anything the window does,
-the CLI does too; the window adds a tray icon, notifications, a globe, and
-editors for every file involved.
+`pvpn-gui` is a GTK4 + libadwaita app that wraps Proton VPN: everything
+Proton's own app offers — quick connect, countries and cities, P2P, Secure
+Core, Tor and streaming servers, NetShield, kill switch, port forwarding,
+custom DNS, VPN Accelerator, moderate NAT, IPv6, account and plan — plus
+what `pvpn` adds for networks that filter Proton: measured and proven
+servers per network, blocks, history, a connect that cannot strand you, and
+the always-on machinery. It runs the installed `pvpn` for everything that
+changes the network, Proton's `protonvpn config` for Proton's settings, and
+reads what both have written down for everything it shows.
 
 ```bash
-pvpn-gui            # open the window
-pvpn-gui --hidden   # start in the tray (what "Start with the session" runs)
+pvpn                # open the window (in a desktop session; `pvpn help` for commands)
+pvpn gui            # the same, explicitly
+pvpn tray           # just the tray icon
+pvpn-gui --tray     # the same, directly (what "Start with the session" runs)
 ```
 
-A second launch raises the first.
+It is also in the app grid and on the desktop. One instance per session: a
+second launch hands over to the first. Bare `pvpn` prints the usage text
+instead where there is no display, or with `PVPN_NO_GUI=1`.
+
+## The tray comes with pvpn
+
+`pvpn up`, `hop`, `try` and `best --connect` — and `pvpn watch` while a
+tunnel is up — ask for the tray icon, whether or not the window was ever
+opened. The request goes over the session bus (`app.tray`); if the app is
+not running, the bus starts it from
+`~/.local/share/dbus-1/services/io.github.dixonsolutions.ProtunUnblocked.service`,
+in a cgroup of its own, so a request from inside the autoconnect or watch
+unit survives that unit finishing. The icon comes up alone; the window does
+not open. Preferences → General → "Tray icon whenever pvpn connects" turns
+this off, as does `PVPN_NO_GUI=1` for one command.
 
 ## It watches; it does not reconnect
 
@@ -30,6 +50,7 @@ pvpn's connect lock while they do) and tells you.
 
 | page | what it is |
 |---|---|
+| **Countries** | Proton's whole catalogue by country and city, filtered to all / P2P / Secure Core / Tor / streaming, with load, features and what your plan allows (countries you can use sort first). Fastest or random — anywhere, in a country, or in a city — picks by Proton's score and connects through `pvpn hop`, so the connect is guarded and what fails is remembered. Rows say which servers work or are blocked on this network. |
 | **Connect** | The orb: grey off, amber while working (click to cancel — SIGINT, so pvpn restores routing), green when the tunnel carries, red when something claims a tunnel that is not there. Protocol choice, Switch server, Measure & connect, Check. A globe with every server this network knows, the ranked ones numbered; drag to turn, scroll to zoom, click one to connect or lift its block. The fastest few as one-click chips. |
 | **Servers** | `pvpn servers`, `working`, `fast`, `blocked` and the ranking, per network, with search. Measure & rank (`pvpn best`), quick rank, measure-and-connect, lift one block or all. |
 | **History** | `pvpn history`: every attempt, how long, what happened; per network or all. |
@@ -54,6 +75,11 @@ Kept separate from the connect page, and meant to cover everything:
   for Connect, which `pvpn` to run, ranking options, globe labels.
 - **Notifications** — a master switch and one each for *connected*,
   *disconnected*, *reconnecting*, *reconnected* and *failure*; a test button.
+- **Proton VPN** — Proton's own client settings: NetShield, kill switch,
+  port forwarding, VPN Accelerator, moderate NAT, IPv6, custom DNS,
+  anonymous crash reports. Applied with `protonvpn config set`, read back
+  from `protonvpn config list`; settings your plan does not include are
+  shown locked. Account and plan (`protonvpn info`).
 - **Connection** — every key in `~/.config/pvpn/config.toml`. Edited in
   place: comments and unknown keys survive, and nothing is written that
   `pvpn` would refuse to load.

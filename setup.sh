@@ -21,7 +21,7 @@
 #   ~/.local/bin/pvpn          the CLI (one binary, nothing runs in the background)
 #   ~/.local/bin/vpn-check
 #   ~/.local/share/pvpn/       Python shims (sitecustomize, sign-in)
-#   ~/.local/bin/pvpn-gui      the window + tray (when GTK4/libadwaita are there)
+#   ~/.local/bin/pvpn-gui      the window + tray (bare `pvpn` opens it; needs GTK4/libadwaita)
 #
 # --always-on is the one exception: it needs sudo and writes root-owned files
 # under /etc and /usr/local/sbin. It is opt-in and never runs by default.
@@ -587,15 +587,35 @@ install_gui() {
     install -Dm644 "$data/icons/$GUI_ID.svg" "$ICONS_DIR/scalable/apps/$GUI_ID.svg"
     install -Dm644 "$data/icons/$GUI_ID-symbolic.svg" "$ICONS_DIR/symbolic/apps/$GUI_ID-symbolic.svg"
     ok "icon installed"
+    # So `pvpn up` from a systemd unit (autoconnect, the watch timer) can
+    # bring the tray up: the session bus starts the window in a unit of its
+    # own instead of it dying with the oneshot that asked.
+    local dbus_dir="$HOME/.local/share/dbus-1/services"
+    mkdir -p "$dbus_dir"
+    printf '[D-BUS Service]\nName=%s\nExec=%s --gapplication-service\n' \
+        "$GUI_ID" "$BIN/pvpn-gui" > "$dbus_dir/$GUI_ID.service"
+    ok "$dbus_dir/$GUI_ID.service"
+    # A shortcut on the desktop as well as in the app grid.
+    local desktop_dir
+    desktop_dir="$(xdg-user-dir DESKTOP 2>/dev/null || echo "$HOME/Desktop")"
+    if [[ -d "$desktop_dir" && "$desktop_dir" != "$HOME" ]]; then
+        install -m755 "$APPS_DIR/$GUI_ID.desktop" "$desktop_dir/$GUI_ID.desktop"
+        command -v gio >/dev/null 2>&1 \
+            && gio set "$desktop_dir/$GUI_ID.desktop" metadata::trusted true 2>/dev/null || true
+        ok "desktop shortcut in $desktop_dir"
+    fi
     command -v gtk-update-icon-cache >/dev/null 2>&1 \
         && gtk-update-icon-cache -q -t "$ICONS_DIR" 2>/dev/null || true
     command -v update-desktop-database >/dev/null 2>&1 \
         && update-desktop-database -q "$APPS_DIR" 2>/dev/null || true
-    note "Open \"Protun Unblocked\" from your apps, or run: pvpn-gui"
+    note "Open \"Protun Unblocked\" from your apps or desktop, or just run: pvpn"
     note "The tray icon needs an AppIndicator host (on GNOME: the AppIndicator extension)."
 }
 
 remove_gui() {
+    local desktop_dir
+    desktop_dir="$(xdg-user-dir DESKTOP 2>/dev/null || echo "$HOME/Desktop")"
+    rm -f "$desktop_dir/$GUI_ID.desktop" "$HOME/.local/share/dbus-1/services/$GUI_ID.service"
     rm -f "$BIN/pvpn-gui" "$APPS_DIR/$GUI_ID.desktop" \
         "$ICONS_DIR/scalable/apps/$GUI_ID.svg" "$ICONS_DIR/symbolic/apps/$GUI_ID-symbolic.svg" \
         "${XDG_CONFIG_HOME:-$HOME/.config}/autostart/$GUI_ID.desktop"
