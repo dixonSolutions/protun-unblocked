@@ -360,6 +360,7 @@ pub fn steer_cache(
         release_steer(serverlist);
         return Err(SteerError::NoMatch);
     }
+    hold_off_refresh(&mut data);
     std::fs::write(serverlist, serde_json::to_vec(&data)?)?;
     Ok(SteerResult {
         kept,
@@ -368,6 +369,35 @@ pub fn steer_cache(
         backup,
         serverlist: serverlist.to_path_buf(),
     })
+}
+
+/// How long a steered cache claims to be fresh: longer than any connect,
+/// short enough that a steer stranded by a kill does not linger.
+const STEER_FRESH_SECS: f64 = 600.0;
+
+/// Keep `protonvpn connect` from refreshing the list it is about to pick from.
+///
+/// The connect refreshes loads whenever `LoadsExpirationTime` has passed,
+/// which Proton sets about fifteen minutes out, and a loads update writes
+/// `Status` back onto every server — un-hiding everything the steer hid.
+/// On 2026-10-04 `pvpn hop US` and `pvpn hop US-FREE#118` both landed on
+/// CA-FREE#23 that way: `/vpn/v1/loads` answered, then Proton picked its
+/// fastest server overall. The backup keeps Proton's real expiry times, so
+/// restoring the cache puts them back.
+fn hold_off_refresh(data: &mut Value) {
+    let Some(object) = data.as_object_mut() else {
+        return;
+    };
+    let Ok(now) = SystemTime::now().duration_since(UNIX_EPOCH) else {
+        return;
+    };
+    let fresh_until = now.as_secs_f64() + STEER_FRESH_SECS;
+    for key in ["ExpirationTime", "LoadsExpirationTime"] {
+        let current = object.get(key).and_then(Value::as_f64).unwrap_or(0.0);
+        if current < fresh_until {
+            object.insert(key.to_string(), Value::from(fresh_until));
+        }
+    }
 }
 
 /// Put Proton's data back. Safe to call when `backup` does not exist.
@@ -586,6 +616,37 @@ mod tests {
         assert!(
             (inventory_valid_for_secs(&path).unwrap() - before).abs() <= 1,
             "a cache that can still be refreshed normally must not be extended"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_steer_holds_off_proton_refreshing_it_away() {
+        let dir = tempdir();
+        let path = write_list_expiring(&dir, -60.0);
+        let read = |p: &Path| -> Value {
+            serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap()
+        };
+        let original = read(&path)["LoadsExpirationTime"].as_f64().unwrap();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+
+        let steered = steer_cache(&path, SteerMode::Only, "SG-FREE").unwrap();
+        let data = read(&path);
+        for key in ["ExpirationTime", "LoadsExpirationTime"] {
+            assert!(
+                data[key].as_f64().unwrap() > now + 60.0,
+                "{key} expired, so the connect would refresh and undo the steer"
+            );
+        }
+
+        restore_cache(&steered.backup, &path);
+        assert_eq!(
+            read(&path)["LoadsExpirationTime"].as_f64().unwrap(),
+            original,
+            "restoring puts Proton's own expiry back"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
