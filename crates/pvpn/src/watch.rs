@@ -63,6 +63,28 @@ const CONFIRMATIONS: u32 = 3;
 /// check fits inside the timer interval with room to spare.
 const CONFIRM_GAP: Duration = Duration::from_secs(2);
 
+/// How long a tunnel that failed its confirmations gets to come back on its
+/// own before anyone is blamed.
+///
+/// Proton's client heals a stalled carrier by itself, but slowly. Measured
+/// 2026-10-04 on `wifi:ratradinternet`, US-FREE#86 over protun-tls:
+///
+/// | time | what happened |
+/// |---|---|
+/// | 19:17:02 | first `HANDSHAKE(KEEPALIVE + REKEY_TIMEOUT)` — carrier silent |
+/// | 19:17:10 | `pvpn watch` calls it dead, writes US-FREE#86 off for a day |
+/// | 19:18:10 | `too many packets without response` |
+/// | 19:18:14 | `tunnel established` — same server, new stream, carrying |
+///
+/// That evening five such stalls retired the one server that worked there,
+/// and every `pvpn up` after them spent 30-40 s on servers it had never
+/// tried. Ninety seconds covers the ~70 s the client takes to notice plus
+/// its reconnect, and still finishes inside the two-minute timer interval.
+const SELF_HEAL_GRACE: Duration = Duration::from_secs(90);
+
+/// Gap between probes while waiting out [`SELF_HEAL_GRACE`].
+const SELF_HEAL_POLL: Duration = Duration::from_secs(10);
+
 /// What the tunnel is doing right now.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Health {
@@ -111,11 +133,6 @@ pub async fn check() -> Health {
         if verify::carrying_now(PROBE_TIMEOUT).await {
             return Health::Carrying;
         }
-        // Between probes, not before the first: the uplink question only
-        // becomes interesting once something has already failed.
-        if matches!(blocking(link::health).await, LinkHealth::Down) {
-            return Health::LinkDown;
-        }
         // The tunnel can be torn down under us mid-check — by a manual
         // `pvpn down` in another terminal, or by the plugin giving up. That
         // is not a dead server, it is no server.
@@ -125,6 +142,33 @@ pub async fn check() -> Health {
         if attempt + 1 < CONFIRMATIONS {
             tokio::time::sleep(CONFIRM_GAP).await;
         }
+    }
+
+    // Three failures in a row is a stall, not yet a death: Proton's client
+    // may be about to rebuild the carrier itself. Only a tunnel still silent
+    // after that has had its chance is anybody's fault.
+    let waited = std::time::Instant::now();
+    while waited.elapsed() < SELF_HEAL_GRACE {
+        tokio::time::sleep(SELF_HEAL_POLL).await;
+        if verify::carrying_now(PROBE_TIMEOUT).await {
+            tracing::info!(
+                "tunnel stalled and recovered on its own after {:?}",
+                waited.elapsed()
+            );
+            return Health::Carrying;
+        }
+        if !verify::tunnel_is_up().await {
+            return Health::NoTunnel;
+        }
+    }
+
+    // Asked last, not between probes: during Proton's own reconnect the
+    // gateway check has answered `Down` on a wifi that never dropped (18:56
+    // and 19:05 on 2026-10-04 — no disassociation, no kernel event), and a
+    // blip that passes is no evidence about the tunnel either way. A link
+    // still down after the grace is.
+    if matches!(blocking(link::health).await, LinkHealth::Down) {
+        return Health::LinkDown;
     }
 
     let server = match blocking(pvpn_core::dbus::active_proton_server).await {
@@ -359,16 +403,27 @@ mod tests {
         assert_eq!(Health::NoTunnel.describe(), "no tunnel is up");
     }
 
-    /// Three probes two seconds apart have to finish well inside the
-    /// interval the timer fires on, or checks pile up on each other.
+    /// Confirmations plus the self-heal grace have to finish inside the
+    /// two-minute interval the timer fires on, or checks pile up on each
+    /// other.
     #[test]
     fn a_full_confirmation_run_fits_inside_the_timer_interval() {
-        let worst_case =
+        let confirmations =
             PROBE_TIMEOUT * CONFIRMATIONS + CONFIRM_GAP * (CONFIRMATIONS.saturating_sub(1));
+        // The last poll may start just before the grace runs out.
+        let grace = SELF_HEAL_GRACE + SELF_HEAL_POLL + PROBE_TIMEOUT;
+        let worst_case = confirmations + grace;
         assert!(
-            worst_case < Duration::from_secs(60),
+            worst_case < Duration::from_secs(120),
             "a check must not outlast the gap between checks; worst case is {worst_case:?}"
         );
+    }
+
+    /// The grace has to outlast the measured self-heal: ~70 s from the
+    /// carrier going silent to Proton's client rebuilding it.
+    #[test]
+    fn the_grace_outlasts_protons_own_reconnect() {
+        assert!(SELF_HEAL_GRACE >= Duration::from_secs(75));
     }
 
     #[tokio::test(flavor = "multi_thread")]
