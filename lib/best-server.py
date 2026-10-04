@@ -671,7 +671,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         max_tier, logicals = load_server_list(args.serverlist)
     except FileNotFoundError:
         print(f"No cached server list at {args.serverlist}.", file=sys.stderr)
-        print("Run 'pvpn up' once, or 'protonvpn servers', to populate it.", file=sys.stderr)
+        print("Run 'pvpn up' or 'pvpn best' once to populate it.", file=sys.stderr)
         return 2
     except (json.JSONDecodeError, OSError) as error:
         print(f"Could not read {args.serverlist}: {error}", file=sys.stderr)

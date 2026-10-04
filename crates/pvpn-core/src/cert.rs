@@ -71,8 +71,8 @@ json.dump(found, sys.stdout)
 /// in CLI 1.0.3 it prints an account URL and exits in 0.7s. It does boot
 /// the client, which schedules Proton's three refreshers, and then exits
 /// long before any of them can finish — which is why renewal "over Tor"
-/// reported failure for months without ever having sent a request. The same
-/// trap is documented for the server list at `proc::API_TIMEOUT_REACHABLE_SECS`.
+/// reported failure for months without ever having sent a request. The
+/// server list fell into the same trap; `cache::refresh` is its way out.
 ///
 /// The private key is reused, exactly as Proton's own `CertificateRefresher`
 /// does — this asks for a new certificate over the existing key, not a new
@@ -104,13 +104,6 @@ json.dump(
 )
 "#;
 
-/// Where Tor's SOCKS port is, matching [`crate::proc::tor_listening`].
-///
-/// `socks5h` and not `socks5`: the `h` resolves the hostname at the exit
-/// node, so this machine never asks the filtered network's resolver about a
-/// Proton domain — which is the thing being routed around.
-const TOR_SOCKS: &str = "socks5h://127.0.0.1:9050";
-
 /// Ask Proton for a new certificate, over Tor when `via_tor`.
 ///
 /// Routing is untouched either way: this is one API call, not a tunnel.
@@ -118,25 +111,8 @@ const TOR_SOCKS: &str = "socks5h://127.0.0.1:9050";
 /// rather than assert success — see [`status`] for why an exit code is not
 /// evidence here.
 pub fn renew(via_tor: bool, timeout: Duration) -> anyhow::Result<CertStatus> {
-    let shim = crate::paths::shim_dir().to_string_lossy().to_string();
-    let budget = if via_tor {
-        crate::proc::API_TIMEOUT_TOR_SECS
-    } else {
-        crate::proc::API_TIMEOUT_REACHABLE_SECS
-    }
-    .to_string();
-
-    let mut envs: Vec<(&str, &str)> = vec![
-        ("PYTHONPATH", shim.as_str()),
-        ("PVPN_DEBUG", "0"),
-        ("PVPN_API_TIMEOUT", budget.as_str()),
-    ];
-    if via_tor {
-        // Read by the shim's patch 5. Not `torsocks`: LD_PRELOAD cannot
-        // carry Proton's aiohttp transport, and the attempt costs eleven
-        // minutes of IPv6 timeouts. The shim's comment has the measurements.
-        envs.push(("PVPN_SOCKS", TOR_SOCKS));
-    }
+    let owned = crate::proc::proton_api_envs(via_tor);
+    let envs: Vec<(&str, &str)> = owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
 
     let result = crate::proc::run_with_timeout(
         crate::paths::system_python(),

@@ -327,36 +327,36 @@ pub async fn ensure_fresh_data(cfg: &Config, optional: bool) -> anyhow::Result<(
         }
     }
 
-    let shim = match paths::ensure_shim() {
-        Ok(p) => p,
-        Err(err) => {
-            tracing::warn!("could not prepare shim: {err}");
-            paths::shim_dir()
-        }
-    };
+    if let Err(err) = paths::ensure_shim() {
+        tracing::warn!("could not prepare shim: {err}");
+    }
     let timeout = Duration::from_secs(cfg.refresh_timeout_secs);
-    let result = if go_direct {
+    let via_tor = !go_direct;
+    if go_direct {
         tracing::info!("server list is stale; Proton's API is reachable, refreshing directly");
-        blocking(move || proc::protonvpn_servers_direct(&shim, timeout)).await
     } else {
         tracing::info!("server list is stale; refreshing over Tor (routing untouched)");
-        blocking(move || proc::protonvpn_servers_via_tor(&shim, timeout)).await
-    };
-    // `protonvpn servers` exits 0 whether or not it reached the API — on a
-    // filtered network it logs "Server list refresh failed: No working
-    // transports found" and returns success. Proton stamps a new expiry only
-    // when a fetch actually lands, so that, not the exit code, is the test.
+    }
+    let result = blocking(move || cache::refresh(via_tor, timeout)).await;
+    // The file on disk is what Proton's client will read, so a fresh expiry
+    // there — not the helper's word — is the test.
     let landed = cache::inventory_valid_for_secs(&path).unwrap_or(-1) > 0;
     match result {
-        Ok(r) if r.success && landed => {
-            tracing::info!("server list cached");
+        Ok(count) if landed => {
+            tracing::info!("server list refreshed — {count} servers");
+            return Ok(());
         }
-        Ok(r) if r.success => {
-            // Do not guess at the reason. The refresh not landing says only
-            // that it did not land: Tor being unusable and Proton's own API
-            // being down produce byte-identical evidence here, and blaming
-            // Tor for the second sends the user to debug a working Tor
-            // while Proton is 503ing for everybody. So ask.
+        Ok(_) => {
+            tracing::warn!(
+                "Proton sent a server list but the cached one still reads as expired; \
+                 connecting with it anyway"
+            );
+        }
+        Err(err) => {
+            // Do not guess at the reason. Tor being unusable and Proton's
+            // own API being down look identical from here, and blaming Tor
+            // for the second sends the user to debug a working Tor while
+            // Proton is 503ing for everybody. So ask.
             match blocking(|| net::proton_api_health(8)).await {
                 net::ApiHealth::Down(code) => tracing::warn!(
                     "Proton's own API is answering {code} — their outage, not this network \
@@ -367,7 +367,7 @@ pub async fn ensure_fresh_data(cfg: &Config, optional: bool) -> anyhow::Result<(
                      the cached list"
                 ),
                 net::ApiHealth::Answering(code) => tracing::warn!(
-                    "Proton's API answered {code} but the refresh still did not land; \
+                    "Proton's API answered {code} but the server list refresh failed ({err}); \
                      connecting with the cached list"
                 ),
                 net::ApiHealth::Intercepted(code) => tracing::warn!(
@@ -375,9 +375,6 @@ pub async fn ensure_fresh_data(cfg: &Config, optional: bool) -> anyhow::Result<(
                      this network is intercepting it; connecting with the cached list"
                 ),
             }
-        }
-        Ok(_) | Err(_) => {
-            tracing::warn!("refresh failed or timed out; connecting with what we have");
         }
     }
     // The refresh has now been tried and did not land. If the cache is also
@@ -655,9 +652,9 @@ Unlock the keyring (or unlock your desktop login) and run `pvpn up` again — do
 /// Proton's own refresher only ever tries the direct path, and on a filtered
 /// network it logs `Certificate refresh failed: No working transports
 /// found`. After that every connect reaches `Connected` and the local agent
-/// drops it a second later with `ExpiredCertificate`. `protonvpn servers`
-/// is what drives all three refreshers — server list, certificate, client
-/// config — so it is the lever for all of them.
+/// drops it a second later with `ExpiredCertificate`. `cert::renew` asks
+/// the API for a new one itself — `protonvpn servers`, which looks like it
+/// should drive Proton's refreshers, exits before any of them run.
 ///
 /// Direct whenever the API answers, Tor only when it does not. Direct is
 /// the faster route and the one Proton serves reliably, and the case this

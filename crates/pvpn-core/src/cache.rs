@@ -95,6 +95,81 @@ fn inventory_valid_for_secs_at(serverlist: &Path, now: f64) -> Option<i64> {
     Some((expires - now).floor() as i64)
 }
 
+/// Fetches Proton's server list and prints how many servers came back.
+///
+/// `VPNSession.fetch_server_list` writes `serverlist.json` itself, with a
+/// fresh `ExpirationTime`, before it returns. It is the same lever
+/// `cert::RENEW_PY` pulls for the certificate, and for the same reason:
+/// `protonvpn servers` — which this used to run — prints an account URL and
+/// exits in 0.2s without sending a request. Every refresh `pvpn` ever
+/// attempted "did not land", and the list lived on expiry extensions alone.
+/// Measured 2026-10-04: the cache was twelve days old, still listed
+/// US-FREE#26 as online, and the API had it at `Status=0`, load 100 — so
+/// `pvpn hop US` kept picking a server Proton had taken down.
+///
+/// A fresh fetcher has no list loaded, so this never sends
+/// `If-Modified-Since` and never gets a 304 back in place of a list.
+const REFRESH_PY: &str = r#"
+import asyncio, json, sys
+from proton.sso import ProtonSSO
+from proton.vpn.session import VPNSession
+from proton.vpn.session.utils import get_core_api_semver_version
+
+version = get_core_api_semver_version()
+sso = ProtonSSO(
+    appversion=f"linux-vpn-cli@{version}",
+    user_agent=f"ProtonVPN/{version} (Linux; pvpn)",
+)
+session = sso.get_default_session(override_class=VPNSession)
+if not session.authenticated:
+    sys.stderr.write("not signed in\n")
+    sys.exit(3)
+
+async def main():
+    # The fetcher stamps the account's tier into the cache, so it needs
+    # the session's VPN data; a session read from the keyring may not
+    # have it loaded yet.
+    if not session.loaded:
+        await session.fetch_session_data()
+    return await session.fetch_server_list()
+
+servers = asyncio.run(main())
+json.dump({"servers": len(servers)}, sys.stdout)
+"#;
+
+/// Fetch Proton's server list into `serverlist.json`, over Tor when
+/// `via_tor`. Routing is untouched: this is one API call, not a tunnel.
+///
+/// Returns how many servers came back. The caller should still check
+/// [`inventory_valid_for_secs`] rather than trust this — the file on disk
+/// is what Proton's client will read.
+pub fn refresh(via_tor: bool, timeout: std::time::Duration) -> anyhow::Result<usize> {
+    let owned = crate::proc::proton_api_envs(via_tor);
+    let envs: Vec<(&str, &str)> = owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let result = crate::proc::run_with_timeout(
+        crate::paths::system_python(),
+        &["-c", REFRESH_PY],
+        &envs,
+        timeout,
+    )?;
+    if !result.success {
+        anyhow::bail!(
+            "{}",
+            result
+                .stderr
+                .lines()
+                .last()
+                .unwrap_or("the server list request failed")
+                .trim()
+        );
+    }
+    serde_json::from_str::<Value>(result.stdout.trim())
+        .ok()
+        .and_then(|v| v.get("servers")?.as_u64())
+        .map(|n| n as usize)
+        .ok_or_else(|| anyhow::anyhow!("could not read the refreshed server list"))
+}
+
 /// Fields Proton's client checks before deciding its cached list is usable.
 const EXPIRY_FIELDS: [&str; 2] = ["ExpirationTime", "LoadsExpirationTime"];
 

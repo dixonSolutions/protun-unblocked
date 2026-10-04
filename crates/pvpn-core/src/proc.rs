@@ -180,74 +180,49 @@ pub fn protonvpn_signout() -> anyhow::Result<RunResult> {
 /// row, and a full certificate renewal completes in 3.5s. Two seconds cuts
 /// every attempt off half a second before the answer arrives.
 /// `legacy/pvpn.sh:1099` passed its helpers a real budget; the rewrite
-/// dropped it on the Tor path.
+/// dropped it on the Tor path. [`proton_api_envs`] is where it lives now.
 ///
 /// Generous rather than tight, because the alternative to waiting is a
 /// certificate nobody can renew until the user finds a different network.
 pub const API_TIMEOUT_TOR_SECS: u64 = 60;
 
-/// Refresh the cached server list through Tor. Routing is untouched, so
-/// this is slow but safe — the caller's internet keeps working.
+/// Where Tor's SOCKS port is, matching [`tor_listening`].
 ///
-/// Note what this does *not* do: renew the client certificate. It looked as
-/// though it should, since booting Proton's client schedules all three of
-/// its refreshers — but `protonvpn servers` in CLI 1.0.3 prints an account
-/// URL and exits in 0.7s, long before any of them can finish. See
-/// `cert::renew`, which asks the API itself.
-pub fn protonvpn_servers_via_tor(shim: &Path, timeout: Duration) -> anyhow::Result<RunResult> {
-    let args = tor_refresh_args(shim);
-    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
-    run_with_timeout("torsocks", &argv, &[], timeout)
-}
+/// `socks5h` and not `socks5`: the `h` resolves the hostname at the exit
+/// node, so this machine never asks the filtered network's resolver about a
+/// Proton domain — which is the thing being routed around.
+const TOR_SOCKS: &str = "socks5h://127.0.0.1:9050";
 
-/// `torsocks`'s argv for a refresh, split out so the API budget it carries
-/// can be asserted on. Losing that budget is not a hypothetical: it is what
-/// silently disabled certificate renewal on every filtered network.
-fn tor_refresh_args(shim: &Path) -> Vec<String> {
-    vec![
-        "env".to_string(),
-        format!("PYTHONPATH={}", shim.to_string_lossy()),
-        "PVPN_DEBUG=0".to_string(),
-        format!("PVPN_API_TIMEOUT={API_TIMEOUT_TOR_SECS}"),
-        "protonvpn".to_string(),
-        "servers".to_string(),
-    ]
-}
-
-/// Refresh the server list over whatever route this machine already has.
+/// Environment for a Python helper that calls Proton's API itself —
+/// `cert::renew` and `cache::refresh`.
 ///
-/// Tor is the fallback for a network that blocks Proton by name, not the
-/// preferred path: whenever the API can actually be reached — most usefully
-/// once a tunnel is already up, which routes around the very block Tor was
-/// there to dodge — going direct is faster and needs nothing else running.
+/// Both go through the shim, which reads `PVPN_API_TIMEOUT` and, over Tor,
+/// `PVPN_SOCKS` (patch 5). Not `torsocks`: LD_PRELOAD cannot carry Proton's
+/// aiohttp transport, and the attempt costs eleven minutes of IPv6
+/// timeouts. The shim's comment has the measurements.
 ///
-/// This used to say Proton does not serve its VPN API to Tor exits at all,
-/// on the evidence of `000` after 60s over Tor against a clean `200`
-/// direct. That was a misreading of a real measurement. Proton serves Tor
-/// exits perfectly well — `api.protonvpn.ch/vpn/logicals` answers in 2.5s
-/// and a full certificate renewal completes in 3.5s, both measured on
-/// `wifi:detnsw`, 2026-08-31. What fails is `torsocks`, whose LD_PRELOAD
-/// cannot carry Proton's aiohttp transport; the `000` was its IPv6 fan-out
-/// timing out. See the shim's patch 5, which proxies at the transport
-/// instead and works.
-pub fn protonvpn_servers_direct(shim: &Path, timeout: Duration) -> anyhow::Result<RunResult> {
-    let shim_str = shim.to_string_lossy().to_string();
-    run_with_timeout(
-        "env",
-        &[
-            &format!("PYTHONPATH={shim_str}"),
-            "PVPN_DEBUG=0",
-            // The caller has already established that the API answers here,
-            // so the shim's two-second fast-fail is measuring nothing but
-            // its own impatience — and the logicals payload is well over a
-            // megabyte.
-            &format!("PVPN_API_TIMEOUT={API_TIMEOUT_REACHABLE_SECS}"),
-            "protonvpn",
-            "servers",
-        ],
-        &[],
-        timeout,
-    )
+/// The budget matters as much as the route. The shim clamps
+/// `TRANSPORT_TIMEOUT` to [`API_TIMEOUT_BLOCKED_SECS`] by default, which
+/// cuts a Tor request off half a second before the answer arrives, and the
+/// logicals payload is well over a megabyte even direct.
+pub fn proton_api_envs(via_tor: bool) -> Vec<(&'static str, String)> {
+    let budget = if via_tor {
+        API_TIMEOUT_TOR_SECS
+    } else {
+        API_TIMEOUT_REACHABLE_SECS
+    };
+    let mut envs = vec![
+        (
+            "PYTHONPATH",
+            crate::paths::shim_dir().to_string_lossy().to_string(),
+        ),
+        ("PVPN_DEBUG", "0".to_string()),
+        ("PVPN_API_TIMEOUT", budget.to_string()),
+    ];
+    if via_tor {
+        envs.push(("PVPN_SOCKS", TOR_SOCKS.to_string()));
+    }
+    envs
 }
 
 /// Kill any `protonvpn connect` still in flight. The pattern is bracketed
@@ -547,12 +522,11 @@ pub const API_TIMEOUT_BLOCKED_SECS: u64 = 2;
 
 /// API budget for a connect where the API actually answers.
 ///
-/// `protonvpn connect` is the *only* command in CLI 1.0.3 that refreshes the
-/// server list — `protonvpn servers` merely prints a URL. So the connect's
-/// own refresher is the one chance the cache gets to be renewed, and the
-/// two-second fast-fail above kills it before it can land even when the API
-/// is healthy. Given room, that refresh is what stops the cache going stale
-/// and needing its expiry extended in the first place.
+/// `protonvpn connect` is the only *command* in the CLI (1.0.3 through
+/// 1.0.5) that refreshes the server list — `protonvpn servers` merely prints
+/// a URL, which is why `cache::refresh` calls the API itself. The connect's
+/// own refresher is a second chance, and the two-second fast-fail above
+/// kills it before it can land even when the API is healthy.
 pub const API_TIMEOUT_REACHABLE_SECS: u64 = 15;
 
 // --- NetworkManager cleanup -----------------------------------------------
@@ -1894,18 +1868,20 @@ gi.repository.GLib.GError: nm-manager-error-quark: The 'protun' plugin only supp
     }
 
     /// Tor answers Proton's API in about 2.5s from a filtered network. The
-    /// shim's default budget is 2s, so a refresh sent without an explicit
-    /// one is cut off just before the answer arrives — and the only thing
-    /// that renews the client certificate on such a network is this call.
-    /// It reported "could not renew over Tor" for a working Tor until the
-    /// budget came back; do not let it go missing again.
+    /// shim's default budget is 2s, so a request sent without an explicit
+    /// one is cut off just before the answer arrives. It reported "could
+    /// not renew over Tor" for a working Tor until the budget came back; do
+    /// not let it go missing again.
     #[test]
-    fn the_tor_refresh_carries_a_budget_tor_can_meet() {
-        let args = tor_refresh_args(Path::new("/home/u/.local/share/pvpn"));
-        let budget = args
-            .iter()
-            .find_map(|a| a.strip_prefix("PVPN_API_TIMEOUT="))
-            .expect("the Tor refresh must set an API budget")
+    fn the_tor_route_carries_a_budget_tor_can_meet() {
+        let envs = proton_api_envs(true);
+        let get = |key: &str| {
+            envs.iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| v.clone())
+        };
+        let budget = get("PVPN_API_TIMEOUT")
+            .expect("the Tor route must set an API budget")
             .parse::<u64>()
             .expect("a number of seconds");
         assert!(
@@ -1913,7 +1889,8 @@ gi.repository.GLib.GError: nm-manager-error-quark: The 'protun' plugin only supp
             "{budget}s is the fast-fail budget, not a Tor budget"
         );
         assert!(budget >= 10, "{budget}s leaves no room for a Tor circuit");
-        assert!(args.ends_with(&["protonvpn".to_string(), "servers".to_string()]));
+        assert_eq!(get("PVPN_SOCKS").as_deref(), Some(TOR_SOCKS));
+        assert!(proton_api_envs(false).iter().all(|(k, _)| *k != "PVPN_SOCKS"));
     }
 
     #[test]
