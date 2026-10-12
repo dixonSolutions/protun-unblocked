@@ -29,6 +29,13 @@ pvpn forget    lift a block by hand
 See [docs/architecture.md](docs/architecture.md) for how it fits together,
 including why the daemon this used to have was removed.
 
+Prefer a window? Run bare `pvpn`. **Protun Unblocked** (`pvpn-gui`) is a
+GTK4/libadwaita app that wraps Proton VPN — Proton's countries, features and
+settings — with everything above on top: one orb to connect, a globe of the
+servers this network has ranked, a tray icon that comes up whenever `pvpn`
+connects, and notifications you can switch on and off one by one. It is in
+the app grid and on the desktop. See [docs/gui.md](docs/gui.md).
+
 ## Why this exists
 
 Proton's own client works fine on an open network. On a filtered one it has
@@ -90,6 +97,8 @@ refreshes for that host go through Tor automatically (`socks5h://127.0.0.1:9050`
 ./setup.sh --uninstall      # remove the ~/.local pvpn files
 ./setup.sh --always-on      # also put the tunnel back after a suspend
 ./setup.sh --no-always-on   # remove those hooks again
+./setup.sh --gui            # also install GTK4/libadwaita build files for the window
+./setup.sh --no-gui         # skip the window
 ```
 
 `--always-on` is opt-in and needs sudo — it is the only part of this
@@ -231,7 +240,10 @@ commands you already ran: every `pvpn best` pays for the latencies, every
 `pvpn up` and `pvpn hop` pays for the verdicts.
 
 Every connect also checks that your Flatpak apps are on the tunnel and puts
-back any that a proxy setting had taken off it:
+back any that a proxy setting had taken off it — after the connect has
+returned, in a short-lived `pvpn after-connect` process that also renews the
+client certificate when Proton's renewal point has passed. What it did is in
+`~/.local/share/pvpn/after-connect.log`.
 
 ```bash
 pvpn apps                 # anything routed around the tunnel?
@@ -303,6 +315,7 @@ stray `pvpnksintrf0`, and optionally blackholing Proton's API in
 | `country` / `PVPN_BEST_COUNTRY` | | optional country filter |
 | `fix_apps` / `PVPN_FIX_APPS` | true | put Flatpak apps back on the tunnel |
 | `autoconnect_networks` | `"started"` | where a resume or `pvpn watch` may rebuild the tunnel: `"started"` (where you last ran `pvpn up`/`hop`), `"all"`, or a list like `["detnsw", "wired:eth0"]` |
+| `autoconnect_never` | `[]` | networks nothing may rebuild the tunnel on for you, whatever `autoconnect_networks` says |
 | `PVPN_NETWORK` | | pin the network key instead of deriving it from the SSID |
 
 Persisted observations live in `~/.local/share/pvpn/state.json` — per

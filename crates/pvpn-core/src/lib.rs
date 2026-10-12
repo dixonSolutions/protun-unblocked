@@ -13,6 +13,7 @@ pub mod config;
 pub mod dbus;
 pub mod display;
 pub mod geo;
+pub mod gui;
 pub mod intent;
 pub mod link;
 pub mod lock;

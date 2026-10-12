@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Protun Unblocked
+GenericName=VPN
+Comment=Proton VPN for networks that filter it
+Exec=pvpn-gui
+Icon=io.github.dixonsolutions.ProtunUnblocked
+Terminal=false
+Categories=Network;GTK;
+Keywords=vpn;proton;tunnel;stealth;
+StartupNotify=true
+X-GNOME-UsesNotifications=true

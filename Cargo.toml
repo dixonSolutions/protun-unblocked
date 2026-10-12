@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/pvpn-core",
     "crates/pvpn",
+    "crates/pvpn-gui",
 ]
 # `legacy/pvpnd` is the removed daemon, kept for reference only. It is not
 # built, and naming it here stops cargo treating it as a stray member.

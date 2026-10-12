@@ -634,6 +634,65 @@ impl State {
         protocols.into_iter().next().map(|(name, _, _)| name)
     }
 
+    /// Every protocol that has carried traffic here recently, in no
+    /// particular order.
+    ///
+    /// [`proven_protocol`](Self::proven_protocol) answers "which one should
+    /// the next Proton connect use"; this answers the looser question the
+    /// hot path asks of a *saved* profile — "has this network been seen to
+    /// pass what the profile runs?". Looser on purpose: a `protun-tls`
+    /// profile is worth activating on a network where `protun-tcp` is the
+    /// faster choice, and worthless on one where only OpenVPN has ever
+    /// carried. Measured 2026-09-21 on `wifi:detnsw`: the hot path picked
+    /// SG-FREE#2, whose saved profile is OpenVPN over UDP on a network that
+    /// drops VPN UDP, waited thirty-five seconds for a handshake that was
+    /// never coming, and then fell back to Proton's client. Every success
+    /// here for a fortnight had been over protun.
+    ///
+    /// Same window as `proven_protocol`, so a protocol that stops working
+    /// here stops qualifying profiles within an evening.
+    pub fn proven_protocols(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .events()
+            .into_iter()
+            .filter(|e| e.outcome == "ok" && !e.protocol.is_empty())
+            .take(RECENT_SUCCESSES)
+            .map(|e| e.protocol)
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    /// Would a saved profile running `protocol` be worth activating here?
+    ///
+    /// Yes when its family — `protun`, `openvpn`, `wireguard` — has carried
+    /// traffic on this network recently, and also when nothing has been
+    /// recorded here at all, because then there is nothing to say against
+    /// it. A `None` protocol is a profile that will not say what it runs,
+    /// and it qualifies too: refusing it would mean never using a
+    /// profile this tool saved before it learned to read them.
+    pub fn profile_protocol_is_plausible(&self, protocol: Option<&str>) -> bool {
+        let Some(protocol) = protocol else {
+            return true;
+        };
+        let proven = self.proven_protocols();
+        if proven.is_empty() {
+            return true;
+        }
+        let family = crate::proc::protocol_family(protocol);
+        proven
+            .iter()
+            .any(|p| crate::proc::protocol_family(p) == family)
+    }
+
+    /// How long this server has been taking to carry traffic here, from
+    /// activation to the first proven packet — the number the hot path
+    /// budgets its patience by. `None` until it has been timed.
+    pub fn expected_ready_ms(&self, name: &str) -> Option<f64> {
+        self.servers().get(name).and_then(|stat| stat.ema_ready_ms)
+    }
+
     /// Every network's connect history, newest first, tagged with which
     /// network it happened on. For `pvpn history --all`.
     pub fn all_events(&self) -> Vec<(String, Event)> {
@@ -1323,5 +1382,51 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn a_saved_profile_qualifies_only_on_a_transport_this_network_passes() {
+        let mut state = State::default();
+        state.set_network("wifi:detnsw");
+        let now = Utc::now();
+        for protocol in ["protun-tcp", "protun-tcp", "protun-tls"] {
+            state.record_event(Event {
+                at: now,
+                server: "JP-FREE#33".into(),
+                protocol: protocol.into(),
+                outcome: "ok".into(),
+                detail: None,
+                seconds: Some(1),
+                ready_ms: Some(900),
+            });
+        }
+        // An OpenVPN-over-UDP profile on a network that has only ever
+        // carried protun: the 2026-09-21 thirty-five-second mistake.
+        assert!(!state.profile_protocol_is_plausible(Some("openvpn-udp")));
+        assert!(state.profile_protocol_is_plausible(Some("protun-tcp")));
+        // Same family, other transport: worth a try.
+        assert!(state.profile_protocol_is_plausible(Some("protun-tls")));
+        // A profile that will not say what it runs is not refused for it.
+        assert!(state.profile_protocol_is_plausible(None));
+        let mut protocols = state.proven_protocols();
+        protocols.sort();
+        assert_eq!(protocols, vec!["protun-tcp", "protun-tls"]);
+    }
+
+    #[test]
+    fn an_unknown_network_has_nothing_to_say_against_any_profile() {
+        let mut state = State::default();
+        state.set_network("wifi:somewhere-new");
+        assert!(state.profile_protocol_is_plausible(Some("openvpn-udp")));
+        assert!(state.proven_protocols().is_empty());
+    }
+
+    #[test]
+    fn expected_ready_time_is_the_recorded_moving_average() {
+        let mut state = State::default();
+        state.set_network("wifi:detnsw");
+        assert_eq!(state.expected_ready_ms("JP-FREE#33"), None);
+        state.record_verified_ready("JP-FREE#33", 900);
+        assert_eq!(state.expected_ready_ms("JP-FREE#33"), Some(900.0));
     }
 }

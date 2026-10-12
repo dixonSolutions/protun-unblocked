@@ -201,6 +201,16 @@ at once when no tunnel is up, holds no state between firings, and records what
 it finds whether or not it is allowed to reconnect. `pvpn-autoconnect --off`
 stops it reconnecting; it goes on telling you.
 
+One more thing it does when the answer is "carrying": it starts
+`pvpn cert --renew --if-due`, detached, which reads the remembered
+certificate expiry (`~/.local/share/pvpn/cert.json`) and exits unless
+Proton's renewal point has passed — in which case it renews through the
+tunnel that is up right now, while that is still one cheap API call, and
+writes what happened to `~/.local/share/pvpn/cert-renew.log`. A carrying
+tunnel is the moment renewal is free, and a check every two minutes means
+the five-day window is never missed for want of a connect falling inside it.
+A failed renewal is not retried for fifteen minutes.
+
 ```bash
 systemctl --user disable --now pvpn-watch.timer   # stop it asking entirely
 systemctl --user list-timers pvpn-watch.timer     # when it next will
@@ -253,6 +263,18 @@ you type writes the network's key to `~/.local/share/pvpn/autoconnect-network`;
 the hook's own reconnects run with `PVPN_AUTOCONNECT=1` and never write it,
 so an automatic reconnect cannot move the line it was checked against. Until
 you have run `pvpn up` somewhere, `"started"` reconnects nowhere.
+
+And the opposite list, for the network you connect on by hand but never want
+fought over:
+
+```toml
+autoconnect_never = ["ratradinternet"]            # never these, whatever the above says
+```
+
+`autoconnect_never` is checked first and wins over every mode, `"all"`
+included — so running `pvpn up` on that network once cannot quietly make it
+the `"started"` one. The window's Preferences → Autoconnect has a single
+"Never reconnect automatically here" switch for the network you are on.
 
 Outside the chosen networks the resume still repairs DNS, and `pvpn watch`
 still checks and records a dead tunnel — it just does not rebuild one. This

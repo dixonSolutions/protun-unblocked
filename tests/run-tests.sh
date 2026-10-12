@@ -86,10 +86,29 @@ fi
 
 head_ "Unit tests: Rust workspace"
 if command -v cargo >/dev/null 2>&1; then
-    if (cd "$REPO" && cargo test --workspace --offline --quiet); then
+    # The window needs GTK's development files; the CLI must not.
+    scope=(--workspace)
+    if ! pkg-config --exists gtk4 libadwaita-1 2>/dev/null; then
+        scope+=(--exclude pvpn-gui)
+        printf '  --   GTK4/libadwaita dev files missing, skipping pvpn-gui\n'
+    fi
+    if (cd "$REPO" && cargo test "${scope[@]}" --offline --quiet); then
         printf '  ok   cargo test\n'
     else
         FAILED+=("cargo test")
+    fi
+
+    # Cargo unifies features across a workspace build. If anything turns on
+    # zbus's `tokio` feature, pvpn's blocking D-Bus calls panic inside its
+    # own runtime ("Cannot start a runtime from within a runtime") — on
+    # every command that reads the network. The tray library did exactly
+    # that once; this keeps it from coming back.
+    if (cd "$REPO" && cargo tree --workspace --offline -e features -i zbus 2>/dev/null) \
+            | grep -q 'zbus feature "tokio"'; then
+        printf '  FAIL zbus built with its tokio feature — pvpn would panic\n'
+        FAILED+=("zbus tokio feature")
+    else
+        printf '  ok   zbus stays on async-io\n'
     fi
 else
     printf '  --   cargo not installed, skipping Rust tests\n'

@@ -1,0 +1,25 @@
+[package]
+name = "pvpn-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Protun Unblocked: a GTK4/libadwaita window and tray icon over pvpn."
+
+[[bin]]
+name = "pvpn-gui"
+path = "src/main.rs"
+
+[dependencies]
+pvpn-core = { path = "../pvpn-core" }
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+anyhow.workspace = true
+chrono.workspace = true
+gtk = { package = "gtk4", version = "0.11", features = ["v4_16"] }
+adw = { package = "libadwaita", version = "0.9", features = ["v1_7"] }
+# async-io, not tokio: ksni's tokio feature switches zbus to tokio for the whole
+# workspace, and pvpn's blocking D-Bus calls then panic inside its runtime.
+ksni = { version = "0.3", default-features = false, features = ["async-io", "blocking"] }
+async-channel = "2"
+toml_edit = "0.22"

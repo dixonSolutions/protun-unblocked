@@ -22,7 +22,17 @@ const STATUS_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 pub struct Session {
     pub config: Config,
     pub state: State,
+    /// When the network key was last resolved, so a command that loads a
+    /// session and immediately asks again does not pay for `nmcli` twice.
+    network_resolved_at: std::time::Instant,
 }
+
+/// How long a resolved network key is taken as still current.
+///
+/// Long enough to cover a command's own setup — load, lock, connect — and
+/// far shorter than the seconds a check or a connect takes, after which
+/// the question is asked again for real.
+const NETWORK_KEY_FRESH_FOR: Duration = Duration::from_secs(2);
 
 /// What `pvpn status` reports. `tunneled` is the part `protonvpn status`
 /// cannot tell you.
@@ -71,7 +81,11 @@ impl Session {
         config.apply_env_overrides();
         let mut state = State::load(&Config::state_path())?;
         state.set_network(proc::active_network_key());
-        Ok(Self { config, state })
+        Ok(Self {
+            config,
+            state,
+            network_resolved_at: std::time::Instant::now(),
+        })
     }
 
     pub fn network(&self) -> &str {
@@ -82,7 +96,11 @@ impl Session {
     /// connect can take two minutes, which is long enough to roam.
     /// Returns true if this is a different network than the last check.
     pub async fn sync_network(&mut self) -> bool {
+        if self.network_resolved_at.elapsed() < NETWORK_KEY_FRESH_FOR {
+            return false;
+        }
         let key = blocking(proc::active_network_key).await;
+        self.network_resolved_at = std::time::Instant::now();
         let changed = self.state.set_network(key.clone());
         if changed {
             tracing::info!("on {key} — using what we know about servers here");
@@ -109,13 +127,22 @@ impl Session {
     /// default: a status that only reads routes is the one that reported
     /// `Connected` at 08:02 over a tunnel that had been dead since 08:00.
     pub async fn status_with_probe(&self, probe: Option<Duration>) -> Status {
-        let result = blocking(|| proc::protonvpn_status().ok()).await;
-        let stdout = result.as_ref().map(|r| r.stdout.as_str()).unwrap_or("");
-        let network_manager_server = blocking(proc::active_proton_server).await;
-        let connected = proc::is_connected(stdout) || network_manager_server.is_some();
-        let server_desc =
-            proc::current_server_desc(stdout).or_else(|| network_manager_server.clone());
-        let protocol = blocking(proc::current_protocol).await;
+        // What Proton's client believes, from the file it believes it in —
+        // not from `protonvpn status`, which is 3.7s of Python to read the
+        // same file. See `proc::proton_client_persisted`.
+        let persisted = proc::proton_client_persisted();
+        let network_manager_server =
+            blocking(pvpn_core::dbus::active_proton_server_or_nmcli).await;
+        let connected = persisted.is_some() || network_manager_server.is_some();
+        let server_desc = network_manager_server
+            .clone()
+            .or_else(|| persisted.as_ref().and_then(|p| p.server.clone()));
+        let protocol = match persisted.as_ref().filter(|p| !p.protocol.is_empty()) {
+            Some(p) => p.protocol.clone(),
+            None => blocking(proc::active_profile_protocol)
+                .await
+                .unwrap_or_else(|| blocking_protocol_setting()),
+        };
         // Only worth the probes when something claims to be up.
         let tunneled = connected && blocking(proc::tunnel_is_real).await;
         let stray_route = if tunneled {
@@ -140,6 +167,12 @@ impl Session {
             stray_route,
         }
     }
+}
+
+/// Proton's configured protocol — what the next client connect would use —
+/// for a status screen with nothing attached to read a real one off.
+fn blocking_protocol_setting() -> String {
+    proc::current_protocol()
 }
 
 /// Run a blocking call off the runtime threads. `protonvpn connect` can

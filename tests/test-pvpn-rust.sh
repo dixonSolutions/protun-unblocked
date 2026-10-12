@@ -24,6 +24,8 @@ if ! (cd "$REPO" && cargo build -p pvpn --quiet); then
 fi
 
 PVPN="$REPO/target/debug/pvpn"
+# Nothing in the suite may open a window or ask for the tray.
+export PVPN_NO_GUI=1
 
 FIXTURE_DIR="$(mktemp -d)"
 FIXTURE="$FIXTURE_DIR/serverlist.json"
@@ -171,6 +173,15 @@ out="$(run_pvpn help)"
 assert_contains "help lists 'pvpn best'" "pvpn best" "$out"
 assert_contains "help explains --connect" "pvpn best --connect" "$out"
 assert_contains "help lists 'pvpn apps'" "pvpn apps" "$out"
+
+# Bare `pvpn` opens the window on a desktop; everywhere else it must still
+# be the usage text. Never open a window from the test suite.
+out="$(PVPN_NO_GUI=1 "$PVPN" 2>&1)"; status=$?
+assert_contains "bare pvpn without a GUI prints usage" "pvpn up" "$out"
+[[ $status -eq 0 ]] && pass "bare pvpn without a GUI exits 0" || fail "bare pvpn without a GUI exits 0" "status $status"
+out="$(env -u DISPLAY -u WAYLAND_DISPLAY "$PVPN" 2>&1)"
+assert_contains "bare pvpn with no display prints usage" "pvpn help" "$out"
+assert_contains "help mentions the window" "pvpn gui" "$(run_pvpn help)"
 
 out="$(run_pvpn best --help)"; status=$?
 assert_status  "best --help exits cleanly" 0 "$status"

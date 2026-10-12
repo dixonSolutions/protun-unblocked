@@ -136,6 +136,9 @@ pub fn cmd_login(email: Option<String>, browser: bool) -> anyhow::Result<i32> {
         eprintln!("CAPTCHA required — switching to browser sign-in bridge.");
         return cmd_login_bridge(Some(user));
     }
+    // A sign-in issues a certificate; whatever expiry was remembered
+    // belongs to the old one.
+    pvpn_core::cert::forget();
     Ok(rc)
 }
 
@@ -214,6 +217,7 @@ fn cmd_login_bridge(email: Option<String>) -> anyhow::Result<i32> {
     if import_rc != 0 {
         return Ok(import_rc);
     }
+    pvpn_core::cert::forget();
     println!("Browser bridge complete.");
     let _ = cmd_account_view();
     Ok(0)
@@ -242,6 +246,7 @@ pub fn cmd_logout() -> anyhow::Result<i32> {
         )?
         .success
     };
+    pvpn_core::cert::forget();
     Ok(if status { 0 } else { 1 })
 }
 
@@ -313,7 +318,11 @@ pub fn cmd_fix(hosts: bool, unhosts: bool) -> anyhow::Result<i32> {
             println!("Proton's API is reachable — not blackholing it.");
             return Ok(0);
         }
+        // Kept for anyone who still wants it, but no longer suggested: the
+        // shim fails blocked API calls in two seconds anyway, and the
+        // blackhole also blocks the API through the tunnel, where it works.
         println!("Blackholing Proton API hosts in /etc/hosts (needs sudo).");
+        println!("Note: this also blocks the API through the tunnel; undo with: pvpn fix --unhosts");
         return Ok(if proc::blackhole_api_hosts()? { 0 } else { 1 });
     }
 
@@ -338,7 +347,13 @@ pub fn cmd_fix(hosts: bool, unhosts: bool) -> anyhow::Result<i32> {
         did = true;
     }
     if !did {
-        println!("Nothing privileged to fix. For a temporary API blackhole: pvpn fix --hosts");
+        println!("Nothing privileged to fix.");
+    }
+    if proc::api_hosts_blackholed() {
+        println!(
+            "An old `pvpn fix --hosts` blackhole is still in /etc/hosts; it blocks Proton's API \
+             even through the tunnel. Remove it with: pvpn fix --unhosts"
+        );
     }
     Ok(0)
 }

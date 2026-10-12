@@ -110,6 +110,43 @@ fn write_holder_note(file: &File) {
     }
 }
 
+/// Who is connecting right now, if anyone: the holder's pid and its note.
+///
+/// For watchers — the GUI — that must never take the lock to find out,
+/// because a watcher holding it for even a moment is a connect that waits a
+/// second for no reason. So this reads `/proc/locks` for a lock on the lock
+/// file's inode instead of trying one.
+pub fn in_flight() -> Option<(u32, String)> {
+    let path = lock_path();
+    let pid = locked_by(&path)?;
+    let note = std::fs::read_to_string(&path)
+        .map(|t| t.trim().to_string())
+        .unwrap_or_default();
+    Some((pid, note))
+}
+
+/// The pid holding any lock on `path`, from `/proc/locks`, without taking
+/// one. Also how the GUI sees `pvpn-autoconnect` running: that script
+/// holds its own flock for as long as it works.
+pub fn locked_by(path: &std::path::Path) -> Option<u32> {
+    use std::os::unix::fs::MetadataExt;
+    let inode = std::fs::metadata(path).ok()?.ino();
+    let locks = std::fs::read_to_string("/proc/locks").ok()?;
+    holder_pid(&locks, inode)
+}
+
+/// The pid holding a lock on `inode` in `/proc/locks` text. Lines marked
+/// `->` are waiters, not holders.
+fn holder_pid(locks: &str, inode: u64) -> Option<u32> {
+    locks.lines().filter(|l| !l.contains("->")).find_map(|line| {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        // "1: FLOCK  ADVISORY  WRITE 12345 fd:01:1234567 0 EOF"
+        let pid = fields.get(4)?.parse().ok()?;
+        let ino: u64 = fields.get(5)?.rsplit(':').next()?.parse().ok()?;
+        (ino == inode).then_some(pid)
+    })
+}
+
 /// Take the lock, waiting as long as the other connect takes.
 ///
 /// There is deliberately no timeout: a connect on a hostile network can
@@ -186,6 +223,38 @@ mod tests {
 
         drop(first);
         assert!(try_acquire(&second), "freed when the holder's fd closed");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn a_holder_is_found_in_proc_locks_text_and_waiters_are_not() {
+        let text = "1: FLOCK  ADVISORY  WRITE 4242 00:1a:991 0 EOF\n\
+                    1: -> FLOCK  ADVISORY  WRITE 5151 00:1a:991 0 EOF\n\
+                    2: POSIX  ADVISORY  WRITE 777 fd:01:12 0 EOF\n";
+        assert_eq!(holder_pid(text, 991), Some(4242));
+        assert_eq!(holder_pid(text, 12), Some(777));
+        assert_eq!(holder_pid(text, 5), None);
+    }
+
+    /// On a private file, not the real lock: a live connect, or another
+    /// test, holding the real one would make this race.
+    #[test]
+    fn locked_by_sees_a_holder_and_forgets_it_when_the_fd_closes() {
+        let dir = std::env::temp_dir().join(format!("pvpn-lock-peek-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("connect.lock");
+        let holder = open_lock_file(&path).unwrap();
+        assert!(try_acquire(&holder));
+        assert_eq!(locked_by(&path), Some(std::process::id()));
+        drop(holder);
+        // Not instantly: a test thread forking a subprocess holds a copy of
+        // every fd until the child execs, and a flock lives as long as any
+        // copy does.
+        let gone = (0..50).any(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            locked_by(&path).is_none()
+        });
+        assert!(gone, "gone once the fd closes");
         std::fs::remove_dir_all(dir).ok();
     }
 
