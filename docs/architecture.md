@@ -15,7 +15,7 @@ persisted per-network knowledge about servers.
 crates/pvpn-core/   rank, probe, geo, serverlist, state, config, proc, link, intent, lock
 crates/pvpn/        the CLI: connect, verify, watch, blocklist, session, narration
 lib/                Python shims loaded into protonvpn via PYTHONPATH
-system/             opt-in suspend/resume recovery (see always-on.md)
+system/             opt-in suspend/resume recovery and Tailscale hook (always-on.md, tailscale.md)
 legacy/             the previous bash tool, and the removed daemon
 ```
 
@@ -373,7 +373,8 @@ need interactive `sudo` and are skipped with a warning:
 `setup.sh --always-on` is the one thing that installs root-owned files
 rather than asking for sudo at use time — four under `/etc` and
 `/usr/local/sbin`, listed in [always-on.md](always-on.md), removable with
-`setup.sh --no-always-on`.
+`setup.sh --no-always-on`. `setup.sh --tailscale` adds one more, a
+NetworkManager dispatcher script described in [tailscale.md](tailscale.md).
 
 Use `pvpn fix` (and `pvpn fix --unhosts`) for those. `pvpn fix --hosts` still
 exists but is no longer suggested anywhere: the shim already fails blocked API

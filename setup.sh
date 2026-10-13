@@ -11,6 +11,8 @@
 #                              where it may reconnect for you (asked if omitted)
 #   ./setup.sh --gui           also install the GTK build libraries for the window
 #   ./setup.sh --no-gui        skip the window (pvpn-gui) entirely
+#   ./setup.sh --tailscale     keep Tailscale working while the tunnel is up
+#   ./setup.sh --no-tailscale  remove that hook again
 #
 # Auto-installs proton-vpn-cli via apt (Debian/Ubuntu) or dnf (Fedora).
 # If repo.protonvpn.com is blocked, downloads and refreshes that repo
@@ -23,9 +25,9 @@
 #   ~/.local/share/pvpn/       Python shims (sitecustomize, sign-in)
 #   ~/.local/bin/pvpn-gui      the window + tray (bare `pvpn` opens it; needs GTK4/libadwaita)
 #
-# --always-on is the one exception: it needs sudo and writes root-owned files
-# under /etc and /usr/local/sbin. It is opt-in and never runs by default.
-# See docs/always-on.md.
+# --always-on and --tailscale are the exceptions: they need sudo and write
+# root-owned files under /etc and /usr/local/sbin. Both are opt-in.
+# See docs/always-on.md and docs/tailscale.md.
 #
 set -euo pipefail
 
@@ -47,6 +49,7 @@ NO_ALWAYS_ON=0
 LID_LOCK=ask
 AUTOCONNECT_NETWORKS=
 GUI=auto
+TAILSCALE=ask
 for arg in "$@"; do
     case "$arg" in
         --uninstall)   # handled below
@@ -58,9 +61,11 @@ for arg in "$@"; do
         --no-lid-lock) LID_LOCK=no ;;
         --gui)         GUI=yes ;;
         --no-gui)      GUI=no ;;
+        --tailscale)   TAILSCALE=yes ;;
+        --no-tailscale) TAILSCALE=no ;;
         --autoconnect-networks=*) AUTOCONNECT_NETWORKS="${arg#*=}" ;;
         -h|--help)
-            sed -n '3,28p' "$0" | sed 's/^# \?//'
+            sed -n '3,30p' "$0" | sed 's/^# \?//'
             exit 0
             ;;
         *)
@@ -865,6 +870,67 @@ remove_always_on() {
     fi
 }
 
+# --- tailscale: its own traffic through the tunnel ----------------------
+
+# tailscaled routes the packets it sends itself around every other tunnel,
+# so with Proton up it talks to its control server over the bare network —
+# which, on a filtered one, refuses it. One dispatcher script points those
+# packets at Proton's table while the tunnel is up. See docs/tailscale.md.
+
+TAILSCALE_HOOK=/etc/NetworkManager/dispatcher.d/80-pvpn-tailscale
+
+tailscale_hook_installed() {
+    [[ -f "$TAILSCALE_HOOK" ]]
+}
+
+install_tailscale_hook() {
+    head_ "Tailscale: routing its own traffic through the tunnel"
+    if ! sudo -v; then
+        bad "needs sudo — skipped. Re-run: ./setup.sh --tailscale"
+        return 1
+    fi
+    # Root-owned and not group/world writable, or NetworkManager ignores it.
+    sudo install -d -m755 /etc/NetworkManager/dispatcher.d
+    sudo install -m755 -o root -g root "$SRC/system/80-pvpn-tailscale" "$TAILSCALE_HOOK"
+    ok "$TAILSCALE_HOOK"
+    # Apply it now rather than at the next network event. It reconciles
+    # with the routing table, so this is right whether a tunnel is up or not.
+    sudo "$TAILSCALE_HOOK" proton0 up
+    if ip -4 rule show pref 5200 2>/dev/null | grep -q .; then
+        ok "Tailscale's traffic now goes through the tunnel"
+    else
+        note "no tunnel up — the rule appears with the next \`pvpn up\`"
+    fi
+}
+
+remove_tailscale_hook() {
+    head_ "Removing the Tailscale hook"
+    if ! sudo -v 2>/dev/null; then
+        warn "no sudo — left in place: $TAILSCALE_HOOK"
+        return 1
+    fi
+    sudo rm -f "$TAILSCALE_HOOK"
+    sudo ip -4 rule del pref 5200 2>/dev/null || true
+    sudo ip -6 rule del pref 5200 2>/dev/null || true
+    ok "removed — Tailscale goes around the tunnel again"
+}
+
+# Installed when asked, kept when already there, and offered once when
+# tailscaled is on the machine.
+maybe_tailscale_hook() {
+    case "$TAILSCALE" in
+        yes) install_tailscale_hook || true; return 0 ;;
+        no)  return 0 ;;
+    esac
+    if tailscale_hook_installed; then
+        install_tailscale_hook || true
+    elif command -v tailscaled >/dev/null 2>&1 \
+         && ask_yes "Tailscale is installed. Keep it working while the VPN is up?"; then
+        install_tailscale_hook || true
+    fi
+    return 0
+}
+
 # --- guided next steps ------------------------------------------------
 
 already_signed_in() {
@@ -1079,6 +1145,7 @@ if [[ "${1:-}" == "--uninstall" ]]; then
     # Hooks outside $HOME go first — an uninstall that left a dispatcher
     # script calling a deleted binary would be worse than not uninstalling.
     always_on_installed && remove_always_on
+    tailscale_hook_installed && { remove_tailscale_hook || true; }
     # The unit and the daemon binary are from older installs; remove them
     # here too so an uninstall does not leave one behind.
     systemctl --user disable --now pvpnd 2>/dev/null || true
@@ -1099,8 +1166,14 @@ if [[ "${1:-}" == "--uninstall" ]]; then
     exit 0
 fi
 
+if [[ "$TAILSCALE" == no ]] && tailscale_hook_installed; then
+    remove_tailscale_hook || true
+fi
 if (( NO_ALWAYS_ON )) && (( ! ALWAYS_ON )); then
     remove_always_on
+    exit 0
+fi
+if [[ "$TAILSCALE" == no ]] && [[ $# -eq 1 ]]; then
     exit 0
 fi
 
@@ -1128,6 +1201,7 @@ if everything_ready; then
     if (( ALWAYS_ON )) || always_on_installed; then
         install_always_on || true
     fi
+    maybe_tailscale_hook
     run_wizard
     exit 0
 fi
@@ -1154,6 +1228,7 @@ fix_flatpak_routing
 if (( ALWAYS_ON )) || always_on_installed; then
     install_always_on || true
 fi
+maybe_tailscale_hook
 
 echo
 head_ "Done installing"

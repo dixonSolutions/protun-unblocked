@@ -99,10 +99,12 @@ refreshes for that host go through Tor automatically (`socks5h://127.0.0.1:9050`
 ./setup.sh --no-always-on   # remove those hooks again
 ./setup.sh --gui            # also install GTK4/libadwaita build files for the window
 ./setup.sh --no-gui         # skip the window
+./setup.sh --tailscale      # keep Tailscale signed in while the tunnel is up
+./setup.sh --no-tailscale   # remove that hook again
 ```
 
-`--always-on` is opt-in and needs sudo — it is the only part of this
-project that writes outside `$HOME`. Without it, closing the lid suspends,
+`--always-on` is opt-in and needs sudo — with `--tailscale`, it is the only
+part of this project that writes outside `$HOME`. Without it, closing the lid suspends,
 the tunnel dies, and DNS stops resolving until you run `pvpn up` again. See
 [docs/always-on.md](docs/always-on.md).
 
@@ -289,6 +291,11 @@ stray `pvpnksintrf0`, and optionally blackholing Proton's API in
 - **Apps that quietly skip the tunnel.** A leftover proxy override takes
   an app off the VPN without anything in `pvpn status` showing it.
   See [docs/flatpak.md](docs/flatpak.md).
+- **Tailscale logged out behind the tunnel.** tailscaled routes its own
+  packets around every other tunnel, so with Proton up it reaches for its
+  control server over the bare, filtered wifi and sits in "context deadline
+  exceeded". `setup.sh --tailscale` points those packets at Proton's table
+  while the tunnel is up. See [docs/tailscale.md](docs/tailscale.md).
 - **Self-resurrecting tunnels.** Proton's NM profile is created with
   autoconnect on. `pvpn down` clears that flag.
 - **Two connects at once do not exist.** NetworkManager's protun plugin

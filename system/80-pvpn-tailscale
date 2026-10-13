@@ -1,0 +1,60 @@
+#!/bin/sh
+# NetworkManager dispatcher: keep Tailscale's own traffic inside the Proton
+# tunnel while there is one.
+#
+# tailscaled marks every packet it sends itself -- control plane, DERP, the
+# WireGuard UDP to peers -- with fwmark 0x80000 and installs
+#
+#     5210: from all fwmark 0x80000/0xff0000 lookup main
+#
+# so its packets never loop back into tailscale0. That rule also sits ahead
+# of Proton's
+#
+#     32765: not from all fwmark 0xea13b2c lookup <proton table>
+#
+# so Tailscale goes straight out of the bare wifi. On a network that filters
+# controlplane.tailscale.com, that is the network this project exists for:
+# measured on detnsw, the control key fetch times out on wlp0s20f3 and
+# answers 200 in 1.4s through proton0. tailscaled sits in "logged out,
+# context deadline exceeded" for as long as the tunnel is up.
+#
+# The fix is one rule ahead of 5210 that sends Tailscale's marked packets
+# into Proton's table instead. Proton's own packets carry 0xea13b2c, not
+# 0x80000, so the tunnel's transport still leaves through the wifi.
+#
+# The rule must exist only while proton0 carries the table's default route.
+# Proton's table also holds an `unreachable default` for its leak guard, and
+# a rule left pointing at it after a disconnect would cut Tailscale off
+# entirely. So this does not act on one event: every event reconciles the
+# rule with what the routing table says now. That keeps it idempotent and
+# makes a missed `down` heal on the next event.
+#
+# Must return immediately (NetworkManager-dispatcher(8) kills slow scripts).
+# It runs only `ip`.
+set -u
+
+PREF=5200
+MARK=0x80000/0xff0000
+
+case "${2:-}" in
+    up|down|vpn-up|vpn-down|dhcp4-change|dhcp6-change|connectivity-change) ;;
+    *) exit 0 ;;
+esac
+
+# The table holding `default dev proton*`, read rather than hardcoded:
+# Proton derives the number and could change it.
+proton_table() {
+    ip "$1" route show table all 2>/dev/null | awk '
+        $1 == "default" && $2 == "dev" && $3 ~ /^proton/ {
+            for (i = 4; i < NF; i++) if ($i == "table") { print $(i + 1); exit }
+        }'
+}
+
+for fam in -4 -6; do
+    table="$(proton_table "$fam")"
+    # Delete then add: a stale rule pointing at an old table never survives.
+    while ip "$fam" rule del pref "$PREF" 2>/dev/null; do :; done
+    [ -n "$table" ] || continue
+    ip "$fam" rule add pref "$PREF" fwmark "$MARK" lookup "$table" 2>/dev/null || true
+done
+exit 0

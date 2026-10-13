@@ -35,7 +35,7 @@ done
 
 head_ "POSIX sh syntax (system/)"
 for script in "$REPO"/system/pvpn-dns-unsnap "$REPO"/system/pvpn-kick-user \
-              "$REPO"/system/90-pvpn-autoconnect; do
+              "$REPO"/system/90-pvpn-autoconnect "$REPO"/system/80-pvpn-tailscale; do
     if sh -n "$script"; then
         printf '  ok   %s\n' "${script#"$REPO"/}"
     else
@@ -57,7 +57,7 @@ if command -v shellcheck >/dev/null 2>&1; then
     if shellcheck "$REPO/legacy/pvpn.sh" "$REPO/bin/pvpn" \
             "$REPO/bin/pvpn-autoconnect" "$REPO"/system/pvpn-dns-unsnap \
             "$REPO"/system/pvpn-kick-user "$REPO"/system/90-pvpn-autoconnect \
-            "$HERE"/*.sh; then
+            "$REPO"/system/80-pvpn-tailscale "$HERE"/*.sh; then
         printf '  ok   shellcheck\n'
     else
         FAILED+=("shellcheck")
@@ -119,6 +119,13 @@ if "$HERE/test-always-on.sh"; then
     printf '  ok   test-always-on.sh\n'
 else
     FAILED+=("test-always-on.sh")
+fi
+
+head_ "Tailscale hook"
+if "$HERE/test-tailscale.sh"; then
+    printf '  ok   test-tailscale.sh\n'
+else
+    FAILED+=("test-tailscale.sh")
 fi
 
 head_ "CLI tests: legacy bash pvpn"
