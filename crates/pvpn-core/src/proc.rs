@@ -723,7 +723,13 @@ pub fn protocol_from_profile(
 /// the plugin picks — and nothing readable says which it will choose, so
 /// that one stays unrecorded.
 fn protun_protocol_from_settings(settings_json: &str) -> Option<String> {
-    let value: serde_json::Value = serde_json::from_str(settings_json.trim()).ok()?;
+    // Proton escapes every comma (`\,`) for NetworkManager's `key = value,
+    // ...` text form, and the escapes are stored verbatim — so the string the
+    // bus hands back is not JSON until they are undone. Parsing it raw failed
+    // on every profile Proton has written since, and an unreadable protocol
+    // passes the transport filter by default, so the filter never ran.
+    let unescaped = settings_json.trim().replace("\\,", ",");
+    let value: serde_json::Value = serde_json::from_str(&unescaped).ok()?;
     let peer = value.get("peers")?.as_array()?.first()?;
     let has = |key: &str| {
         peer.get(key)
@@ -809,55 +815,36 @@ pub fn reconcile_verified_proton_connection(server: &str) -> anyhow::Result<usiz
 }
 
 /// Disconnect a proven tunnel while retaining one plain-name, manual-toggle
-/// profile. The clone uses a temporary name only during the teardown, then
-/// replaces Proton's deleted transient profile without leaving a duplicate.
+/// profile that still holds its WireGuard key.
+///
+/// This used to `nmcli con clone` the live profile. The clone came out
+/// without the key — Proton now keeps it in NetworkManager, and secrets do
+/// not travel with a copy — so every profile it preserved asked for secrets
+/// when activated and timed out: the hot path, measured 2026-10-14, spent
+/// thirty seconds per proven server failing to start before Proton's client
+/// was even tried. The profile is now written by [`crate::profiles`], key
+/// included, *before* the teardown, so an interrupted teardown loses
+/// nothing.
 pub fn disconnect_preserving_verified_connection(server: &str) -> anyhow::Result<bool> {
-    let active = run(
-        "nmcli",
-        &["-t", "-f", "NAME,UUID", "con", "show", "--active"],
-    )?;
-    let expected_name = proton_profile_name(server);
-    let source_uuid = parse_connections(&active.stdout)
-        .into_iter()
-        .find_map(|(name, uuid)| (name == expected_name).then_some(uuid));
-    let Some(source_uuid) = source_uuid else {
+    let Some(live) = crate::dbus::active_proton_live()
+        .filter(|live| live.server.eq_ignore_ascii_case(server))
+    else {
         // Proton's status can lag behind NetworkManager after a tunnel dies.
         // There is no live profile left to preserve in that race.
         return Ok(false);
     };
+    let source_uuid = live.uuid.clone();
 
-    // Delete the stale copies *before* cloning, not after. Doing it after
-    // meant every teardown spent its whole duration holding two profiles for
-    // one server, and a Ctrl-C anywhere in that window — which is most of the
-    // window — left both behind permanently.
-    for (name, uuid) in nmcli_proton_connections() {
-        if is_profile_for_server(&name, server) && uuid != source_uuid {
-            nmcli_delete_connection(&uuid);
+    if live.transient {
+        // Stale copies first, so the saved profile is the only one left.
+        for (name, uuid) in nmcli_proton_connections() {
+            if is_profile_for_server(&name, server) && uuid != source_uuid {
+                nmcli_delete_connection(&uuid);
+            }
         }
-    }
-    let temporary_name = format!("ProtonVPN pvpn-preserve-{}", std::process::id());
-    let cloned = run("nmcli", &["con", "clone", &source_uuid, &temporary_name])?;
-    if !cloned.success {
-        anyhow::bail!("NetworkManager could not preserve {server}'s profile");
-    }
-
-    let temporary_uuid = nmcli_proton_connections()
-        .into_iter()
-        .find_map(|(name, uuid)| (name == temporary_name).then_some(uuid))
-        .context("NetworkManager cloned the profile but did not list it")?;
-    let configured = run(
-        "nmcli",
-        &[
-            "con",
-            "modify",
-            &temporary_uuid,
-            "connection.autoconnect",
-            "no",
-        ],
-    )?;
-    if !configured.success {
-        nmcli_delete_connection(&temporary_uuid);
-        anyhow::bail!("NetworkManager could not configure {server}'s saved profile");
+        if let Err(err) = crate::profiles::save_live(server, &live.settings) {
+            tracing::warn!("could not keep {server} in Network Settings: {err}");
+        }
     }
 
     // Proton's exit code is not the evidence here; NetworkManager letting
@@ -870,7 +857,13 @@ pub fn disconnect_preserving_verified_connection(server: &str) -> anyhow::Result
     // seconds in Proton's client instead of one on the hot path. The
     // same evidence rule as everywhere else in this tool: ask the thing
     // that owns the state.
-    protonvpn_disconnect_if_needed();
+    if live.transient {
+        protonvpn_disconnect_if_needed();
+    } else {
+        // A saved profile this tool activated: Proton's client never knew
+        // about it, so there is nothing for it to take down.
+        let _ = run("nmcli", &["con", "down", &source_uuid]);
+    }
     let mut released = wait_for_profile_release(&source_uuid, Duration::from_secs(3));
     if !released {
         // The client did not manage it: deactivate directly, as `restore`
@@ -879,24 +872,8 @@ pub fn disconnect_preserving_verified_connection(server: &str) -> anyhow::Result
         released = wait_for_profile_release(&source_uuid, Duration::from_secs(3));
     }
     if !released {
-        nmcli_delete_connection(&temporary_uuid);
         anyhow::bail!("NetworkManager is still holding {server}'s tunnel");
     }
-    let renamed = run(
-        "nmcli",
-        &[
-            "con",
-            "modify",
-            &temporary_uuid,
-            "connection.id",
-            &expected_name,
-        ],
-    )?;
-    if !renamed.success {
-        nmcli_delete_connection(&temporary_uuid);
-        anyhow::bail!("NetworkManager could not name {server}'s saved profile");
-    }
-
     Ok(true)
 }
 
@@ -1656,6 +1633,17 @@ mod tests {
         // readable says which — so nothing is claimed.
         let smart = r#"{"version": 1, "peers": [{"id": "SG-FREE#2", "udp-ports": [51820], "tcp-ports": [443], "tls-ports": [443], "priority": 0}]}"#;
         assert_eq!(protun_protocol_from_settings(smart), None);
+    }
+
+    #[test]
+    fn a_protun_profile_names_its_transport_as_the_bus_returns_it() {
+        // `GetSettings` for `ProtonVPN SG-FREE#2` on 2026-10-14: the `\,`
+        // escapes Proton wrote are stored and returned verbatim.
+        let over_dbus = r#"{"version": 1\, "peers": [{"id": "SG-FREE#2"\, "endpoint": "149.50.211.129"\, "public-key": "mYGJ"\, "udp-ports": []\, "tcp-ports": []\, "tls-ports": [443]\, "priority": 0}]\, "pcap-file": null}"#;
+        assert_eq!(
+            protun_protocol_from_settings(over_dbus).as_deref(),
+            Some("protun-tls")
+        );
     }
 
     #[test]

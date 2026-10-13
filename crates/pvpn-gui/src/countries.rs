@@ -108,8 +108,12 @@ pub fn from_raw(max_tier: i64, raw: Vec<RawLogical>) -> Catalog {
     Catalog { max_tier, servers }
 }
 
+/// Proton's catalogue, as `pvpn query inventory` hands it over.
 pub fn load() -> Catalog {
-    match pvpn_core::serverlist::load_server_list(&pvpn_core::paths::serverlist_path()) {
+    let Some(text) = crate::cli::inventory() else {
+        return Catalog::default();
+    };
+    match pvpn_core::serverlist::parse_server_list(&text) {
         Ok((max_tier, raw)) => from_raw(max_tier, raw),
         Err(_) => Catalog::default(),
     }

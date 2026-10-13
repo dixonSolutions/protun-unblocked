@@ -10,6 +10,7 @@
 //! reconnects on its own — see `status.rs`.
 
 mod app;
+mod cli;
 mod countries;
 mod data;
 mod globe;

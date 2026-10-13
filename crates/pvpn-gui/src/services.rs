@@ -158,62 +158,37 @@ pub fn parse_show(text: &str) -> UnitState {
     }
 }
 
-fn base(unit: &Unit) -> Vec<String> {
-    let mut argv = vec!["systemctl".to_string()];
+/// `pvpn service …` for this unit: the CLI owns which units may be touched
+/// and how (`pkexec` for system units, `--no-block` for starts).
+fn pvpn_service(unit: &Unit, args: &[&str]) -> Vec<String> {
+    let mut full = vec!["service"];
+    full.extend_from_slice(args);
     if unit.user {
-        argv.push("--user".into());
+        full.push("--user");
     }
-    argv
+    crate::cli::argv(&full)
 }
 
 pub async fn state(unit: &Unit) -> UnitState {
-    let mut argv = base(unit);
-    argv.extend([
-        "show".into(),
-        unit.name.into(),
-        "-p".into(),
-        "LoadState,ActiveState,SubState,UnitFileState,NextElapseUSecRealtime"
-            .into(),
-    ]);
-    parse_show(&capture(argv).await.stdout)
+    parse_show(&capture(pvpn_service(unit, &["show", unit.name])).await.stdout)
 }
 
 pub fn command(unit: &Unit, verb: Verb) -> Vec<String> {
-    let mut argv = if unit.user {
-        base(unit)
-    } else {
-        vec!["pkexec".into(), "systemctl".into()]
-    };
-    argv.push(verb.word().into());
-    // A start of a oneshot would otherwise block until it finishes — a
-    // reconnect can take minutes.
-    if verb == Start || verb == Restart {
-        argv.push("--no-block".into());
-    }
-    argv.push(unit.name.into());
-    argv
+    pvpn_service(unit, &["run", verb.word(), unit.name])
 }
 
 pub async fn run(unit: &Unit, verb: Verb) -> Output {
     capture(command(unit, verb)).await
 }
 
-/// `journalctl` for a unit's recent lines.
+/// `pvpn service journal` for a unit's recent lines.
 pub fn journal_command(unit: &str, user: bool, lines: u32) -> Vec<String> {
-    let mut argv = vec!["journalctl".to_string()];
+    let lines = lines.to_string();
+    let mut args = vec!["service", "journal", unit, "-n", lines.as_str()];
     if user {
-        argv.push("--user".into());
+        args.push("--user");
     }
-    argv.extend([
-        "-u".into(),
-        unit.into(),
-        "-n".into(),
-        lines.to_string(),
-        "--no-pager".into(),
-        "-o".into(),
-        "short-iso".into(),
-    ]);
-    argv
+    crate::cli::argv(&args)
 }
 
 #[cfg(test)]
@@ -232,11 +207,16 @@ mod tests {
     }
 
     #[test]
-    fn system_units_go_through_pkexec_and_starts_do_not_block() {
+    fn service_actions_are_asked_of_pvpn() {
+        // `pvpn service` decides pkexec and --no-block; see the CLI's tests.
         let tor = UNITS.iter().find(|u| u.name == "tor.service").unwrap();
-        assert_eq!(command(tor, Verb::Restart), ["pkexec", "systemctl", "restart", "--no-block", "tor.service"]);
+        assert_eq!(command(tor, Verb::Restart)[1..], ["service", "run", "restart", "tor.service"]);
         let watch = UNITS.iter().find(|u| u.name == "pvpn-watch.timer").unwrap();
-        assert_eq!(command(watch, Verb::Enable), ["systemctl", "--user", "enable", "pvpn-watch.timer"]);
+        assert_eq!(command(watch, Verb::Enable)[1..], ["service", "run", "enable", "pvpn-watch.timer", "--user"]);
+        assert_eq!(
+            journal_command("pvpn-watch.service", true, 50)[1..],
+            ["service", "journal", "pvpn-watch.service", "-n", "50", "--user"]
+        );
     }
 
     #[test]

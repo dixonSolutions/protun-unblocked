@@ -6,9 +6,14 @@ Core, Tor and streaming servers, NetShield, kill switch, port forwarding,
 custom DNS, VPN Accelerator, moderate NAT, IPv6, account and plan — plus
 what `pvpn` adds for networks that filter Proton: measured and proven
 servers per network, blocks, history, a connect that cannot strand you, and
-the always-on machinery. It runs the installed `pvpn` for everything that
-changes the network, Proton's `protonvpn config` for Proton's settings, and
-reads what both have written down for everything it shows.
+the always-on machinery. It talks to nothing but the installed `pvpn`:
+every action is a `pvpn` command, and everything it shows comes from
+`pvpn query status|busy|state|inventory|cert|config` (JSON). Proton's
+settings go through `pvpn proton config …`, config edits through
+`pvpn config set|write` (validated before anything is written), services
+through `pvpn service run|show|journal`, and Proton's log through
+`pvpn logs`. One reader of the facts, so the window and the CLI cannot
+disagree about what is true.
 
 ```bash
 pvpn                # open the window (in a desktop session; `pvpn help` for commands)
@@ -45,6 +50,18 @@ did it — `pvpn-autoconnect` after a resume or link change, and the
 `pvpn-watch.timer` health check — and both still ask `autoconnect_networks`
 and `autoconnect_never` first. The window notices them working (they hold
 pvpn's connect lock while they do) and tells you.
+
+## The tray menu stays open
+
+The menu's items never change, only whether each is shown or enabled.
+Adding or removing items is a layout change, and the GNOME AppIndicator
+extension answers one by rebuilding the menu — closing it if it is open.
+On a roaming wifi `pvpn-autoconnect` starts on every DHCP renew just to
+confirm the tunnel is fine; the window used to read each of those as
+"Reconnecting…", swap Disconnect for Cancel, and shut the menu in your
+hand. A running autoconnect now only counts as reconnecting when there is
+no tunnel; if it really rebuilds one, its `pvpn up` holds the connect lock
+and shows as that.
 
 ## Pages
 

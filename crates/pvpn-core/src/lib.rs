@@ -22,9 +22,12 @@ pub mod paths;
 pub mod pipeline;
 pub mod probe;
 pub mod proc;
+pub mod profiles;
 pub mod rank;
 pub mod scope;
 pub mod serverlist;
+pub mod snapshot;
 pub mod state;
+pub mod teardown;
 
 pub use rank::Candidate;

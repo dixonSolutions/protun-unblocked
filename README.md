@@ -99,7 +99,7 @@ refreshes for that host go through Tor automatically (`socks5h://127.0.0.1:9050`
 ./setup.sh --no-always-on   # remove those hooks again
 ./setup.sh --gui            # also install GTK4/libadwaita build files for the window
 ./setup.sh --no-gui         # skip the window
-./setup.sh --tailscale      # keep Tailscale signed in while the tunnel is up
+./setup.sh --tailscale      # keep Tailscale working while the tunnel is up (default when installed)
 ./setup.sh --no-tailscale   # remove that hook again
 ```
 
@@ -160,7 +160,14 @@ pvpn best --country JP    # one country only
 pvpn hop                  # the next best server, then the one after
 pvpn hop JP               # somewhere in Japan
 pvpn hop SG-FREE#12       # that exact server
+pvpn hop JP --force       # take over from any other pvpn still working
 ```
+
+`--force` (on `up`, `hop`, `down`, `try` and `best --connect`) does not wait
+for another `pvpn` — a reconnect after a resume, a `down`, another
+terminal's connect. That one is asked to step aside, puts your normal
+routing back, and exits; yours carries on. A connect started in the
+background steps aside for a command you typed even without `--force`.
 
 Bare `pvpn hop` does not hand the choice back to Proton. It works down the
 list this network has already taught it — **servers proven to carry traffic

@@ -631,7 +631,28 @@ impl State {
             }
             .then_with(|| b.2.cmp(&a.2))
         });
-        protocols.into_iter().next().map(|(name, _, _)| name)
+        // A transport whose latest word here is a dead tunnel has lost its
+        // claim, however fast it once was: on `wifi:detnsw` protun-tcp
+        // carries in a second and the network has been seen to start killing
+        // it minutes later. Its next success puts it back. Unless nothing
+        // else has ever carried — then it is still the best guess.
+        let events = self.events();
+        let failed_since_success = |name: &str, newest_ok: DateTime<Utc>| {
+            events.iter().any(|e| {
+                e.protocol == name
+                    && e.at > newest_ok
+                    && matches!(
+                        e.outcome.as_str(),
+                        "no-traffic" | "session-killed" | "handshake-closed"
+                    )
+            })
+        };
+        let first = protocols.first().map(|(name, _, _)| name.clone());
+        protocols
+            .into_iter()
+            .find(|(name, _, newest)| !failed_since_success(name, *newest))
+            .map(|(name, _, _)| name)
+            .or(first)
     }
 
     /// Every protocol that has carried traffic here recently, in no
@@ -1255,6 +1276,44 @@ mod tests {
             Some("protun-tcp"),
             "the newest success is not the same question as the fastest"
         );
+    }
+
+    #[test]
+    fn a_quick_transport_whose_latest_tunnel_died_loses_until_it_carries_again() {
+        let mut state = State::default();
+        state.set_network("wifi:detnsw");
+        let t0 = Utc::now();
+        state.record_event(event_timed("JP-FREE#11", "protun-tls", t0, 40_000));
+        state.record_event(event_timed(
+            "JP-FREE#11",
+            "protun-tcp",
+            t0 + chrono::Duration::minutes(1),
+            1_000,
+        ));
+        assert_eq!(state.proven_protocol().as_deref(), Some("protun-tcp"));
+
+        let mut killed = event_timed(
+            "JP-FREE#11",
+            "protun-tcp",
+            t0 + chrono::Duration::minutes(5),
+            0,
+        );
+        killed.outcome = "session-killed".into();
+        killed.ready_ms = None;
+        state.record_event(killed);
+        assert_eq!(
+            state.proven_protocol().as_deref(),
+            Some("protun-tls"),
+            "the network has started killing it"
+        );
+
+        state.record_event(event_timed(
+            "JP-FREE#11",
+            "protun-tcp",
+            t0 + chrono::Duration::minutes(9),
+            1_000,
+        ));
+        assert_eq!(state.proven_protocol().as_deref(), Some("protun-tcp"));
     }
 
     #[test]

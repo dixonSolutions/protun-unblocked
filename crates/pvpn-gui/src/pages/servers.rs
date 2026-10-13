@@ -248,7 +248,7 @@ fn fill(app: &Rc<App>, ui: &Rc<Ui>) {
     let here = app.snapshot.borrow().as_ref().map(|s| s.network.clone()).unwrap_or_default();
     let is_here = network == here;
     let state = data::load_state();
-    let config = pvpn_core::config::Config::load(&pvpn_core::config::Config::default_path()).unwrap_or_default();
+    let config = crate::cli::config();
     let view = data::view(&state, &network, &config);
     let filter = FILTERS
         .iter()

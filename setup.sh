@@ -915,8 +915,10 @@ remove_tailscale_hook() {
     ok "removed — Tailscale goes around the tunnel again"
 }
 
-# Installed when asked, kept when already there, and offered once when
-# tailscaled is on the machine.
+# Installed when asked, kept when already there, and installed by default
+# when tailscaled is on the machine: a Tailscale that goes dark the moment
+# the VPN connects is a broken install, not a preference. --no-tailscale
+# opts out.
 maybe_tailscale_hook() {
     case "$TAILSCALE" in
         yes) install_tailscale_hook || true; return 0 ;;
@@ -924,8 +926,8 @@ maybe_tailscale_hook() {
     esac
     if tailscale_hook_installed; then
         install_tailscale_hook || true
-    elif command -v tailscaled >/dev/null 2>&1 \
-         && ask_yes "Tailscale is installed. Keep it working while the VPN is up?"; then
+    elif command -v tailscaled >/dev/null 2>&1; then
+        note "Tailscale is installed — keeping it working while the VPN is up (--no-tailscale to skip)"
         install_tailscale_hook || true
     fi
     return 0

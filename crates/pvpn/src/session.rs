@@ -108,6 +108,21 @@ impl Session {
         changed
     }
 
+    /// Re-read `state.json`, keeping this session's network.
+    ///
+    /// For work that ran a long time between loading state and writing to
+    /// it — a measurement pass — while another `pvpn` may have recorded a
+    /// connect in between: saving the copy loaded at the start would write
+    /// that record away. Measurements do not hold the connect lock, so this
+    /// is how they share the file with the connects that do.
+    pub fn reload_state(&mut self) {
+        let network = self.network().to_string();
+        if let Ok(mut fresh) = State::load(&Config::state_path()) {
+            fresh.set_network(network);
+            self.state = fresh;
+        }
+    }
+
     pub fn save(&self) {
         let path = Config::state_path();
         if let Err(err) = self.state.save(&path) {

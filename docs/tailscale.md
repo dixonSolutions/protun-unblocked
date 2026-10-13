@@ -15,8 +15,9 @@ Install the fix with:
 ./setup.sh --tailscale
 ```
 
-Remove it with `./setup.sh --no-tailscale`. Setup offers it on its own when
-`tailscaled` is installed.
+Setup installs it on its own whenever `tailscaled` is installed — a
+Tailscale that goes dark the moment the VPN connects is a broken install,
+not a preference. Remove it with `./setup.sh --no-tailscale`.
 
 ## Why it happens
 

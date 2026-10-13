@@ -98,12 +98,25 @@ fn holder_description(file: &File) -> String {
     "another pvpn".to_string()
 }
 
+/// Marks a holder nobody is waiting on at a terminal.
+const BACKGROUND_TAG: &str = "[background]";
+
+/// Is this process working for nobody in particular — `pvpn-autoconnect`
+/// after a resume or a roam — rather than for someone who typed a command?
+pub fn running_in_background() -> bool {
+    std::env::var_os("PVPN_AUTOCONNECT").is_some_and(|v| !v.is_empty())
+}
+
 /// Record who we are for anyone who comes waiting. Best-effort: the lock
 /// is the lock, the note is a courtesy.
 fn write_holder_note(file: &File) {
     let mut file = file;
     let args: Vec<String> = std::env::args().take(3).collect();
-    let note = format!("pid {}: {}", std::process::id(), args.join(" "));
+    let mut note = format!("pid {}: {}", std::process::id(), args.join(" "));
+    if running_in_background() {
+        note.push(' ');
+        note.push_str(BACKGROUND_TAG);
+    }
     if file.seek(SeekFrom::Start(0)).is_ok() {
         let _ = file.set_len(0);
         let _ = file.write_all(note.as_bytes());
@@ -163,6 +176,10 @@ pub async fn acquire() -> ConnectGuard {
         return ConnectGuard { _file: Some(file) };
     }
     let holder = holder_description(&file);
+    if !running_in_background() && holder.contains(BACKGROUND_TAG) && preempt(&file, &holder).await {
+        write_holder_note(&file);
+        return ConnectGuard { _file: Some(file) };
+    }
     tracing::info!("{holder} is already working — waiting for it to finish (Ctrl-C to cancel)");
     let mut since_narration = WAIT_NARRATION_EVERY;
     loop {
@@ -178,6 +195,85 @@ pub async fn acquire() -> ConnectGuard {
             tracing::info!("still waiting for {holder} — Ctrl-C to cancel");
         }
     }
+}
+
+/// Take the lock from whoever holds it — `--force`.
+///
+/// For when the command typed now matters more than the one already
+/// running, whoever started it: `pvpn up --force` over a `pvpn down` still
+/// tearing down, `pvpn hop --force` over a connect that is still grinding
+/// through its settle window in another terminal. The holder is asked to
+/// step aside exactly as a background connect is — SIGTERM, which runs its
+/// own restore — and only if it is still holding the lock after
+/// [`PREEMPT_PATIENCE`] is it killed outright; the kernel then releases the
+/// lock, and the connect that follows rebuilds whatever it left.
+pub async fn acquire_forced() -> ConnectGuard {
+    let Some(file) = open_lock_file(&lock_path()) else {
+        return ConnectGuard { _file: None };
+    };
+    if try_acquire(&file) {
+        write_holder_note(&file);
+        return ConnectGuard { _file: Some(file) };
+    }
+    let holder = holder_description(&file);
+    if preempt(&file, &holder).await {
+        write_holder_note(&file);
+        return ConnectGuard { _file: Some(file) };
+    }
+    if let Some(pid) = locked_by(&lock_path()).filter(|pid| *pid != std::process::id()) {
+        tracing::warn!("{holder} did not step aside — stopping it");
+        let _ = std::process::Command::new("kill")
+            .args(["-KILL", &pid.to_string()])
+            .status();
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if try_acquire(&file) {
+                write_holder_note(&file);
+                return ConnectGuard { _file: Some(file) };
+            }
+        }
+    }
+    // Something we cannot signal holds it; wait as an ordinary command would.
+    drop(file);
+    acquire().await
+}
+
+/// How long a preempted background connect gets to put routing back.
+const PREEMPT_PATIENCE: Duration = Duration::from_secs(15);
+
+/// Ask a background holder to step aside, and take the lock when it has.
+///
+/// A connect nobody asked for must not make someone who did wait for it.
+/// Measured 2026-10-14 on `wifi:detnsw`: a roam started `pvpn-autoconnect`,
+/// whose `pvpn up` spent three minutes on saved profiles that could not
+/// start; the `pvpn hop SG-FREE#2` typed meanwhile sat behind it until the
+/// user found the pid and killed it by hand. SIGTERM runs the holder's own
+/// cleanup — the same restore as Ctrl-C — so routing is put back before
+/// the lock comes free. `false` when it did not step aside in time; the
+/// caller then waits as it always has.
+async fn preempt(file: &File, holder: &str) -> bool {
+    let Some(pid) = locked_by(&lock_path()) else {
+        return false;
+    };
+    if pid == std::process::id() {
+        return false;
+    }
+    tracing::info!("asking {holder} to step aside");
+    let signalled = std::process::Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .status()
+        .is_ok_and(|s| s.success());
+    if !signalled {
+        return false;
+    }
+    let deadline = std::time::Instant::now() + PREEMPT_PATIENCE;
+    while std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if try_acquire(file) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Take the lock, giving up after `patience`. For `down`: an explicit

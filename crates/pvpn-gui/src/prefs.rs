@@ -34,10 +34,8 @@ pub fn edit_config(f: impl FnOnce(&mut toml_edit::DocumentMut)) -> Result<(), St
     f(&mut doc);
     let new = doc.to_string();
     validate_config(&new)?;
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-    }
-    std::fs::write(&path, new).map_err(|e| e.to_string())
+    // `pvpn config write` validates again and writes; the CLI owns the file.
+    crate::cli::write_config(&new)
 }
 
 fn set_value(key: &str, value: impl Into<toml_edit::Value>) -> Result<(), String> {
@@ -54,7 +52,7 @@ fn set_list(key: &str, list: &[String]) -> Result<(), String> {
 }
 
 fn load_config() -> Config {
-    Config::load(&Config::default_path()).unwrap_or_default()
+    crate::cli::config()
 }
 
 /// `wifi:home` → `home`: what a person would type, and what `scope`
@@ -201,6 +199,7 @@ fn general(app: &Rc<App>) -> adw::PreferencesPage {
         let a = app.clone();
         let row = entry_row("pvpn to run (empty: ~/.local/bin/pvpn, then PATH)", &s.pvpn_path, move |t| {
             with_gui(&a, |g| g.pvpn_path = t.trim().to_string());
+            crate::cli::set_binary(a.settings.borrow().pvpn_binary());
             a.toast(&format!("Using {}", a.settings.borrow().pvpn_binary()));
         });
         connect.add(&row);
@@ -369,7 +368,7 @@ fn proton_page(app: &Rc<App>) -> adw::PreferencesPage {
 
     let (rows2, q) = (rows.clone(), quiet.clone());
     glib::spawn_future_local(async move {
-        let out = runner::capture(vec!["protonvpn".into(), "config".into(), "list".into()]).await;
+        let out = runner::capture(crate::cli::argv(&["proton", "config", "list"])).await;
         let listed = proton::parse_config_list(&out.stdout);
         if listed.is_empty() {
             status.set_description(Some("The settings Proton's own app has, applied with `protonvpn config set`. Could not read `protonvpn config list`; showing settings.json."));
@@ -875,7 +874,10 @@ fn files(app: &Rc<App>) -> adw::PreferencesPage {
                 backup(&path);
                 let mut fresh = Config::default();
                 fresh.autoconnect_never = load_config().autoconnect_never;
-                match fresh.save(&path) {
+                let written = toml::to_string_pretty(&fresh)
+                    .map_err(|e| e.to_string())
+                    .and_then(|text| crate::cli::write_config(&text));
+                match written {
                     Ok(()) => a2.toast("Config reset to defaults"),
                     Err(e) => a2.toast(&format!("Not reset: {e}")),
                 }
@@ -1004,6 +1006,8 @@ fn editor(app: &Rc<App>, spec: &'static FileSpec) {
                         backup(&path);
                         if spec.privileged {
                             write_privileged(&path, &text).await
+                        } else if matches!(spec.kind, Check::PvpnConfig) {
+                            crate::cli::write_config(&text)
                         } else {
                             path.parent().map(std::fs::create_dir_all);
                             std::fs::write(&path, &text).map_err(|e| e.to_string())
@@ -1015,6 +1019,7 @@ fn editor(app: &Rc<App>, spec: &'static FileSpec) {
                     Ok(()) => {
                         if matches!(spec.kind, Check::GuiConfig) {
                             *a.settings.borrow_mut() = GuiSettings::load();
+                            crate::cli::set_binary(a.settings.borrow().pvpn_binary());
                             a.apply_tray();
                             a.restart_polling();
                         }

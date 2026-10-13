@@ -20,7 +20,12 @@ pub const PROBE_PORT: u16 = 443;
 pub const PROBE_SNI: &str = "www.google.com";
 
 pub const DEFAULT_PROBE_ROUNDS: usize = 2;
-pub const DEFAULT_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+/// A handshake slower than this is not a contender for "fastest", and on a
+/// filtering network most of the ones that miss it never answer at all —
+/// the five seconds this used to be went on waiting out handshakes the
+/// filter had silently dropped. Measured 2026-10-14 on `wifi:detnsw`: real
+/// answers in 0.4–0.9s, and `pvpn best` down from 14.4s.
+pub const DEFAULT_PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
 pub const DEFAULT_SHORTLIST: usize = 40;
 pub const DEFAULT_REFINE: usize = 8;
 
@@ -28,7 +33,7 @@ pub const DEFAULT_REFINE: usize = 8;
 /// figure — probes compete with each other for the same uplink. So: a wide
 /// sweep to find what answers, then a gentle re-time of the finalists.
 pub const SWEEP_CONCURRENCY: usize = 16;
-pub const REFINE_CONCURRENCY: usize = 4;
+pub const REFINE_CONCURRENCY: usize = 8;
 
 /// Reserved for documentation (RFC 5737), so nothing is behind them
 /// anywhere. A TCP connection that succeeds proves a local box answers for

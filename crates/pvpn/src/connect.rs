@@ -20,7 +20,7 @@ use pvpn_core::cache::{self, SteerMode};
 use pvpn_core::cert;
 use pvpn_core::config::Config;
 use pvpn_core::intent;
-use pvpn_core::dbus::SavedProfile;
+use pvpn_core::dbus::{Activation, SavedProfile};
 use pvpn_core::link::{self, LinkHealth};
 use pvpn_core::net::{self, ProbeSet};
 use pvpn_core::paths;
@@ -52,11 +52,112 @@ const BASELINE_PROBE_TIMEOUT: Duration = Duration::from_millis(2500);
 async fn local_network_problem() -> Option<String> {
     // Raced, not serial: the first endpoint that answers on the ordinary
     // network settles it, and one filtered endpoint cannot hold the connect
-    // for its whole timeout.
-    let (dns_ok, internet_ok) = tokio::join!(
+    // for its whole timeout. The portal question rides along for free.
+    let (dns_ok, internet_ok, portal) = tokio::join!(
         blocking(net::dns_works),
-        net::net_works_raced(BASELINE_PROBE_TIMEOUT)
+        net::net_works_raced(BASELINE_PROBE_TIMEOUT),
+        net::portal_check(BASELINE_PROBE_TIMEOUT),
     );
+    // First, because a portal answers every other probe in the
+    // internet's place and so passes the checks below.
+    if let net::Portal::SignIn { url } = portal {
+        if !wait_for_portal_sign_in(url).await {
+            return Some(
+                "This network wants you to sign in before anything else works (a captive \
+                 portal). No server was tried or blocked.\nSign in in a browser — any \
+                 plain http:// page takes you there — then run `pvpn up` again."
+                    .to_string(),
+            );
+        }
+        let (dns_ok, internet_ok) = tokio::join!(
+            blocking(net::dns_works),
+            net::net_works_raced(BASELINE_PROBE_TIMEOUT)
+        );
+        return baseline_problem(dns_ok, internet_ok);
+    }
+    baseline_problem(dns_ok, internet_ok)
+}
+
+/// How long a connect waits for someone to get through a sign-in page.
+/// Longer in the background: nobody is sitting at that one, and the
+/// notification may not be seen at once.
+const PORTAL_PATIENCE: Duration = Duration::from_secs(5 * 60);
+const PORTAL_PATIENCE_BACKGROUND: Duration = Duration::from_secs(15 * 60);
+
+/// Put the sign-in page in front of the user and wait until it is gone.
+///
+/// A command typed at a terminal opens it in the browser; the background
+/// autoconnect raises a desktop notification instead of stealing focus.
+/// Either way the connect then carries on by itself — the point is that a
+/// reconnect after a roam ends in a tunnel, not in a failure to retry.
+/// `false` when nobody signed in within the patience.
+async fn wait_for_portal_sign_in(url: Option<String>) -> bool {
+    let page = url.unwrap_or_else(|| net::PORTAL_FALLBACK_URL.to_string());
+    let background = pvpn_core::lock::running_in_background();
+    tracing::warn!("this network wants you to sign in first (captive portal): {page}");
+    let has_display = std::env::var_os("WAYLAND_DISPLAY").is_some()
+        || std::env::var_os("DISPLAY").is_some();
+    let shown = if background || !has_display {
+        let ssid = blocking(proc::active_network_key).await;
+        spawn_quiet(
+            "notify-send",
+            &[
+                "--app-name=Protun Unblocked",
+                "--icon=network-wireless-acquiring-symbolic",
+                "--urgency=critical",
+                &format!("Sign in to {}", ssid.trim_start_matches("wifi:")),
+                &format!(
+                    "This network has a sign-in page. The VPN connects by itself once you are \
+                     through it.\n{page}"
+                ),
+            ],
+        )
+    } else {
+        spawn_quiet("xdg-open", &[&page])
+    };
+    if shown {
+        tracing::info!(
+            "{} — the connect continues by itself once you are signed in (Ctrl-C to cancel)",
+            if background || !has_display {
+                "sent a notification"
+            } else {
+                "opened the sign-in page in your browser"
+            }
+        );
+    }
+    let patience = if background {
+        PORTAL_PATIENCE_BACKGROUND
+    } else {
+        PORTAL_PATIENCE
+    };
+    let deadline = Instant::now() + patience;
+    let mut narrated = Instant::now();
+    while Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        if net::portal_check(Duration::from_secs(3)).await == net::Portal::Open {
+            tracing::info!("signed in — the network is open; connecting");
+            return true;
+        }
+        if narrated.elapsed() >= Duration::from_secs(30) {
+            narrated = Instant::now();
+            tracing::info!("still waiting for the sign-in page: {page}");
+        }
+    }
+    false
+}
+
+/// Start a helper program and forget it; `false` if it could not start.
+fn spawn_quiet(program: &str, args: &[&str]) -> bool {
+    std::process::Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .is_ok()
+}
+
+fn baseline_problem(dns_ok: bool, internet_ok: bool) -> Option<String> {
     if !dns_ok {
         return Some(
             "Your local DNS resolver is not answering before the VPN starts. \
@@ -222,6 +323,42 @@ fn fast_path_candidates(
     out
 }
 
+/// `server`'s saved profile, if it runs a transport this network passes.
+fn plausible_profile(
+    session: &Session,
+    profiles: &[SavedProfile],
+    server: &str,
+) -> Option<SavedProfile> {
+    let profile = profiles
+        .iter()
+        .find(|p| p.server().is_some_and(|s| s.eq_ignore_ascii_case(server)))?;
+    session
+        .state
+        .profile_protocol_is_plausible(profile.protocol().as_deref())
+        .then(|| profile.clone())
+}
+
+/// The protocol a profile is built for when nobody named one: what last
+/// carried here, else the default.
+fn direct_protocol(session: &Session, named: Option<&str>) -> String {
+    named
+        .map(str::to_string)
+        .or_else(|| session.state.proven_protocol())
+        .unwrap_or_else(|| DEFAULT_PROTOCOL.to_string())
+}
+
+/// Saved profiles for `servers`, building the missing ones from Proton's
+/// inventory, so each can be activated over D-Bus instead of through
+/// Proton's client — measured 2026-10-14 on `wifi:detnsw`, twelve to
+/// sixteen seconds between asking the client and NetworkManager starting
+/// the tunnel, three of them a `clientconfig` request this network never
+/// answers. See [`pvpn_core::profiles`].
+async fn direct_profiles(servers: &[String], protocol: &str) -> Vec<SavedProfile> {
+    let servers = servers.to_vec();
+    let protocol = protocol.to_string();
+    blocking(move || pvpn_core::profiles::ensure_profiles(&servers, Some(&protocol))).await
+}
+
 /// Activate one saved profile over D-Bus and see whether it carries.
 ///
 /// `None` when NetworkManager never brought it up — nothing was tried, so
@@ -240,9 +377,16 @@ async fn activate_profile_and_verify(
     profile: &SavedProfile,
     probes: &ProbeSet,
     network: &str,
+    protocol: Option<&str>,
 ) -> Option<Attempt> {
     let started_at = Utc::now();
     let timer = Instant::now();
+    // The transport this network passes best, not whichever one the profile
+    // happened to be saved with. See `profiles::align_transport`.
+    let wanted = direct_protocol(session, protocol);
+    let to_align = profile.clone();
+    let aligned = blocking(move || pvpn_core::profiles::align_transport(&to_align, &wanted)).await;
+    let profile = &aligned;
     let timeout = Duration::from_secs(session.config.connect_timeout_secs);
     let settle = fast_path_settle(
         session.state.expected_ready_ms(server),
@@ -250,21 +394,50 @@ async fn activate_profile_and_verify(
     );
     tracing::debug!("t+{:.3}s asking NetworkManager for {server}", timer.elapsed().as_secs_f64());
 
-    let to_activate = profile.clone();
-    let active_path = match blocking(move || pvpn_core::dbus::activate(&to_activate)).await {
-        Ok(path) => path,
-        Err(err) => {
-            tracing::warn!("NetworkManager would not start {server}'s saved profile: {err}");
-            return None;
+    let mut rekeyed = false;
+    let active_path = loop {
+        let to_activate = profile.clone();
+        let active_path = match blocking(move || pvpn_core::dbus::activate(&to_activate)).await {
+            Ok(path) => path,
+            Err(err) => {
+                tracing::warn!("NetworkManager would not start {server}'s saved profile: {err}");
+                return None;
+            }
+        };
+        let awaited = active_path.clone();
+        match blocking(move || pvpn_core::dbus::await_activation(&awaited, timeout)).await {
+            Activation::Activated => break active_path,
+            Activation::NeedsSecrets if !rekeyed => {
+                // Every saved profile carries the same session key, so one
+                // keyring read repairs this one and every other one with it.
+                rekeyed = true;
+                let _ = blocking(move || pvpn_core::dbus::deactivate(&active_path)).await;
+                let _ = wait_for_no_active_tunnel(Duration::from_secs(2)).await;
+                match blocking(pvpn_core::profiles::rekey_all).await {
+                    Some(n) => tracing::info!(
+                        "{server}'s saved profile had lost its key — restored it to {n} saved profile{}",
+                        if n == 1 { "" } else { "s" }
+                    ),
+                    None => {
+                        tracing::warn!(
+                            "{server}'s saved profile has no key and the keyring would not give one up"
+                        );
+                        return None;
+                    }
+                }
+            }
+            outcome => {
+                if outcome == Activation::NeedsSecrets {
+                    tracing::warn!("{server}'s saved profile still asks for a key it was just given");
+                } else {
+                    tracing::warn!("{server}'s saved profile did not come up");
+                }
+                let _ = blocking(move || pvpn_core::dbus::deactivate(&active_path)).await;
+                let _ = wait_for_no_active_tunnel(Duration::from_secs(2)).await;
+                return None;
+            }
         }
     };
-    let awaited = active_path.clone();
-    if !blocking(move || pvpn_core::dbus::await_activation(&awaited, timeout)).await {
-        tracing::warn!("{server}'s saved profile did not come up");
-        let _ = blocking(move || pvpn_core::dbus::deactivate(&active_path)).await;
-        let _ = wait_for_no_active_tunnel(Duration::from_secs(2)).await;
-        return None;
-    }
 
     let protocol = profile.protocol().unwrap_or_default();
     tracing::info!(
@@ -335,7 +508,7 @@ async fn activate_saved_fast_path(
     let network = session.network().to_string();
     for (server, profile) in candidates.iter().take(FAST_PATH_CANDIDATES) {
         let Some(attempt) =
-            activate_profile_and_verify(session, server, profile, probes, &network).await
+            activate_profile_and_verify(session, server, profile, probes, &network, None).await
         else {
             continue;
         };
@@ -496,26 +669,59 @@ pub async fn ensure_fresh_data(cfg: &Config, optional: bool) -> anyhow::Result<(
     }
     if let Some(valid_for) = cache::inventory_valid_for_secs(&path) {
         if valid_for > 0 {
-            let minutes = (valid_for + 59) / 60;
-            tracing::info!(
-                "Proton's server inventory is valid for {minutes} more minute{}",
-                if minutes == 1 { "" } else { "s" }
-            );
+            tracing::debug!("Proton's server inventory is valid for {}s more", valid_for);
             return Ok(());
         }
     } else {
         let age = proc::file_age_hours(&path).unwrap_or(99999);
         if age < cfg.stale_hours {
-            tracing::info!("server inventory has no expiry metadata and is {age}h old");
+            tracing::debug!("server inventory has no expiry metadata and is {age}h old");
             return Ok(());
         }
     }
 
-    if !path.is_file() {
-        tracing::info!("no cached Proton server inventory");
-    } else {
-        tracing::info!("Proton's cached server inventory has expired");
+    // A list we already have is a list we can connect with. Refreshing it
+    // here put the API between the user and the tunnel — on a network that
+    // blocks Proton by name that is a Tor round trip with a ten-minute
+    // budget, before a connect that otherwise takes a second. The refresh
+    // happens after the tunnel is verified instead, through the tunnel,
+    // where the API answers (`refresh_inventory_if_due`, run by
+    // `after-connect`). Only a machine with no list at all has to wait.
+    if path.is_file() {
+        let stale_for = cfg.stale_hours.max(1) as i64;
+        let extended = blocking(move || cache::extend_inventory_expiry(&path, stale_for)).await;
+        if let Err(err) = extended {
+            tracing::warn!("could not extend the cached inventory's expiry: {err}");
+        }
+        tracing::info!(
+            "Proton's server inventory has expired — connecting with it, and refreshing it \
+             through the tunnel once it is up"
+        );
+        return Ok(());
     }
+    tracing::info!("no cached Proton server inventory — fetching it first");
+    refresh_inventory(cfg, optional).await
+}
+
+/// Fetch Proton's inventory once the tunnel has been verified, if the data
+/// on disk is older than Proton's own refresh period.
+pub async fn refresh_inventory_if_due(cfg: &Config) {
+    if cache::fetched_within(cache::INVENTORY_REFRESH_EVERY) {
+        return;
+    }
+    if cache::steer_in_flight(&paths::serverlist_path()) {
+        // A hop is choosing from this list right now; next time.
+        return;
+    }
+    if let Err(err) = refresh_inventory(cfg, true).await {
+        eprintln!("could not refresh Proton's server inventory: {err}");
+    }
+}
+
+/// Fetch Proton's server list, directly where the API answers and over Tor
+/// where it does not. Routing is untouched.
+async fn refresh_inventory(cfg: &Config, optional: bool) -> anyhow::Result<()> {
+    let path = paths::serverlist_path();
 
     // Ask where the API can be reached *before* reaching for Tor. Tor is
     // the workaround for a network that blocks Proton by name; it is not a
@@ -1058,7 +1264,10 @@ pub async fn after_connect(cfg: &Config) -> i32 {
     let fix = cfg.fix_apps;
     let bypassing = blocking(apps_hook::audit).await;
     blocking(move || apps_hook::enforce_app_routing_for(&bypassing, fix)).await;
-    renew_if_due(cfg).await
+    // Both need Proton's API, which the verified tunnel has just made
+    // reachable; neither needs the other.
+    let (renewed, ()) = tokio::join!(renew_if_due(cfg), refresh_inventory_if_due(cfg));
+    renewed
 }
 
 /// `pvpn cert --renew --if-due`: the body of the background renewal.
@@ -1174,6 +1383,9 @@ pub async fn compute_full_rank(
     req = req.with_state(&session.state, cfg.blocked_retry_after(), now);
 
     let result = pipeline::rank_servers(req).await?;
+    // The measuring took seconds without the connect lock; take in whatever
+    // a connect recorded meanwhile before writing over it.
+    session.reload_state();
 
     // Only when the numbers mean something. Where a transparent proxy
     // answers every handshake, `measured` is false and the latencies are
@@ -1447,6 +1659,54 @@ pub async fn up(session: &mut Session, protocol: Option<String>) -> UpReport {
             };
         }
         attempt += 1;
+
+        // Direct first: a profile for this server, saved or built from
+        // Proton's inventory, activated in one D-Bus call. Only when that
+        // cannot start a tunnel at all does Proton's client get the server.
+        if let Some(name) = &target {
+            let profiles = direct_profiles(std::slice::from_ref(name), &proto).await;
+            if let Some(profile) = plausible_profile(session, &profiles, name) {
+                if let Some(direct) =
+                    activate_profile_and_verify(session, name, &profile, &probes, &network, Some(&proto)).await
+                {
+                    if direct.verdict.carrying() {
+                        return UpReport {
+                            ok: true,
+                            message: format!(
+                                "Connected via {proto}; verified in {:.2}s.",
+                                direct.ready_ms as f64 / 1000.0
+                            ),
+                            server: Some(direct.server),
+                        };
+                    }
+                    match direct.outcome {
+                        ConnectOutcome::LocalNetworkDown => {
+                            restore().await;
+                            return UpReport {
+                                ok: false,
+                                message: format!(
+                                    "Your own network went away during the connect, so there is \
+                                     nothing to say about {name}.\nNo server was written off. Run \
+                                     `pvpn up` again once the wifi is back."
+                                ),
+                                server: None,
+                            };
+                        }
+                        // Ours, not the server's: Proton's client below
+                        // knows how to renew and retry.
+                        ConnectOutcome::CertificateExpired => {}
+                        _ => {
+                            quiet_tunnels += 1;
+                            if quiet_tunnels >= QUIET_TUNNELS_BEFORE_GIVING_UP {
+                                break;
+                            }
+                            n += 1;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
 
         let attempt_started = Utc::now();
         let attempt_timer = Instant::now();
@@ -1724,17 +1984,52 @@ pub async fn down() -> UpReport {
     // holds even when the teardown below ends in a warning.
     intent::mark_down(&Config::data_dir());
 
-    // NetworkManager owns the actual tunnel. Proton's status can remain
-    // "Connected" after that profile has already disappeared.
-    let current = blocking(proc::active_proton_server).await;
-    if let (Some(server), Ok(mut session)) = (current.as_deref(), Session::load()) {
+    // The bus first: one deactivation, the live profile saved in place, and
+    // nothing of Proton's client started. Measured 2026-10-14 on
+    // `wifi:detnsw`: a tunnel Proton's client had built took 5–6s to come
+    // down through `protonvpn disconnect` and a keyring read; this is
+    // NetworkManager's own few milliseconds.
+    let mut session = Session::load().ok();
+    if let Some(session) = session.as_mut() {
         session.sync_network().await;
-        if server_is_proven_here(&session, server) {
-            preserve_then_disconnect(server).await;
-        }
     }
-    let restored = restore().await;
-    tidy_duplicate_profiles().await;
+    let proven: std::collections::HashSet<String> = session
+        .as_ref()
+        .map(|s| {
+            s.state
+                .servers()
+                .keys()
+                .filter(|name| server_is_proven_here(s, name))
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    let fast = blocking(move || {
+        pvpn_core::teardown::down(|server| {
+            proven.iter().any(|p| p.eq_ignore_ascii_case(server))
+        })
+    })
+    .await;
+    let restored = match fast {
+        Ok(_) => {
+            proc::kill_in_flight_connect();
+            wait_for_internet(Duration::from_secs(SETTLE_AFTER_TEARDOWN_SECS as u64)).await
+        }
+        Err(err) => {
+            tracing::debug!("taking the tunnel down over the bus failed ({err}); asking Proton's client");
+            // NetworkManager owns the actual tunnel. Proton's status can
+            // remain "Connected" after that profile has already disappeared.
+            let current = blocking(proc::active_proton_server).await;
+            if let (Some(server), Some(session)) = (current.as_deref(), session.as_ref()) {
+                if server_is_proven_here(session, server) {
+                    preserve_then_disconnect(server).await;
+                }
+            }
+            let restored = restore().await;
+            tidy_duplicate_profiles().await;
+            restored
+        }
+    };
     let stray = blocking(proc::stray_leak_route).await;
     if let Some(dev) = stray {
         // Say this even when IPv4 came back: "Internet is working" while a
@@ -1945,28 +2240,25 @@ async fn hop_to_next_best(
         candidates[..attempts].join(", ")
     );
 
-    // Saved profiles worth activating, looked up once for the whole list.
-    let profiles = blocking(pvpn_core::dbus::saved_proton_profiles).await;
-    let saved: Vec<(String, SavedProfile)> = fast_path_candidates(session, &profiles, Some(&current));
+    // Saved profiles worth activating — built from Proton's inventory where
+    // a candidate has none — looked up once for the whole list.
+    let profiles = direct_profiles(&candidates[..attempts], &proto).await;
     let mut probes: Option<ProbeSet> = None;
 
     for (i, target) in candidates.iter().take(attempts).enumerate() {
         tracing::info!("attempt {}/{attempts} — {target}", i + 1);
-        // The hot path first, where there is one: a proven server's saved
-        // profile over D-Bus. If it activates and carries nothing, that is
-        // recorded and the next candidate is tried — not Proton's client
-        // for the same server, which would build the same tunnel again.
-        let saved_profile = saved
-            .iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case(target))
-            .map(|(_, profile)| profile.clone());
+        // The hot path first, where there is one: a saved profile over
+        // D-Bus. If it activates and carries nothing, that is recorded and
+        // the next candidate is tried — not Proton's client for the same
+        // server, which would build the same tunnel again.
+        let saved_profile = plausible_profile(session, &profiles, target);
         let attempt = if let Some(profile) = saved_profile {
             disconnect_and_wait().await;
             if probes.is_none() {
                 probes = Some(ProbeSet::resolve(PROBE_RESOLVE_BUDGET).await);
             }
             let probes = probes.clone().unwrap_or_default();
-            match activate_profile_and_verify(session, target, &profile, &probes, &network).await
+            match activate_profile_and_verify(session, target, &profile, &probes, &network, Some(&proto)).await
             {
                 Some(attempt) => attempt,
                 None => continue,
@@ -2058,8 +2350,10 @@ async fn hop_via_saved_profile(
     session: &mut Session,
     want: &str,
     before: Option<&str>,
+    protocol: Option<&str>,
 ) -> Option<UpReport> {
-    let profiles = blocking(pvpn_core::dbus::saved_proton_profiles).await;
+    let wanted = direct_protocol(session, protocol);
+    let profiles = direct_profiles(&[want.to_string()], &wanted).await;
     let profile = profiles
         .iter()
         .find(|p| p.server().is_some_and(|s| s.eq_ignore_ascii_case(want)))?
@@ -2084,7 +2378,7 @@ async fn hop_via_saved_profile(
         disconnect_and_wait().await;
     }
     let network = session.network().to_string();
-    let attempt = activate_profile_and_verify(session, want, &profile, &probes, &network).await?;
+    let attempt = activate_profile_and_verify(session, want, &profile, &probes, &network, Some(&wanted)).await?;
     if !attempt.verdict.carrying() {
         return None;
     }
@@ -2135,13 +2429,15 @@ async fn hop_to_pattern(
     }
     let cfg = session.config.clone();
 
-    // A server named exactly, proven here, with a saved profile that runs
-    // a transport this network passes: the same hot path `up` takes, and
-    // for the same reason — one D-Bus call and a second, against Proton's
-    // client and fifteen. Anything short of carrying falls through to the
-    // full path below, which knows how to rebuild from Proton's inventory.
-    if want.contains('#') && server_is_proven_here(session, &want) {
-        if let Some(report) = hop_via_saved_profile(session, &want, before.as_deref()).await {
+    // A server named exactly, with a saved profile — or one built from
+    // Proton's inventory — that runs a transport this network passes: the
+    // same hot path `up` takes, and for the same reason — one D-Bus call
+    // and a second, against Proton's client and fifteen. Anything short of
+    // carrying falls through to the full path below.
+    if want.contains('#') {
+        if let Some(report) =
+            hop_via_saved_profile(session, &want, before.as_deref(), protocol.as_deref()).await
+        {
             return report;
         }
     }

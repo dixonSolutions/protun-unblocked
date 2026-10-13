@@ -13,6 +13,7 @@ mod blocklist;
 mod connect;
 mod login;
 mod narrate;
+mod query;
 mod session;
 mod verify;
 mod watch;
@@ -56,6 +57,10 @@ Takes no arguments. Choosing a server or a protocol is hop's job:
         /// entirely — silence is the one thing it must not do again.
         #[arg(hide = true)]
         rejected: Vec<String>,
+        /// Take over from any other pvpn already working — a `down`, a
+        /// reconnect, another terminal's connect — instead of waiting
+        #[arg(long, short = 'f')]
+        force: bool,
     },
     /// Rank the fastest servers your account can use
     #[command(after_help = "\
@@ -72,6 +77,9 @@ pvpn best — find the fastest servers your account can use
         /// Measure, then connect to the best one
         #[arg(long, short = 'c')]
         connect: bool,
+        /// With --connect: take over from any other pvpn instead of waiting
+        #[arg(long, short = 'f')]
+        force: bool,
         /// Skip measuring; rank by distance and load
         #[arg(long, short = 'q')]
         quick: bool,
@@ -103,10 +111,17 @@ pvpn best — find the fastest servers your account can use
     Hop {
         pattern: Option<String>,
         protocol: Option<String>,
+        /// Take over from any other pvpn already working instead of waiting
+        #[arg(long, short = 'f')]
+        force: bool,
     },
     /// Disconnect and restore normal internet
     #[command(alias = "disconnect")]
-    Down,
+    Down {
+        /// Stop any connect in progress at once, rather than giving it 30s
+        #[arg(long, short = 'f')]
+        force: bool,
+    },
     /// Show connection state and protocol
     #[command(alias = "st")]
     Status,
@@ -176,7 +191,11 @@ pvpn apps — find Flatpak apps whose traffic skips the tunnel
         apps: Vec<String>,
     },
     /// Try every protocol, stop at the first that works
-    Try,
+    Try {
+        /// Take over from any other pvpn already working instead of waiting
+        #[arg(long, short = 'f')]
+        force: bool,
+    },
     /// Which backends are actually available here
     #[command(alias = "protos")]
     Protocols,
@@ -318,6 +337,36 @@ or a session the far end tore down actually shows up.
     Gui,
     /// Start just the tray icon, no window
     Tray,
+    /// Machine-readable state as JSON — what the window reads
+    #[command(after_help = "\
+pvpn query — machine-readable state, one JSON document on stdout
+
+  pvpn query status [--probe]   the tunnel, who is connecting, autoconnect
+  pvpn query busy               only who holds the connect lock
+  pvpn query state              everything every network has taught pvpn
+  pvpn query inventory          Proton's server inventory
+  pvpn query cert               the client certificate's expiry
+  pvpn query config             the effective configuration
+")]
+    Query {
+        #[command(subcommand)]
+        what: query::What,
+    },
+    /// Read or change ~/.config/pvpn/config.toml
+    Config {
+        #[command(subcommand)]
+        action: query::ConfigAction,
+    },
+    /// Run Proton's own CLI with pvpn's fast-fail API shim
+    Proton {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Start, stop or read the services pvpn uses
+    Service {
+        #[command(subcommand)]
+        action: query::ServiceAction,
+    },
     /// May the tunnel be rebuilt for you on this network? (for pvpn-autoconnect)
     #[command(name = "autoconnect-check", hide = true)]
     AutoconnectCheck,
@@ -505,27 +554,31 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
         }
         Command::Gui => cmd_gui(false),
         Command::Tray => cmd_gui(true),
-        Command::Up { rejected } => block_on(async move {
+        Command::Up { rejected, force } => block_on(async move {
             if let Some(message) = connect::up_takes_no_arguments(&rejected) {
                 eprintln!("{message}");
                 return Ok(2);
             }
             let mut session = Session::load()?;
             let _tray = tray_for_connect();
-            let _guard = pvpn_core::lock::acquire().await;
+            let _guard = connect_lock(force).await;
             remember_where_asked();
             Ok(report(
                 run_interruptible(connect::up(&mut session, None)).await,
             ))
         }),
-        Command::Down => block_on(async move {
-            let _guard = pvpn_core::lock::acquire_bounded(DOWN_LOCK_PATIENCE).await;
+        Command::Down { force } => block_on(async move {
+            let _guard = if force {
+                Some(pvpn_core::lock::acquire_forced().await)
+            } else {
+                pvpn_core::lock::acquire_bounded(DOWN_LOCK_PATIENCE).await
+            };
             Ok(report(connect::down().await))
         }),
-        Command::Hop { pattern, protocol } => block_on(async move {
+        Command::Hop { pattern, protocol, force } => block_on(async move {
             let mut session = Session::load()?;
             let _tray = tray_for_connect();
-            let _guard = pvpn_core::lock::acquire().await;
+            let _guard = connect_lock(force).await;
             remember_where_asked();
             Ok(report(
                 run_interruptible(connect::hop(&mut session, pattern, protocol)).await,
@@ -557,6 +610,7 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
         Command::Ip => block_on(cmd_ip()),
         Command::Best {
             connect,
+            force,
             quick,
             json,
             country,
@@ -565,7 +619,7 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
             serverlist,
             offline,
         } => block_on(cmd_best(
-            connect, quick, json, country, limit, free, serverlist, offline,
+            connect, force, quick, json, country, limit, free, serverlist, offline,
         )),
         Command::Login { email, browser } => login::cmd_login(email, browser),
         Command::Logout => login::cmd_logout(),
@@ -591,13 +645,17 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
             }
         }
         Command::Apps { fix, verify, apps } => apps_cmd::cmd_apps(fix, verify, &apps),
-        Command::Try => block_on(async move {
+        Command::Try { force } => block_on(async move {
             let _tray = tray_for_connect();
-            let _guard = pvpn_core::lock::acquire().await;
+            let _guard = connect_lock(force).await;
             login::cmd_try().await
         }),
         Command::Protocols => login::cmd_protocols(),
         Command::Fix { hosts, unhosts } => login::cmd_fix(hosts, unhosts),
+        Command::Query { what } => Ok(query::query(what)),
+        Command::Config { action } => Ok(query::config(action)),
+        Command::Proton { args } => Ok(query::proton(&args)),
+        Command::Service { action } => Ok(query::service(action)),
         Command::AfterConnect => block_on(async {
             let session = Session::load()?;
             Ok(connect::after_connect(&session.config).await)
@@ -693,6 +751,20 @@ fn report(report: connect::UpReport) -> i32 {
     }
 }
 
+/// The connect lock, waited for — or, with `--force`, taken from whoever
+/// holds it.
+async fn connect_lock(force: bool) -> pvpn_core::lock::ConnectGuard {
+    if force {
+        pvpn_core::lock::acquire_forced().await
+    } else {
+        pvpn_core::lock::acquire().await
+    }
+}
+
+/// Exit code of a connect that stepped aside for another command
+/// (`EX_TEMPFAIL`). `pvpn-autoconnect` reads it as "someone else has this".
+const PREEMPTED_EXIT: i32 = 75;
+
 /// A connect rewrites routing and DNS before it starts carrying traffic, so
 /// Ctrl-C is a request to abort safely, not permission to leave immediately.
 ///
@@ -704,8 +776,27 @@ async fn run_interruptible<F>(operation: F) -> connect::UpReport
 where
     F: std::future::Future<Output = connect::UpReport>,
 {
+    // SIGTERM is how a command typed at a terminal asks a background
+    // connect to step aside (`lock::preempt`), and how systemd stops one.
+    // Same cleanup as Ctrl-C, then a distinct exit code so
+    // `pvpn-autoconnect` stops rather than queueing another attempt behind
+    // the command that preempted it.
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
+    let terminated = async {
+        match term.as_mut() {
+            Some(term) => {
+                term.recv().await;
+            }
+            None => std::future::pending::<()>().await,
+        }
+    };
     tokio::select! {
         report = operation => report,
+        _ = terminated => {
+            tracing::warn!("asked to step aside — restoring normal internet first");
+            connect::restore().await;
+            std::process::exit(PREEMPTED_EXIT);
+        }
         _ = tokio::signal::ctrl_c() => {
             tracing::warn!("interrupted — disconnecting and restoring normal internet");
             let restored = connect::restore().await;
@@ -1294,6 +1385,7 @@ fn cmd_logs(follow: bool, lines: u32) -> anyhow::Result<i32> {
 #[allow(clippy::too_many_arguments)]
 async fn cmd_best(
     do_connect: bool,
+    force: bool,
     quick: bool,
     json: bool,
     country: Option<String>,
@@ -1326,7 +1418,7 @@ async fn cmd_best(
         print_rank(&result, json)?;
         if do_connect {
             let mut session = Session::load()?;
-            let _guard = pvpn_core::lock::acquire().await;
+            let _guard = connect_lock(force).await;
             return Ok(report(
                 run_interruptible(connect::up(&mut session, None)).await,
             ));
@@ -1348,7 +1440,7 @@ async fn cmd_best(
     print_rank(&result, json)?;
 
     if do_connect {
-        let _guard = pvpn_core::lock::acquire().await;
+        let _guard = connect_lock(force).await;
         return Ok(report(
             run_interruptible(connect::up(&mut session, None)).await,
         ));

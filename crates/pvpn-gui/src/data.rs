@@ -50,8 +50,10 @@ pub struct NetworkView {
     pub ranked_at: Option<DateTime<Utc>>,
 }
 
+/// Everything `pvpn` has learned, from `pvpn query state`.
 pub fn load_state() -> State {
-    State::load(&Config::state_path()).unwrap_or_default()
+    crate::cli::query(&["state"])
+        .unwrap_or_else(|| State::load(&Config::state_path()).unwrap_or_default())
 }
 
 pub fn networks(state: &State) -> Vec<String> {
@@ -149,10 +151,9 @@ struct RawList {
     logical: Vec<pvpn_core::serverlist::RawLogical>,
 }
 
-/// Name → place, from Proton's cached server list.
+/// Name → place, from Proton's server list (`pvpn query inventory`).
 pub fn places() -> HashMap<String, Place> {
-    let path = pvpn_core::paths::serverlist_path();
-    let Ok(text) = std::fs::read_to_string(path) else {
+    let Some(text) = crate::cli::inventory() else {
         return HashMap::new();
     };
     let Ok(list) = serde_json::from_str::<RawList>(&text) else {

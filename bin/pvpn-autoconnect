@@ -164,9 +164,14 @@ export PVPN_AUTOCONNECT=1
 # can take a minute and a half on a filtered one, so pvpn is never given a
 # deadline here — killing it mid-connect is what strands the kill switch and
 # takes all internet with it.
+#
+# Exit 75 means a command typed at a terminal asked this one to step aside
+# (pvpn's lock preempts background connects). That command owns the tunnel
+# now; retrying behind it would only queue another connect it does not want.
 for ((attempt = 1; attempt <= ATTEMPTS; attempt++)); do
     tunnel_up && exit 0
     "$pvpn_bin" up && tunnel_up && exit 0
+    [[ $? -eq 75 ]] && exit 0
     [[ $attempt -lt $ATTEMPTS ]] && sleep $((attempt * 20))
 done
 exit 1

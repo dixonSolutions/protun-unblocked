@@ -70,8 +70,13 @@ pub enum LoadError {
 ///
 /// Returns the account's max tier and the raw logical server records.
 pub fn load_server_list(path: &Path) -> Result<(i64, Vec<RawLogical>), LoadError> {
-    let text = std::fs::read_to_string(path)?;
-    let parsed: RawServerList = serde_json::from_str(&text)?;
+    parse_server_list(&std::fs::read_to_string(path)?)
+}
+
+/// [`load_server_list`] for text already in hand — what `pvpn query
+/// inventory` printed, say.
+pub fn parse_server_list(text: &str) -> Result<(i64, Vec<RawLogical>), LoadError> {
+    let parsed: RawServerList = serde_json::from_str(text)?;
     Ok((parsed.max_tier, parsed.logical_servers))
 }
 

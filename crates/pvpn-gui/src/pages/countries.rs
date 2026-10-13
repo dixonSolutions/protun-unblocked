@@ -198,7 +198,7 @@ pub fn build(app: &Rc<App>) -> gtk::Widget {
             *u.catalog.borrow_mut() = countries::load();
             let state = data::load_state();
             let network = a.snapshot.borrow().as_ref().map(|s| s.network.clone()).unwrap_or_default();
-            let config = pvpn_core::config::Config::load(&pvpn_core::config::Config::default_path()).unwrap_or_default();
+            let config = crate::cli::config();
             *u.known.borrow_mut() = data::view(&state, &network, &config).servers.into_iter().map(|s| (s.name, s.kind)).collect();
             let c = u.catalog.borrow();
             u.plan.set_label(&format!(

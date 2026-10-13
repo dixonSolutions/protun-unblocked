@@ -34,6 +34,8 @@ pub struct SavedProfile {
     /// `settings` JSON naming the ports, which is what tells `protun-tcp`
     /// from `protun-tls`.
     pub vpn_data: HashMap<String, String>,
+    /// `connection.autoconnect`, which NetworkManager defaults to on.
+    pub autoconnect: bool,
 }
 
 impl SavedProfile {
@@ -109,6 +111,10 @@ fn saved_profiles_with(bus: &Connection) -> Vec<SavedProfile> {
                 kind: string_value(connection, "type")?,
                 service_type,
                 vpn_data,
+                autoconnect: connection
+                    .get("autoconnect")
+                    .and_then(|v| bool::try_from(v).ok())
+                    .unwrap_or(true),
             })
         })
         .collect()
@@ -270,22 +276,178 @@ pub fn deactivate(active_path: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn await_activation(active_path: &str, timeout: Duration) -> bool {
+/// How an activation ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Activation {
+    Activated,
+    /// The plugin asked for the profile's secrets: the WireGuard key is not
+    /// stored in it. Nothing will supply one — GNOME Shell's agent has no
+    /// dialog for protun and never answers — so waiting is pointless.
+    NeedsSecrets,
+    Failed,
+}
+
+/// `NM_VPN_CONNECTION_STATE_NEED_AUTH`.
+const NM_VPN_CONNECTION_STATE_NEED_AUTH: u32 = 2;
+const VPN_CONNECTION_IFACE: &str = "org.freedesktop.NetworkManager.VPN.Connection";
+
+/// Wait for an activation to settle, reading NetworkManager's state for it.
+///
+/// A profile without its key used to cost the whole connect timeout here.
+/// Measured on `wifi:detnsw`, 2026-10-14: three saved profiles, each one
+/// logging `Secrets are needed for this connection` within 3ms of
+/// activation and then waiting thirty seconds for a secret agent that never
+/// replies — ninety seconds before Proton's client was even started. The
+/// VPN state says `NEED_AUTH` the moment the plugin asks, so that is a
+/// verdict in milliseconds rather than a timeout.
+pub fn await_activation(active_path: &str, timeout: Duration) -> Activation {
     let Some(bus) = system_bus() else {
-        return false;
+        return Activation::Failed;
     };
     let Ok(proxy) = Proxy::new(&bus, NM_DEST, active_path, ACTIVE_IFACE) else {
-        return false;
+        return Activation::Failed;
     };
+    let vpn = Proxy::new(&bus, NM_DEST, active_path, VPN_CONNECTION_IFACE).ok();
     let deadline = Instant::now() + timeout;
     loop {
         match proxy.get_property::<u32>("State") {
-            Ok(NM_ACTIVE_CONNECTION_STATE_ACTIVATED) => return true,
-            Ok(NM_ACTIVE_CONNECTION_STATE_DEACTIVATED) | Err(_) => return false,
-            _ if Instant::now() >= deadline => return false,
-            _ => std::thread::sleep(Duration::from_millis(20)),
+            Ok(NM_ACTIVE_CONNECTION_STATE_ACTIVATED) => return Activation::Activated,
+            Ok(NM_ACTIVE_CONNECTION_STATE_DEACTIVATED) | Err(_) => return Activation::Failed,
+            _ => {}
         }
+        if vpn
+            .as_ref()
+            .and_then(|vpn| vpn.get_property::<u32>("VpnState").ok())
+            == Some(NM_VPN_CONNECTION_STATE_NEED_AUTH)
+        {
+            return Activation::NeedsSecrets;
+        }
+        if Instant::now() >= deadline {
+            return Activation::Failed;
+        }
+        std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// A profile's settings as NetworkManager returns them, secrets excluded.
+pub type Settings = HashMap<String, HashMap<String, OwnedValue>>;
+
+/// `GetSettings` for one saved profile. Never asks for secrets: on a protun
+/// profile `GetSecrets` waits on GNOME Shell's agent, which does not answer.
+pub fn settings_of(profile_path: &str) -> Option<Settings> {
+    let bus = system_bus()?;
+    let proxy = Proxy::new(&bus, NM_DEST, profile_path, SETTINGS_CONNECTION_IFACE).ok()?;
+    proxy.call("GetSettings", &()).ok()
+}
+
+/// The active Proton profile, read while it is still there to read.
+pub struct LiveProfile {
+    pub server: String,
+    pub uuid: String,
+    /// The active connection, for `DeactivateConnection`.
+    pub active_path: String,
+    /// The profile behind it, for `Update2` and `Delete`.
+    pub profile_path: String,
+    /// Proton's client builds an in-memory profile per connect and deletes
+    /// it on disconnect; a saved one this tool activated is on disk already.
+    pub transient: bool,
+    pub settings: Settings,
+}
+
+pub fn active_proton_live() -> Option<LiveProfile> {
+    let bus = system_bus()?;
+    let active = active_profiles_with(&bus)
+        .into_iter()
+        .find(|profile| profile.id.starts_with("ProtonVPN "))?;
+    let proxy = Proxy::new(&bus, NM_DEST, active.path.as_str(), ACTIVE_IFACE).ok()?;
+    let profile_path = proxy.get_property::<OwnedObjectPath>("Connection").ok()?;
+    let uuid = proxy.get_property::<String>("Uuid").ok()?;
+    let saved = Proxy::new(&bus, NM_DEST, profile_path.as_str(), SETTINGS_CONNECTION_IFACE).ok()?;
+    let transient = saved.get_property::<bool>("Unsaved").unwrap_or(true)
+        || saved
+            .get_property::<String>("Filename")
+            .is_ok_and(|f| f.starts_with("/run/"));
+    let server = active.id.strip_prefix("ProtonVPN ")?;
+    Some(LiveProfile {
+        server: server.strip_suffix(" (verified)").unwrap_or(server).to_string(),
+        uuid,
+        active_path: active.path.clone(),
+        profile_path: profile_path.to_string(),
+        transient,
+        settings: settings_of(profile_path.as_str())?,
+    })
+}
+
+/// The settings of the active Proton profile, with the server it is for.
+pub fn active_proton_settings() -> Option<(String, Settings)> {
+    let live = active_proton_live()?;
+    Some((live.server, live.settings))
+}
+
+/// Save a new profile to disk, secrets included. Returns its object path.
+pub fn add_connection(settings: &Settings) -> anyhow::Result<String> {
+    let bus = Connection::system()?;
+    let proxy = Proxy::new(&bus, NM_DEST, SETTINGS_PATH, SETTINGS_IFACE)?;
+    let path: OwnedObjectPath = proxy.call("AddConnection", &(settings,))?;
+    Ok(path.to_string())
+}
+
+/// Replace a saved profile's settings, secrets included.
+pub fn update_connection(profile_path: &str, settings: &Settings) -> anyhow::Result<()> {
+    let bus = Connection::system()?;
+    let proxy = Proxy::new(&bus, NM_DEST, profile_path, SETTINGS_CONNECTION_IFACE)?;
+    proxy.call::<_, _, ()>("Update", &(settings,))?;
+    Ok(())
+}
+
+/// `NM_SETTINGS_UPDATE2_FLAG_TO_DISK`.
+const UPDATE2_TO_DISK: u32 = 0x1;
+
+/// Replace a profile's settings and move it to disk, keeping the secrets
+/// NetworkManager already holds for it — an in-memory profile becomes a
+/// saved one without its key ever leaving NetworkManager.
+pub fn persist_connection(profile_path: &str, settings: &Settings) -> anyhow::Result<()> {
+    let bus = Connection::system()?;
+    let proxy = Proxy::new(&bus, NM_DEST, profile_path, SETTINGS_CONNECTION_IFACE)?;
+    let args: HashMap<String, OwnedValue> = HashMap::new();
+    proxy.call::<_, _, HashMap<String, OwnedValue>>("Update2", &(settings, UPDATE2_TO_DISK, args))?;
+    Ok(())
+}
+
+/// Replace a profile's settings, keeping the secrets NetworkManager holds
+/// for it — what `nmcli connection modify` does. Unlike [`update_connection`]
+/// the settings need not carry the key.
+pub fn update_keeping_secrets(profile_path: &str, settings: &Settings) -> anyhow::Result<()> {
+    let bus = Connection::system()?;
+    let proxy = Proxy::new(&bus, NM_DEST, profile_path, SETTINGS_CONNECTION_IFACE)?;
+    let args: HashMap<String, OwnedValue> = HashMap::new();
+    proxy.call::<_, _, HashMap<String, OwnedValue>>("Update2", &(settings, 0u32, args))?;
+    Ok(())
+}
+
+/// Every Proton kill-switch profile Proton's client left (`pvpn-killswitch`,
+/// `pvpn-killswitch-ipv6`), by object path.
+pub fn killswitch_profiles() -> Vec<String> {
+    let Some(bus) = system_bus() else {
+        return Vec::new();
+    };
+    saved_profiles_with(&bus)
+        .into_iter()
+        .filter(|p| p.id.starts_with("pvpn-killswitch") || p.id.contains("pvpnks"))
+        .map(|p| p.path)
+        .collect()
+}
+
+/// Is any Proton profile still active?
+pub fn proton_profile_active() -> Option<bool> {
+    active_proton_profile_checked().ok().map(|p| p.is_some())
+}
+
+pub fn delete_connection(profile_path: &str) -> anyhow::Result<()> {
+    let bus = Connection::system()?;
+    let proxy = Proxy::new(&bus, NM_DEST, profile_path, SETTINGS_CONNECTION_IFACE)?;
+    proxy.call::<_, _, ()>("Delete", &())?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -303,6 +465,7 @@ mod tests {
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
+            autoconnect: false,
         }
     }
 

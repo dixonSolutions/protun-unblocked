@@ -10,6 +10,9 @@ use ksni::blocking::{Handle, TrayMethods};
 use ksni::menu::{CheckmarkItem, StandardItem, SubMenu};
 use ksni::MenuItem;
 
+/// How many servers the "Fastest here" submenu has room for.
+pub const FASTEST_SLOTS: usize = 6;
+
 #[derive(Debug, Clone)]
 pub enum TrayMsg {
     Show,
@@ -86,71 +89,81 @@ impl ksni::Tray for PvpnTray {
             .into(),
             MenuItem::Separator,
         ];
-        if self.busy {
-            items.push(
+        // Every item is always there; state only changes what is visible
+        // or enabled. Adding or removing items is a layout change, and the
+        // GNOME AppIndicator extension answers one by rebuilding the menu —
+        // closing it if it is open. The state changes every time a connect
+        // starts or finishes, so a structural menu snapped shut in the hand.
+        let connected = self.connected && !self.busy;
+        let idle = !self.connected && !self.busy;
+        items.push(
+            StandardItem {
+                label: "Cancel".into(),
+                icon_name: "process-stop-symbolic".into(),
+                visible: self.busy,
+                activate: Box::new(|t: &mut Self| t.send(TrayMsg::Cancel)),
+                ..Default::default()
+            }
+            .into(),
+        );
+        items.push(
+            StandardItem {
+                label: "Disconnect".into(),
+                icon_name: "network-vpn-disconnected-symbolic".into(),
+                visible: connected,
+                activate: Box::new(|t: &mut Self| t.send(TrayMsg::Disconnect)),
+                ..Default::default()
+            }
+            .into(),
+        );
+        items.push(
+            StandardItem {
+                label: "Switch server".into(),
+                icon_name: "media-skip-forward-symbolic".into(),
+                visible: connected,
+                activate: Box::new(|t: &mut Self| t.send(TrayMsg::Hop(None))),
+                ..Default::default()
+            }
+            .into(),
+        );
+        items.push(
+            StandardItem {
+                label: "Connect".into(),
+                icon_name: "network-vpn-symbolic".into(),
+                visible: idle,
+                activate: Box::new(|t: &mut Self| t.send(TrayMsg::Connect)),
+                ..Default::default()
+            }
+            .into(),
+        );
+        // A fixed number of slots for the same reason; unused ones hide.
+        let submenu: Vec<MenuItem<Self>> = (0..FASTEST_SLOTS)
+            .map(|i| {
+                let name = self.fastest.get(i).cloned();
                 StandardItem {
-                    label: "Cancel".into(),
-                    icon_name: "process-stop-symbolic".into(),
-                    activate: Box::new(|t: &mut Self| t.send(TrayMsg::Cancel)),
-                    ..Default::default()
-                }
-                .into(),
-            );
-        } else if self.connected {
-            items.push(
-                StandardItem {
-                    label: "Disconnect".into(),
-                    icon_name: "network-vpn-disconnected-symbolic".into(),
-                    activate: Box::new(|t: &mut Self| t.send(TrayMsg::Disconnect)),
-                    ..Default::default()
-                }
-                .into(),
-            );
-            items.push(
-                StandardItem {
-                    label: "Switch server".into(),
-                    icon_name: "media-skip-forward-symbolic".into(),
-                    activate: Box::new(|t: &mut Self| t.send(TrayMsg::Hop(None))),
-                    ..Default::default()
-                }
-                .into(),
-            );
-        } else {
-            items.push(
-                StandardItem {
-                    label: "Connect".into(),
-                    icon_name: "network-vpn-symbolic".into(),
-                    activate: Box::new(|t: &mut Self| t.send(TrayMsg::Connect)),
-                    ..Default::default()
-                }
-                .into(),
-            );
-        }
-        if !self.fastest.is_empty() {
-            let submenu: Vec<MenuItem<Self>> = self
-                .fastest
-                .iter()
-                .map(|name| {
-                    let n = name.clone();
-                    StandardItem {
-                        label: name.replace('_', "__"),
-                        enabled: !self.busy,
-                        activate: Box::new(move |t: &mut Self| t.send(TrayMsg::Hop(Some(n.clone())))),
-                        ..Default::default()
-                    }
-                    .into()
-                })
-                .collect();
-            items.push(
-                SubMenu {
-                    label: "Fastest here".into(),
+                    label: name.as_deref().unwrap_or_default().replace('_', "__"),
+                    visible: name.is_some(),
                     enabled: !self.busy,
-                    submenu,
+                    activate: Box::new(move |t: &mut Self| {
+                        if let Some(n) = t.fastest.get(i).cloned() {
+                            t.send(TrayMsg::Hop(Some(n)));
+                        }
+                    }),
                     ..Default::default()
                 }
-                .into(),
-            );
-        }
+                .into()
+            })
+            .collect();
+        items.push(
+            SubMenu {
+                label: "Fastest here".into(),
+                enabled: !self.busy,
+                visible: !self.fastest.is_empty(),
+                submenu,
+                ..Default::default()
+            }
+            .into(),
+        );
         items.push(
             StandardItem {
                 label: "Check tunnel".into(),

@@ -304,9 +304,8 @@ pub fn build(app: &Rc<App>) -> gtk::Widget {
     let cert_c = cert_row.clone();
     let a = app.clone();
     let details: Rc<dyn Fn()> = Rc::new(move || {
-        let now = chrono::Utc::now();
-        cert_c.set_subtitle(&match pvpn_core::cert::status_fast() {
-            Some(c) => glib::markup_escape_text(&c.describe(now)).to_string(),
+        cert_c.set_subtitle(&match crate::cli::cert() {
+            Some(c) => glib::markup_escape_text(&c.describe).to_string(),
             None => "Unknown — Proton's client has not written one here".into(),
         });
         let who = who_c.clone();

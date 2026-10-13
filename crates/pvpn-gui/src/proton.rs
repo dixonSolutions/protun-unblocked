@@ -158,8 +158,9 @@ pub fn is_on(value: &str) -> bool {
     !(v.is_empty() || v == "off" || v == "disabled" || v.starts_with("upgrade"))
 }
 
+/// `pvpn proton config set …`: Proton's CLI, run by `pvpn` with its API shim.
 pub fn set_command(key: &str, value: &str, dns: Option<&str>) -> Vec<String> {
-    let mut argv: Vec<String> = ["protonvpn", "config", "set", key, value].iter().map(|s| s.to_string()).collect();
+    let mut argv = crate::cli::argv(&["proton", "config", "set", key, value]);
     if let Some(list) = dns.filter(|l| !l.trim().is_empty()) {
         argv.push("--dns".into());
         argv.push(list.split([',', ' ']).filter(|s| !s.is_empty()).collect::<Vec<_>>().join(","));
@@ -207,10 +208,10 @@ anonymous-crash-reports  on\n\
 
     #[test]
     fn set_commands_are_what_protons_cli_takes() {
-        assert_eq!(set_command("ipv6", "off", None), ["protonvpn", "config", "set", "ipv6", "off"]);
+        assert_eq!(set_command("ipv6", "off", None)[1..], ["proton", "config", "set", "ipv6", "off"]);
         assert_eq!(
-            set_command("custom-dns", "on", Some("1.1.1.1, 8.8.8.8")),
-            ["protonvpn", "config", "set", "custom-dns", "on", "--dns", "1.1.1.1,8.8.8.8"]
+            set_command("custom-dns", "on", Some("1.1.1.1, 8.8.8.8"))[1..],
+            ["proton", "config", "set", "custom-dns", "on", "--dns", "1.1.1.1,8.8.8.8"]
         );
         assert!(!is_on(UPGRADE));
         assert!(is_on("malware-only"));

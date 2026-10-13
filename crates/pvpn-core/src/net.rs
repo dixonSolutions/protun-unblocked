@@ -165,6 +165,123 @@ pub async fn net_works_raced(timeout: Duration) -> bool {
     first_url_works(&urls, timeout).await
 }
 
+/// What the network in front of us does with a plain-HTTP request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Portal {
+    /// The real answer came back: nothing is in the way.
+    Open,
+    /// Something answered in the endpoint's place — a sign-in page or a
+    /// redirect to one. `url` is where it pointed, when it said.
+    SignIn { url: Option<String> },
+    /// Nothing answered at all; not evidence of a portal.
+    Unknown,
+}
+
+/// The two endpoints browsers use for exactly this question, with the exact
+/// answer each gives when nothing is in the way.
+const PORTAL_PROBES: [(&str, u16, &str); 2] = [
+    ("http://connectivitycheck.gstatic.com/generate_204", 204, ""),
+    ("http://detectportal.firefox.com/success.txt", 200, "success"),
+];
+
+/// What to open in a browser when the portal did not say where it lives:
+/// any plain-HTTP request is redirected to the sign-in page.
+pub const PORTAL_FALLBACK_URL: &str = "http://connectivitycheck.gstatic.com/generate_204";
+
+/// Classify one probe's answer: `(status, redirect, body)`.
+fn classify_portal_answer(
+    expected_status: u16,
+    expected_body: &str,
+    status: u16,
+    redirect: &str,
+    body: &str,
+) -> Portal {
+    if status == 0 {
+        return Portal::Unknown;
+    }
+    if status == expected_status && body.trim() == expected_body {
+        return Portal::Open;
+    }
+    let url = if !redirect.is_empty() {
+        Some(redirect.to_string())
+    } else {
+        // Portals that answer 200 often point the browser on with a meta
+        // refresh or a script rather than a Location header.
+        let lower = body.to_ascii_lowercase();
+        ["url=", "location.href=", "location.href = ", "window.location="]
+            .iter()
+            .find_map(|marker| {
+                let at = lower.find(marker)? + marker.len();
+                let rest = body[at..].trim_start_matches(['"', '\'', ' ']);
+                let end = rest.find(['"', '\'', '>', ' ', ';']).unwrap_or(rest.len());
+                let url = &rest[..end];
+                url.starts_with("http").then(|| url.to_string())
+            })
+    };
+    Portal::SignIn { url }
+}
+
+async fn portal_probe(url: &str, timeout: Duration, expected: u16, body: &str) -> Portal {
+    let output = tokio::process::Command::new("curl")
+        .args([
+            "-s",
+            "-4",
+            "--noproxy",
+            "*",
+            "--max-time",
+            &format!("{:.3}", timeout.as_secs_f64()),
+            "-w",
+            "\n%{http_code}\n%{redirect_url}",
+            url,
+        ])
+        .kill_on_drop(true)
+        .stdin(Stdio::null())
+        .output()
+        .await;
+    let Ok(output) = output else {
+        return Portal::Unknown;
+    };
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut lines = text.rsplitn(3, '\n');
+    let redirect = lines.next().unwrap_or_default().trim();
+    let status = lines.next().unwrap_or_default().trim().parse().unwrap_or(0);
+    let answered = lines.next().unwrap_or_default();
+    classify_portal_answer(expected, body, status, redirect, answered)
+}
+
+/// Is a sign-in page standing between this machine and the internet?
+///
+/// Ask *before* a connect, with the tunnel down — the only time the answer
+/// can be seen. Behind a portal every ordinary probe "works" (the portal
+/// answers it), so the pre-connect check passed, and then every server
+/// tried failed to carry and was written off for the portal's sake. On
+/// `wifi:detnsw` the portal comes back on its own schedule, so this is the
+/// usual reason a reconnect after a roam fails.
+///
+/// Either endpoint giving its real answer settles it as open; otherwise any
+/// substituted answer is a portal.
+pub async fn portal_check(timeout: Duration) -> Portal {
+    let mut checks = JoinSet::new();
+    for (url, expected, body) in PORTAL_PROBES {
+        checks.spawn(async move { portal_probe(url, timeout, expected, body).await });
+    }
+    let mut verdict = Portal::Unknown;
+    while let Some(result) = checks.join_next().await {
+        match result {
+            Ok(Portal::Open) => {
+                checks.abort_all();
+                return Portal::Open;
+            }
+            // A portal that said where it lives beats one that did not.
+            Ok(Portal::SignIn { url }) if !matches!(&verdict, Portal::SignIn { url: Some(_) }) => {
+                verdict = Portal::SignIn { url };
+            }
+            _ => {}
+        }
+    }
+    verdict
+}
+
 /// The probe endpoints with their addresses looked up in advance.
 ///
 /// Verifying a fresh tunnel by hostname made the DNS lookup part of the
@@ -444,7 +561,7 @@ pub fn wait_for_net(attempts: u32) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{classify_api_response, ApiHealth};
+    use super::{classify_api_response, classify_portal_answer, ApiHealth, Portal};
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::time::{Duration, Instant};
@@ -470,6 +587,29 @@ x-pm-date: 26 Aug 2026 23:59:33 GMT\r\n\r\n200";
         // Reporting this as "down" would call a healthy API broken.
         let headers = "HTTP/2 401 \r\nx-pm-date: 26 Aug 2026 23:59:33 GMT\r\n\r\n401";
         assert_eq!(classify_api_response(401, headers), ApiHealth::Answering(401));
+    }
+
+    #[test]
+    fn portal_answers_are_told_apart_from_the_real_ones() {
+        assert_eq!(classify_portal_answer(204, "", 204, "", ""), Portal::Open);
+        assert_eq!(
+            classify_portal_answer(200, "success", 200, "", "success\n"),
+            Portal::Open
+        );
+        assert_eq!(classify_portal_answer(204, "", 0, "", ""), Portal::Unknown);
+        assert_eq!(
+            classify_portal_answer(204, "", 302, "https://login.example/portal?x=1", ""),
+            Portal::SignIn { url: Some("https://login.example/portal?x=1".into()) }
+        );
+        let page = r#"<html><meta http-equiv="refresh" content="0; URL=https://wifi.example/login"></html>"#;
+        assert_eq!(
+            classify_portal_answer(200, "success", 200, "", page),
+            Portal::SignIn { url: Some("https://wifi.example/login".into()) }
+        );
+        assert_eq!(
+            classify_portal_answer(204, "", 200, "", "<html>Sign in — café</html>"),
+            Portal::SignIn { url: None }
+        );
     }
 
     #[test]

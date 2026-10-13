@@ -13,11 +13,13 @@ enum Source {
     Activity,
     File(fn() -> std::path::PathBuf),
     Journal(&'static str, bool),
+    /// A `pvpn` command that prints a log; `-n N` is appended.
+    Pvpn(&'static [&'static str]),
 }
 
 const SOURCES: [(&str, Source); 10] = [
     ("This window's activity", Source::Activity),
-    ("Proton client log", Source::File(pvpn_core::paths::proton_log_path)),
+    ("Proton client log", Source::Pvpn(&["logs"])),
     ("Autoconnect (journal)", Source::Journal("pvpn-autoconnect.service", true)),
     ("Health checks (journal)", Source::Journal("pvpn-watch.service", true)),
     ("Resume recovery (journal)", Source::Journal("pvpn-recover.service", false)),
@@ -130,11 +132,20 @@ pub fn build(app: &Rc<App>) -> gtk::Widget {
                     show(buf.text(&buf.start_iter(), &buf.end_iter(), false).to_string());
                 }
                 Source::File(path) => show(tail(&path(), n)),
-                Source::Journal(unit, user) => {
+                Source::Journal(..) | Source::Pvpn(..) => {
                     if loading.replace(true) {
                         return;
                     }
-                    let argv = journal_command(unit, *user, n as u32);
+                    let argv = match &SOURCES[idx].1 {
+                        Source::Journal(unit, user) => journal_command(unit, *user, n as u32),
+                        Source::Pvpn(args) => {
+                            let lines = n.to_string();
+                            let mut full: Vec<&str> = args.to_vec();
+                            full.extend(["-n", lines.as_str()]);
+                            crate::cli::argv(&full)
+                        }
+                        _ => unreachable!(),
+                    };
                     let loading = loading.clone();
                     glib::spawn_future_local(async move {
                         let out = runner::capture(argv).await;

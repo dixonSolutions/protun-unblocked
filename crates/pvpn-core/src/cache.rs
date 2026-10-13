@@ -163,11 +163,44 @@ pub fn refresh(via_tor: bool, timeout: std::time::Duration) -> anyhow::Result<us
                 .trim()
         );
     }
-    serde_json::from_str::<Value>(result.stdout.trim())
+    let count = serde_json::from_str::<Value>(result.stdout.trim())
         .ok()
         .and_then(|v| v.get("servers")?.as_u64())
         .map(|n| n as usize)
-        .ok_or_else(|| anyhow::anyhow!("could not read the refreshed server list"))
+        .ok_or_else(|| anyhow::anyhow!("could not read the refreshed server list"))?;
+    note_fetched();
+    Ok(count)
+}
+
+/// How old Proton's real data may get before the next verified connect
+/// fetches it again. Proton's own client refreshes the list on this period.
+pub const INVENTORY_REFRESH_EVERY: std::time::Duration = std::time::Duration::from_secs(3 * 3600);
+
+/// When a refresh last actually landed, beside `state.json`.
+///
+/// `ExpirationTime` cannot answer this: [`extend_inventory_expiry`] pads it
+/// so Proton's client will read a list it could not refresh, and after that
+/// the file claims to be fresh for a day whatever its data is. Measured
+/// 2026-10-04: twelve days old, still listing a server Proton had taken down.
+fn fetched_marker() -> std::path::PathBuf {
+    crate::config::Config::data_dir().join("inventory-fetched")
+}
+
+pub fn note_fetched() {
+    let path = fetched_marker();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(path, b"");
+}
+
+/// Has a refresh landed within `within`? `false` when none ever has.
+pub fn fetched_within(within: std::time::Duration) -> bool {
+    std::fs::metadata(fetched_marker())
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .is_some_and(|age| age < within)
 }
 
 /// Fields Proton's client checks before deciding its cached list is usable.
@@ -459,6 +492,12 @@ fn steer_owner_is_alive(serverlist: &Path) -> bool {
         Ok(raw) => String::from_utf8_lossy(&raw).contains("pvpn"),
         Err(_) => false,
     }
+}
+
+/// Is a live `pvpn` steering the cache? A refresh then would hand that hop
+/// a list with everything un-hidden.
+pub fn steer_in_flight(serverlist: &Path) -> bool {
+    steer_owner_is_alive(serverlist)
 }
 
 /// What healing a stranded steer had to do.

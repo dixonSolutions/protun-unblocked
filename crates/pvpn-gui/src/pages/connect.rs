@@ -365,10 +365,9 @@ pub fn build(app: &Rc<App>, bp: &adw::Breakpoint) -> gtk::Widget {
 }
 
 fn refresh_cert(banner: &adw::Banner) {
-    let now = chrono::Utc::now();
-    match pvpn_core::cert::status_fast() {
-        Some(c) if c.unusable(now) => {
-            banner.set_title(&format!("Certificate: {} — no server can connect until it is renewed.", c.describe(now)));
+    match crate::cli::cert() {
+        Some(c) if c.unusable => {
+            banner.set_title(&format!("Certificate: {} — no server can connect until it is renewed.", c.describe));
             banner.set_revealed(true);
         }
         _ => banner.set_revealed(false),
@@ -381,7 +380,7 @@ fn refresh_chips(app: &Rc<App>, chips: &gtk::FlowBox) {
     }
     let state = data::load_state();
     let network = app.snapshot.borrow().as_ref().map(|s| s.network.clone()).unwrap_or_default();
-    let config = pvpn_core::config::Config::load(&pvpn_core::config::Config::default_path()).unwrap_or_default();
+    let config = crate::cli::config();
     let view = data::view(&state, &network, &config);
     let names = app.fastest_names(8);
     if names.is_empty() {
@@ -418,7 +417,7 @@ pub fn refresh_markers(app: &Rc<App>, globe: &Globe) {
     let snap = app.snapshot.borrow().clone();
     let network = snap.as_ref().map(|s| s.network.clone()).unwrap_or_else(|| state.network().to_string());
     let current = snap.as_ref().filter(|s| s.tunneled).and_then(|s| s.server.clone());
-    let config = pvpn_core::config::Config::load(&pvpn_core::config::Config::default_path()).unwrap_or_default();
+    let config = crate::cli::config();
     let view = data::view(&state, &network, &config);
     let settings = app.settings.borrow();
     let label_count = settings.globe_labels as usize;
@@ -522,7 +521,7 @@ fn server_popover(app: &Rc<App>, area: &gtk::DrawingArea, name: &str, x: f64, y:
     bx.append(&connect);
     let state = data::load_state();
     let network = app.snapshot.borrow().as_ref().map(|s| s.network.clone()).unwrap_or_default();
-    let config = pvpn_core::config::Config::load(&pvpn_core::config::Config::default_path()).unwrap_or_default();
+    let config = crate::cli::config();
     let view = data::view(&state, &network, &config);
     if view.servers.iter().any(|s| s.name == name && s.kind == Kind::Blocked) {
         let forget = gtk::Button::with_label("Lift block");

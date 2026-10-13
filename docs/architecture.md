@@ -140,6 +140,61 @@ it is worth keeping (`RUST_LOG=pvpn=debug pvpn up` prints the `t+…s` split):
   `State::profile_protocol_is_plausible` requires the family (`protun`,
   `openvpn`, `wireguard`) to appear among this network's recent successes.
   Up to three qualifying profiles are tried before Proton's client is.
+- **A saved profile carries its own key.** Proton's client now stores
+  the WireGuard private key in NetworkManager (`private-key-flags = 0`),
+  and a copy of a profile never carries it: `GetSettings` omits secrets,
+  and `GetSecrets` on a protun profile waits on GNOME Shell's secret agent,
+  which never answers. Measured 2026-10-14: every preserved profile logged
+  `Secrets are needed for this connection` and waited out the thirty-second
+  connect timeout — ninety seconds over three proven servers before Proton's
+  client was even started. `pvpn-core::profiles` takes the key from where
+  Proton does (the session in the keyring, ~300ms of Python) and writes it
+  into the profile; it never touches a log or a file of ours. An activation
+  that still asks for secrets is seen in milliseconds (`VpnState` =
+  `NEED_AUTH`), every saved profile is re-keyed with one keyring read, and
+  the activation is retried once.
+- **Proton's client is not needed to start a tunnel.** The same module
+  builds a profile for any server in Proton's inventory, copying
+  everything but the peer from a profile that has worked here. `pvpn hop
+  <server>`, the next-best hop and every ranked attempt in `pvpn up` try
+  that first, one D-Bus call, and only fall back to `protonvpn connect`
+  — twelve to sixteen seconds of Python, a `clientconfig` request the
+  network never answers, and its own retries — when no profile can start.
+  Measured on `wifi:detnsw`, 2026-10-14: command to activated tunnel in
+  0.13s, and to verified traffic in about a second over protun-tcp (see
+  the transport, below).
+- **The transport is chosen per network, and profiles follow it.** On
+  `wifi:detnsw` the filter rejects TLS by SNI, and the protun plugin's
+  Stealth (protun-tls) sends a random SNI per attempt, so each attempt is a
+  lottery with a three-second retry: 14–58s to carry, measured 2026-10-14.
+  protun-tcp, which has no SNI to judge, carried the same server in
+  0.97–1.05s three times out of three and held for as long as it was
+  watched. `State::proven_protocol` already prefers the fastest recent
+  transport; a transport whose latest result here is a dead tunnel now
+  loses that claim until it carries again. The transport is only the
+  profile's port lists, so `profiles::align_transport` rewrites a saved
+  profile in place (key kept) before activating it.
+- **Switching servers can cost one retry, and that part is Proton's.**
+  Reconnecting to the same server carries in about a second. Moving to a
+  different one, the first handshake is refused about two times in five
+  and the plugin's retry lands four to five seconds later; restarting the
+  activation sooner did not help (measured: every restarted attempt still
+  carried at ~5s), which points at the servers learning that the key has
+  left the old one.
+- **A sign-in page is found before any server is tried.** Behind a captive
+  portal every ordinary probe "works" — the portal answers it — so the
+  pre-connect check passed and each server then failed to carry and was
+  written off. `net::portal_check` asks the two endpoints browsers use and
+  demands their exact answers (`204`, `success`). On a portal, a command at
+  a terminal opens the sign-in page in the browser, the background
+  autoconnect raises a notification instead, and either waits for the
+  portal to clear and then connects by itself. Nothing is blamed.
+- **The inventory never stands between you and the tunnel.** An expired
+  list is used as it is, and refreshed by `after-connect` through the
+  verified tunnel, where Proton's API answers, once Proton's three-hour
+  period has passed (`inventory-fetched` records when a fetch really
+  landed — the padded `ExpirationTime` cannot say). Only a machine with no
+  list at all waits for one.
 - **The certificate's expiry is remembered, not re-read.** Reading it means
   starting Python and importing Proton's loader — 320ms — and the two
   timestamps change only when a certificate is issued. They are kept in
@@ -216,6 +271,25 @@ the CLI surfaces as a bare `SystemExit: 1`. Measured on 2026-09-11: a manual
 `pvpn hop` overlapped `pvpn-autoconnect`'s `pvpn up`, the hop's connect was
 refused, and the hop's failure cleanup then tore down the working tunnel the
 autoconnect had just built.
+
+`--force` (`up`, `hop`, `down`, `try`, `best --connect`) takes the lock
+from whoever holds it, background or not: the holder gets the same SIGTERM
+and restore, and is killed only if it has not let go within fifteen
+seconds. `pvpn down` takes a tunnel down over the bus — deactivate, save
+Proton's transient profile to disk in place with `Update2` (its key never
+leaves NetworkManager), delete the kill switch, clear Proton's persistence
+file — without starting Proton's client: 0.17s measured, against 5–6s
+through `protonvpn disconnect`. Measuring (`pvpn best`) holds no lock at
+all, so it runs beside a connect; it re-reads `state.json` before writing
+its results so it cannot write a concurrent connect's record away.
+
+A command typed at a terminal does not queue behind a background one.
+When the holder's note is tagged `[background]` (`PVPN_AUTOCONNECT` set),
+the waiter sends it SIGTERM; it restores routing exactly as Ctrl-C would and
+exits 75, which `pvpn-autoconnect` reads as "someone else has this" and
+stops. Measured 2026-10-14: a roam's autoconnect spent three minutes on
+keyless profiles while a typed `pvpn hop` waited behind it until its pid was
+killed by hand.
 
 `up`, `hop`, `try`, `best --connect` and `down` now hold an flock on
 `$XDG_RUNTIME_DIR/pvpn-connect.lock` for their whole duration

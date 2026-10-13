@@ -48,6 +48,7 @@ pub struct App {
     monitors: RefCell<Vec<gio::FileMonitor>>,
     poll_source: RefCell<Option<glib::SourceId>>,
     busy_source: RefCell<Option<glib::SourceId>>,
+    busy_reading: std::cell::Cell<bool>,
     hold: RefCell<Option<gio::ApplicationHoldGuard>>,
     /// Filled once the pages exist.
     prefs_opener: RefCell<Option<Rc<dyn Fn(Option<&str>)>>>,
@@ -102,9 +103,11 @@ impl App {
             monitors: RefCell::new(Vec::new()),
             poll_source: RefCell::new(None),
             busy_source: RefCell::new(None),
+            busy_reading: std::cell::Cell::new(false),
             hold: RefCell::new(None),
             prefs_opener: RefCell::new(None),
         });
+        crate::cli::set_binary(app.settings.borrow().pvpn_binary());
         app.build_ui();
         app.wire_runner();
         app.wire_actions();
@@ -617,7 +620,22 @@ impl App {
     /// what makes "Reconnecting" possible to notice at all on a connect that
     /// takes one second.
     fn refresh_busy(self: &Rc<Self>) {
-        let (busy, autoconnect_running) = status::read_busy(self.runner.pid());
+        // Asked of `pvpn`, so off the main thread; one at a time.
+        if self.busy_reading.replace(true) {
+            return;
+        }
+        let own = self.runner.pid();
+        let a = self.clone();
+        glib::spawn_future_local(async move {
+            let read = gio::spawn_blocking(move || status::read_busy(own)).await;
+            a.busy_reading.set(false);
+            if let Ok((busy, autoconnect_running)) = read {
+                a.absorb_busy(busy, autoconnect_running);
+            }
+        });
+    }
+
+    fn absorb_busy(self: &Rc<Self>, busy: Option<status::Busy>, autoconnect_running: bool) {
         let changed = {
             let snap = self.snapshot.borrow();
             match snap.as_ref() {
@@ -674,17 +692,21 @@ impl App {
         let a = self.clone();
         let generation = self.generation.get();
         glib::spawn_future_local(async move {
-            let snap = gio::spawn_blocking(move || status::read(probe, own)).await;
+            let snap = gio::spawn_blocking(move || {
+                let mut snap = status::read(probe, own);
+                // The lock may have changed while NetworkManager kept this
+                // reading waiting; the fresh answer wins.
+                let (busy, autoconnect_running) = status::read_busy(own);
+                snap.busy = busy;
+                snap.autoconnect_running = autoconnect_running;
+                snap
+            })
+            .await;
             if a.generation.get() != generation {
                 return; // superseded by the reading started after a connect finished
             }
             a.polling.set(false);
-            if let Ok(mut snap) = snap {
-                // The lock may have changed while NetworkManager kept this
-                // reading waiting; the fresh answer wins.
-                let (busy, autoconnect_running) = status::read_busy(a.runner.pid());
-                snap.busy = busy;
-                snap.autoconnect_running = autoconnect_running;
+            if let Ok(snap) = snap {
                 a.absorb(snap, probe);
             }
         });
@@ -795,7 +817,7 @@ impl App {
             .as_ref()
             .map(|s| s.network.clone())
             .unwrap_or_else(|| state.network().to_string());
-        let config = pvpn_core::config::Config::load(&pvpn_core::config::Config::default_path()).unwrap_or_default();
+        let config = crate::cli::config();
         let view = data::view(&state, &network, &config);
         let mut names: Vec<String> = Vec::new();
         let mut state = state;
@@ -827,7 +849,7 @@ impl App {
             (_, Some(s)) => s.network.trim_start_matches("wifi:").to_string(),
             _ => String::new(),
         };
-        let fastest = self.fastest_names(6);
+        let fastest = self.fastest_names(tray::FASTEST_SLOTS);
         let notifications = self.settings.borrow().notifications.enabled;
         let shown = (
             phase.css().to_string(),
