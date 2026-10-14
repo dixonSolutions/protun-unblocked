@@ -203,10 +203,10 @@ assert_eq "--on restores it" "on" "$(run_ac --status | awk 'NR == 1 {print $1}')
 # The positive case, which also proves the fake pvpn above is the one being
 # reached -- otherwise the "attempts nothing" test could pass vacuously.
 run_ac_connect "$WORK/calls.ac2" down
-if grep -q '^pvpn up (autoconnect)$' "$WORK/calls.ac2"; then
-    pass "while on and no tunnel: runs pvpn up"
+if grep -q '^pvpn reconnect (autoconnect)$' "$WORK/calls.ac2"; then
+    pass "while on and no tunnel: runs pvpn reconnect"
 else
-    fail "while on and no tunnel: runs pvpn up" "calls: $(cat "$WORK/calls.ac2")"
+    fail "while on and no tunnel: runs pvpn reconnect" "calls: $(cat "$WORK/calls.ac2")"
 fi
 
 # And the guard that matters most: a live tunnel is never disturbed.
@@ -220,7 +220,7 @@ fi
 
 # Only on networks autoconnect_networks allows.
 run_ac_connect "$WORK/calls.scope" down deny
-if grep -q '^pvpn up' "$WORK/calls.scope"; then
+if grep -q '^pvpn reconnect' "$WORK/calls.scope"; then
     fail "on a network outside autoconnect_networks: runs nothing" "calls: $(cat "$WORK/calls.scope")"
 else
     pass "on a network outside autoconnect_networks: runs nothing"
@@ -251,7 +251,7 @@ fi
 # script reconnects again once it is gone.)
 rm -f "$DATA/pvpn/down-by-user"
 run_ac_connect "$WORK/calls.up" down
-if grep -q '^pvpn up (autoconnect)$' "$WORK/calls.up"; then
+if grep -q '^pvpn reconnect (autoconnect)$' "$WORK/calls.up"; then
     pass "after pvpn up: resume reconnects again"
 else
     fail "after pvpn up: resume reconnects again" "calls: $(cat "$WORK/calls.up")"

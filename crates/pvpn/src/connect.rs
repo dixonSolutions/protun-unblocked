@@ -1977,6 +1977,30 @@ pub async fn up(session: &mut Session, protocol: Option<String>) -> UpReport {
     }
 }
 
+/// Rebuild the tunnel the way this network asked for it: its reconnect
+/// target (`reconnect_to`, set with `pvpn reconnect to`) first, the ranked
+/// list only if that will not carry.
+///
+/// What the resume hook and `pvpn watch` run. A named server goes through
+/// `hop`, so a proven one is its saved profile over D-Bus — about a second
+/// on `wifi:detnsw` over protun-tcp, and reconnecting to the server the
+/// tunnel was just on is the quickest case there is. A target that is
+/// blocked here is still tried: naming it is the instruction.
+pub async fn reconnect(session: &mut Session) -> UpReport {
+    session.sync_network().await;
+    let network = session.network().to_string();
+    let Some(target) = session.config.reconnect_target(&network).map(str::to_string) else {
+        return up(session, None).await;
+    };
+    tracing::info!("reconnecting to {target} — the reconnect target for {network}");
+    let report = hop(session, Some(target.clone()), None).await;
+    if report.ok {
+        return report;
+    }
+    tracing::warn!("{target} did not carry — reconnecting to the best server here instead");
+    up(session, None).await
+}
+
 pub async fn down() -> UpReport {
     // Record the intent before touching anything. The opt-in resume hook
     // reads this and stays out of the way; without it, a suspend would put

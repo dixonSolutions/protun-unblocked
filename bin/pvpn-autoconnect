@@ -170,7 +170,10 @@ export PVPN_AUTOCONNECT=1
 # now; retrying behind it would only queue another connect it does not want.
 for ((attempt = 1; attempt <= ATTEMPTS; attempt++)); do
     tunnel_up && exit 0
-    "$pvpn_bin" up && tunnel_up && exit 0
+    # `reconnect`, not `up`: it goes to this network's reconnect target
+    # (`pvpn reconnect to <server>`) when there is one, the ranked list
+    # otherwise — the same thing `pvpn up` would do.
+    "$pvpn_bin" reconnect && tunnel_up && exit 0
     [[ $? -eq 75 ]] && exit 0
     [[ $attempt -lt $ATTEMPTS ]] && sleep $((attempt * 20))
 done

@@ -44,6 +44,25 @@ pub enum ConfigAction {
 }
 
 #[derive(Subcommand, Debug)]
+pub enum ReconnectAction {
+    /// Always reconnect to SERVER on this network (or --network)
+    To {
+        /// A server (`JP-FREE#11`) or a country (`JP`)
+        server: String,
+        /// SSID or network key; defaults to the network you are on
+        #[arg(long)]
+        network: Option<String>,
+    },
+    /// Where reconnects go, here and on every network that has a target
+    Show,
+    /// Go back to reconnecting to the fastest server
+    Clear {
+        #[arg(long)]
+        network: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 pub enum ServiceAction {
     /// start, stop, restart, enable or disable a unit
     Run {
@@ -177,6 +196,97 @@ pub fn config(action: ConfigAction) -> i32 {
         Err(err) => {
             eprintln!("config not changed: {err}");
             1
+        }
+    }
+}
+
+/// The config key for a network: the SSID for wifi — what anybody editing
+/// the file by hand would write — and the full key for anything else.
+fn network_entry(network: &str) -> String {
+    network.strip_prefix("wifi:").unwrap_or(network).to_string()
+}
+
+/// Proton's name for `server` if its inventory lists it, matched without
+/// regard to case; `None` for a name it does not know.
+fn inventory_name(server: &str) -> Option<String> {
+    let path = pvpn_core::paths::serverlist_path();
+    let (_, logicals) = pvpn_core::serverlist::load_server_list(&path).ok()?;
+    logicals
+        .into_iter()
+        .filter_map(|l| l.name)
+        .find(|name| name.eq_ignore_ascii_case(server))
+}
+
+pub fn reconnect_config(action: ReconnectAction) -> i32 {
+    let here = pvpn_core::proc::active_network_key();
+    let edit = |entry: String, server: Option<String>| -> Result<(), String> {
+        let path = Config::default_path();
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        let mut doc: toml_edit::DocumentMut = text.parse().map_err(|e: toml_edit::TomlError| e.to_string())?;
+        if doc.get("reconnect_to").and_then(|t| t.as_table()).is_none() {
+            doc["reconnect_to"] = toml_edit::table();
+        }
+        let table = doc["reconnect_to"].as_table_mut().ok_or("reconnect_to is not a table")?;
+        match server {
+            Some(server) => {
+                table[entry.as_str()] = toml_edit::value(server);
+            }
+            None => {
+                table.remove(&entry);
+            }
+        }
+        write_config(&doc.to_string())
+    };
+    match action {
+        ReconnectAction::To { server, network } => {
+            let entry = network_entry(network.as_deref().unwrap_or(&here));
+            let server = if server.contains('#') {
+                match inventory_name(&server) {
+                    Some(name) => name,
+                    None => {
+                        eprintln!(
+                            "{server} is not in Proton's server list for this account —                              setting it anyway; `pvpn best` lists what you have"
+                        );
+                        server.to_ascii_uppercase()
+                    }
+                }
+            } else {
+                server.to_ascii_uppercase()
+            };
+            match edit(entry.clone(), Some(server.clone())) {
+                Ok(()) => {
+                    println!("Reconnects on {entry} now go to {server}, then the fastest server if it will not carry.");
+                    0
+                }
+                Err(err) => {
+                    eprintln!("not changed: {err}");
+                    1
+                }
+            }
+        }
+        ReconnectAction::Clear { network } => {
+            let entry = network_entry(network.as_deref().unwrap_or(&here));
+            match edit(entry.clone(), None) {
+                Ok(()) => {
+                    println!("Reconnects on {entry} go to the fastest server again.");
+                    0
+                }
+                Err(err) => {
+                    eprintln!("not changed: {err}");
+                    1
+                }
+            }
+        }
+        ReconnectAction::Show => {
+            let cfg = effective_config();
+            match cfg.reconnect_target(&here) {
+                Some(server) => println!("Here ({here}): reconnects go to {server}"),
+                None => println!("Here ({here}): reconnects go to the fastest server"),
+            }
+            for (network, server) in &cfg.reconnect_to {
+                println!("  {network:<20} {server}");
+            }
+            0
         }
     }
 }

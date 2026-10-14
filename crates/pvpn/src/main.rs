@@ -115,6 +115,30 @@ pvpn best — find the fastest servers your account can use
         #[arg(long, short = 'f')]
         force: bool,
     },
+    /// Reconnect: this network's reconnect target, else the fastest server
+    #[command(after_help = "\
+pvpn reconnect — put the tunnel back the way this network asks for it
+
+  pvpn reconnect                 reconnect now
+  pvpn reconnect --force         ...taking over from any other pvpn
+  pvpn reconnect to JP-FREE#11   always reconnect here to JP-FREE#11
+  pvpn reconnect to JP --network detnsw
+                                 on detnsw, to the best server in Japan
+  pvpn reconnect show            where reconnects go
+  pvpn reconnect clear           back to the fastest server
+
+The resume hook (pvpn-autoconnect) and `pvpn watch` reconnect this way too.
+A target is tried first even when it is blocked or just died: naming it is
+the instruction. If it will not carry, the fastest server is next.
+Stored as `reconnect_to` in ~/.config/pvpn/config.toml.
+")]
+    Reconnect {
+        #[command(subcommand)]
+        action: Option<query::ReconnectAction>,
+        /// Take over from any other pvpn already working instead of waiting
+        #[arg(long, short = 'f')]
+        force: bool,
+    },
     /// Disconnect and restore normal internet
     #[command(alias = "disconnect")]
     Down {
@@ -384,6 +408,8 @@ pvpn - simple Proton VPN control
   pvpn best            rank the fastest servers you can use
   pvpn best --connect  rank them, then connect to the best
   pvpn hop [match] [proto]  switch server; optionally one matching e.g. JP, SG-FREE#12
+  pvpn reconnect       reconnect: this network's target, else the fastest
+  pvpn reconnect to <server>   always reconnect to it on this network
   pvpn down            disconnect and restore normal internet
   pvpn status          show connection state, protocol, and whether it carries
   pvpn watch           check a tunnel that is up; reconnect if it died
@@ -565,6 +591,18 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
             remember_where_asked();
             Ok(report(
                 run_interruptible(connect::up(&mut session, None)).await,
+            ))
+        }),
+        Command::Reconnect {
+            action: Some(action),
+            ..
+        } => Ok(query::reconnect_config(action)),
+        Command::Reconnect { action: None, force } => block_on(async move {
+            let mut session = Session::load()?;
+            let _tray = tray_for_connect();
+            let _guard = connect_lock(force).await;
+            Ok(report(
+                run_interruptible(connect::reconnect(&mut session)).await,
             ))
         }),
         Command::Down { force } => block_on(async move {

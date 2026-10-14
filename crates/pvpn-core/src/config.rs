@@ -40,6 +40,13 @@ pub struct Config {
     /// Networks nothing may rebuild the tunnel on for you, whatever
     /// `autoconnect_networks` says. SSIDs or network keys.
     pub autoconnect_never: Vec<String>,
+    /// Where a reconnect goes, per network: `detnsw = "JP-FREE#11"` sends
+    /// every reconnect on that wifi — after a resume, a roam, or a tunnel
+    /// `pvpn watch` found dead — straight to that server's saved profile,
+    /// and only to the ranked list if it will not carry. A country (`"JP"`)
+    /// works too. Keys are SSIDs or network keys, as in
+    /// `autoconnect_networks`. Set with `pvpn reconnect to <server>`.
+    pub reconnect_to: std::collections::BTreeMap<String, String>,
 }
 
 impl Default for Config {
@@ -60,11 +67,21 @@ impl Default for Config {
             fix_apps: true,
             autoconnect_networks: Default::default(),
             autoconnect_never: Vec::new(),
+            reconnect_to: Default::default(),
         }
     }
 }
 
 impl Config {
+    /// Where a reconnect on `network` should go, if anywhere in particular.
+    pub fn reconnect_target(&self, network: &str) -> Option<&str> {
+        self.reconnect_to
+            .iter()
+            .find(|(entry, _)| crate::scope::matches(entry, network))
+            .map(|(_, server)| server.as_str())
+            .filter(|server| !server.trim().is_empty())
+    }
+
     pub fn config_dir() -> PathBuf {
         dirs::config_dir()
             .unwrap_or_else(|| PathBuf::from("."))
@@ -149,6 +166,15 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_reconnect_target_is_found_by_ssid_or_network_key() {
+        let cfg: Config = toml::from_str("[reconnect_to]\ndetnsw = \"JP-FREE#11\"\n\"wired:eth0\" = \"SG\"\n").unwrap();
+        assert_eq!(cfg.reconnect_target("wifi:detnsw"), Some("JP-FREE#11"));
+        assert_eq!(cfg.reconnect_target("wired:eth0"), Some("SG"));
+        assert_eq!(cfg.reconnect_target("wifi:home"), None);
+        assert_eq!(Config::default().reconnect_target("wifi:detnsw"), None);
+    }
 
     #[test]
     fn defaults_are_sane() {

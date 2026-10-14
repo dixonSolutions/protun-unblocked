@@ -363,11 +363,14 @@ pub async fn watch(session: &mut Session, reconnect: bool) -> UpReport {
                 };
             }
 
-            tracing::info!("{server} stopped carrying — reconnecting somewhere else");
+            tracing::info!("{server} stopped carrying — reconnecting");
             // `record` above blocked this server, and `up` reads the
-            // blocklist before it chooses, so this lands somewhere else
-            // without having to be told to.
-            connect::up(session, None).await
+            // blocklist before it chooses, so without a reconnect target
+            // this lands somewhere else without having to be told to. With
+            // one (`reconnect_to`), the target is tried first even if it is
+            // the server that just died: on `wifi:detnsw` a session the
+            // network killed comes back on the same server in a second.
+            connect::reconnect(session).await
         }
     }
 }

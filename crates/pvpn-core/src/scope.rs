@@ -79,7 +79,7 @@ pub fn launched_by_autoconnect() -> bool {
 
 /// `wifi:detnsw` matches both `wifi:detnsw` and bare `detnsw`, because an
 /// SSID is what anybody writing a config file actually knows.
-fn matches(entry: &str, network: &str) -> bool {
+pub fn matches(entry: &str, network: &str) -> bool {
     let entry = entry.trim();
     entry == network || network.strip_prefix("wifi:") == Some(entry)
 }

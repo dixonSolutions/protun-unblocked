@@ -161,7 +161,18 @@ pvpn hop                  # the next best server, then the one after
 pvpn hop JP               # somewhere in Japan
 pvpn hop SG-FREE#12       # that exact server
 pvpn hop JP --force       # take over from any other pvpn still working
+
+pvpn reconnect to JP-FREE#11   # on this network, always reconnect here
+pvpn reconnect                 # reconnect now, the way this network asks
+pvpn reconnect show            # where reconnects go
+pvpn reconnect clear           # back to the fastest server
 ```
+
+A reconnect — `pvpn reconnect`, the resume hook after a suspend or a roam,
+and `pvpn watch` finding the tunnel dead — goes to the network's target
+first (`reconnect_to` in `config.toml`, e.g. `detnsw = "JP-FREE#11"`),
+through its saved profile, and to the fastest server only if the target
+will not carry.
 
 `--force` (on `up`, `hop`, `down`, `try` and `best --connect`) does not wait
 for another `pvpn` — a reconnect after a resume, a `down`, another
