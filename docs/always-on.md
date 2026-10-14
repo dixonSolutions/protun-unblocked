@@ -227,6 +227,17 @@ in. This persists `want_down`, which can only ever cause *less* to happen.
 Nothing reconnects because of that file; the worst a stale one can do is make
 you type `pvpn up`.
 
+If you would rather a resume always put the tunnel back, `pvpn down` or not,
+say so in `~/.config/pvpn/config.toml`:
+
+```toml
+reconnect_mode = "always"     # default "previous": a `pvpn down` holds
+```
+
+The marker is still written, so the window still knows a disconnect was
+yours, but the hook no longer stops for it. `autoconnect_networks`,
+`autoconnect_never` and `--off` below still apply.
+
 To stop it reconnecting at all, separately from any one `pvpn down`:
 
 ```bash

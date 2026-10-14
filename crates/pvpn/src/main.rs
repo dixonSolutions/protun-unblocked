@@ -13,6 +13,7 @@ mod blocklist;
 mod connect;
 mod login;
 mod narrate;
+mod portal_note;
 mod query;
 mod session;
 mod verify;
@@ -394,6 +395,9 @@ pvpn query — machine-readable state, one JSON document on stdout
     /// May the tunnel be rebuilt for you on this network? (for pvpn-autoconnect)
     #[command(name = "autoconnect-check", hide = true)]
     AutoconnectCheck,
+    /// Does a `pvpn down` keep the tunnel down? (for pvpn-autoconnect)
+    #[command(name = "autoconnect-held", hide = true)]
+    AutoconnectHeld,
     /// This message
     Help,
 }
@@ -707,6 +711,7 @@ fn run(cli: Cli) -> anyhow::Result<i32> {
         Command::Forget { all, server } => block_on(cmd_forget(all, server)),
         Command::Logs { follow, lines } => cmd_logs(follow, lines),
         Command::AutoconnectCheck => cmd_autoconnect_check(),
+        Command::AutoconnectHeld => cmd_autoconnect_held(),
     }
 }
 
@@ -718,6 +723,21 @@ fn remember_where_asked() {
     if !scope::launched_by_autoconnect() {
         let network = pvpn_core::proc::active_network_key();
         scope::record_started(&pvpn_core::config::Config::data_dir(), &network);
+    }
+}
+
+/// Exit 0 when a `pvpn down` is holding the tunnel down, 3 when nothing is
+/// — no `pvpn down`, or `reconnect_mode = "always"` reconnecting regardless.
+/// 3 rather than 1 because 1 is any error, and an error must keep the hold.
+/// Read by `pvpn-autoconnect` before anything else.
+fn cmd_autoconnect_held() -> anyhow::Result<i32> {
+    use pvpn_core::config::Config;
+    let config = Config::load(&Config::default_path())?;
+    if pvpn_core::intent::is_holding(config.reconnect_mode, &Config::data_dir()) {
+        println!("holding: you ran `pvpn down`, and reconnect_mode is \"previous\"");
+        Ok(0)
+    } else {
+        Ok(3)
     }
 }
 
@@ -780,12 +800,18 @@ fn capitalise(text: &str) -> String {
 }
 
 fn report(report: connect::UpReport) -> i32 {
+    // Closes the sign-in bubble with the outcome, if this connect raised one.
+    let unanswered = portal_note::finish(report.ok, report.server.as_deref(), &report.message);
     if report.ok {
         println!("{}", report.message);
         0
     } else {
         eprintln!("{}", report.message);
-        1
+        if unanswered {
+            UNSIGNED_PORTAL_EXIT
+        } else {
+            1
+        }
     }
 }
 
@@ -802,6 +828,12 @@ async fn connect_lock(force: bool) -> pvpn_core::lock::ConnectGuard {
 /// Exit code of a connect that stepped aside for another command
 /// (`EX_TEMPFAIL`). `pvpn-autoconnect` reads it as "someone else has this".
 const PREEMPTED_EXIT: i32 = 75;
+
+/// Exit code of a connect that waited out its patience for a captive-portal
+/// sign-in nobody did (`EX_NOPERM`). `pvpn-autoconnect` stops on it rather
+/// than asking again: the bubble already told you, and asking twice more is
+/// another half an hour of nagging.
+const UNSIGNED_PORTAL_EXIT: i32 = 77;
 
 /// A connect rewrites routing and DNS before it starts carrying traffic, so
 /// Ctrl-C is a request to abort safely, not permission to leave immediately.

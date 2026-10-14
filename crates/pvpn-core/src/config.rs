@@ -47,6 +47,24 @@ pub struct Config {
     /// works too. Keys are SSIDs or network keys, as in
     /// `autoconnect_networks`. Set with `pvpn reconnect to <server>`.
     pub reconnect_to: std::collections::BTreeMap<String, String>,
+    /// Whether a `pvpn down` holds the tunnel down through a resume or a
+    /// link change: `"previous"` (it does — the tunnel comes back only if it
+    /// was up) or `"always"` (it comes back regardless).
+    pub reconnect_mode: ReconnectMode,
+}
+
+/// What the resume/link hook does after a deliberate `pvpn down`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReconnectMode {
+    /// Put back the state you left: a tunnel you took down stays down until
+    /// you connect again.
+    #[default]
+    Previous,
+    /// Reconnect whatever you last did. `autoconnect_networks`,
+    /// `autoconnect_never` and `pvpn-autoconnect --off` still apply.
+    #[serde(alias = "regardless")]
+    Always,
 }
 
 impl Default for Config {
@@ -68,6 +86,7 @@ impl Default for Config {
             autoconnect_networks: Default::default(),
             autoconnect_never: Vec::new(),
             reconnect_to: Default::default(),
+            reconnect_mode: ReconnectMode::Previous,
         }
     }
 }
@@ -174,6 +193,19 @@ mod tests {
         assert_eq!(cfg.reconnect_target("wired:eth0"), Some("SG"));
         assert_eq!(cfg.reconnect_target("wifi:home"), None);
         assert_eq!(Config::default().reconnect_target("wifi:detnsw"), None);
+    }
+
+    #[test]
+    fn reconnect_mode_defaults_to_previous_and_reads_both_spellings() {
+        assert_eq!(Config::default().reconnect_mode, ReconnectMode::Previous);
+        for (text, want) in [
+            ("reconnect_mode = \"previous\"", ReconnectMode::Previous),
+            ("reconnect_mode = \"always\"", ReconnectMode::Always),
+            ("reconnect_mode = \"regardless\"", ReconnectMode::Always),
+        ] {
+            let cfg: Config = toml::from_str(text).unwrap();
+            assert_eq!(cfg.reconnect_mode, want, "{text}");
+        }
     }
 
     #[test]

@@ -341,6 +341,7 @@ stray `pvpnksintrf0`, and optionally blackholing Proton's API in
 | `fix_apps` / `PVPN_FIX_APPS` | true | put Flatpak apps back on the tunnel |
 | `autoconnect_networks` | `"started"` | where a resume or `pvpn watch` may rebuild the tunnel: `"started"` (where you last ran `pvpn up`/`hop`), `"all"`, or a list like `["detnsw", "wired:eth0"]` |
 | `autoconnect_never` | `[]` | networks nothing may rebuild the tunnel on for you, whatever `autoconnect_networks` says |
+| `reconnect_mode` | `"previous"` | after a resume or link change: `"previous"` puts back the state you left (a `pvpn down` stays down), `"always"` reconnects regardless |
 | `PVPN_NETWORK` | | pin the network key instead of deriving it from the SSID |
 
 Persisted observations live in `~/.local/share/pvpn/state.json` — per

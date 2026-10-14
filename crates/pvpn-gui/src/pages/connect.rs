@@ -322,7 +322,7 @@ pub fn build(app: &Rc<App>, bp: &adw::Breakpoint) -> gtk::Widget {
                 "Autoconnect is off everywhere".to_string()
             } else {
                 match &s.autoconnect_here {
-                    Ok(_) if s.down_by_user => format!("Autoconnect on {net}: holding, you disconnected"),
+                    Ok(_) if s.holding => format!("Autoconnect on {net}: holding, you disconnected"),
                     Ok(_) => format!("Autoconnect will rebuild the tunnel on {net}"),
                     Err(why) => format!("No autoconnect here: {}", why.trim_start_matches(&format!("{}: ", s.network))),
                 }

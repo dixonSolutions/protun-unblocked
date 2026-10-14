@@ -39,6 +39,9 @@ pub struct Snapshot {
     /// `pvpn-autoconnect` is running (it holds its own lock while it does).
     pub autoconnect_running: bool,
     pub down_by_user: bool,
+    /// That `pvpn down` keeps a resume from reconnecting
+    /// (`reconnect_mode = "previous"`).
+    pub holding: bool,
     pub autoconnect_off: bool,
     /// Would a reconnect be allowed here, and why (or why not).
     pub autoconnect_here: Result<String, String>,
@@ -57,6 +60,7 @@ impl Default for Snapshot {
             busy: None,
             autoconnect_running: false,
             down_by_user: false,
+            holding: false,
             autoconnect_off: false,
             autoconnect_here: Err(String::new()),
         }
@@ -158,6 +162,7 @@ pub fn read(probe_traffic: bool, own_child: Option<u32>) -> Snapshot {
         busy,
         autoconnect_running,
         down_by_user: intent::is_down_by_user(&Config::data_dir()),
+        holding: intent::is_holding(config.reconnect_mode, &Config::data_dir()),
         autoconnect_off: intent::autoconnect_is_off(&Config::config_dir()),
         autoconnect_here,
     }

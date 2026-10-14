@@ -33,7 +33,6 @@ use std::time::{Duration, Instant};
 pub struct UpReport {
     pub ok: bool,
     pub message: String,
-    #[allow(dead_code)]
     pub server: Option<String>,
 }
 
@@ -99,19 +98,7 @@ async fn wait_for_portal_sign_in(url: Option<String>) -> bool {
         || std::env::var_os("DISPLAY").is_some();
     let shown = if background || !has_display {
         let ssid = blocking(proc::active_network_key).await;
-        spawn_quiet(
-            "notify-send",
-            &[
-                "--app-name=Protun Unblocked",
-                "--icon=network-wireless-acquiring-symbolic",
-                "--urgency=critical",
-                &format!("Sign in to {}", ssid.trim_start_matches("wifi:")),
-                &format!(
-                    "This network has a sign-in page. The VPN connects by itself once you are \
-                     through it.\n{page}"
-                ),
-            ],
-        )
+        crate::portal_note::ask_sign_in(ssid.trim_start_matches("wifi:"), &page)
     } else {
         spawn_quiet("xdg-open", &[&page])
     };
@@ -136,6 +123,7 @@ async fn wait_for_portal_sign_in(url: Option<String>) -> bool {
         tokio::time::sleep(Duration::from_secs(2)).await;
         if net::portal_check(Duration::from_secs(3)).await == net::Portal::Open {
             tracing::info!("signed in — the network is open; connecting");
+            crate::portal_note::signed_in();
             return true;
         }
         if narrated.elapsed() >= Duration::from_secs(30) {

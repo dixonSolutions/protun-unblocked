@@ -7,8 +7,9 @@
 #   pvpn-autoconnect --on       resume reconnecting automatically
 #   pvpn-autoconnect --status   report which of those is in effect
 #
-# A deliberate `pvpn down` is never undone: it leaves a marker that survives
-# a suspend, and only `pvpn up` or `pvpn hop` clears it.
+# A deliberate `pvpn down` is not undone: it leaves a marker that survives
+# a suspend, and only `pvpn up` or `pvpn hop` clears it. Unless config.toml
+# says `reconnect_mode = "always"`, which reconnects regardless.
 #
 # It only reconnects on networks `autoconnect_networks` allows in
 # ~/.config/pvpn/config.toml: "started" (default — wherever you last ran
@@ -32,6 +33,16 @@ DOWN_MARKER="${XDG_DATA_HOME:-$HOME/.local/share}/pvpn/down-by-user"
 ATTEMPTS="${PVPN_AUTOCONNECT_ATTEMPTS:-3}"
 LINK_WAIT="${PVPN_AUTOCONNECT_LINK_WAIT:-60}"
 
+# Does the `pvpn down` marker hold? pvpn reads reconnect_mode for us. If it
+# cannot be asked, the marker holds — the safe direction.
+held() {
+    local bin
+    bin="$(command -v pvpn || echo "$HOME/.local/bin/pvpn")"
+    [[ -x "$bin" ]] || return 0
+    "$bin" autoconnect-held >/dev/null 2>&1
+    [[ $? -ne 3 ]]
+}
+
 case "${1:-}" in
     --off)
         mkdir -p "$MARKER_DIR" && : > "$MARKER"
@@ -46,9 +57,10 @@ case "${1:-}" in
     --status)
         if [[ -e "$MARKER" ]]; then
             echo "off  (remove $MARKER, or run: pvpn-autoconnect --on)"
-        elif [[ -e "$DOWN_MARKER" ]]; then
+        elif [[ -e "$DOWN_MARKER" ]] && held; then
             echo "on   but holding: you ran \`pvpn down\`, so a resume will"
-            echo "     leave the tunnel down. \`pvpn up\` releases the hold."
+            echo "     leave the tunnel down. \`pvpn up\` releases the hold,"
+            echo "     and reconnect_mode = \"always\" in config.toml ignores it."
         else
             echo "on   (disable with: pvpn-autoconnect --off)"
         fi
@@ -75,8 +87,12 @@ esac
 
 # A deliberate `pvpn down` should stick, including across a suspend. This is
 # the whole reason the marker exists: without it, locking the laptop after
-# turning the VPN off would turn it back on again.
-[[ -e "$DOWN_MARKER" ]] && exit 0
+# turning the VPN off would turn it back on again. `reconnect_mode =
+# "always"` is someone saying they would rather it did.
+if [[ -e "$DOWN_MARKER" ]] && held; then
+    echo "holding: you ran \`pvpn down\` (reconnect_mode = \"previous\")"
+    exit 0
+fi
 
 # One autoconnect at a time. The connects themselves are serialised by
 # pvpn's own lock (crates/pvpn-core/src/lock.rs): an overlap with a manual
@@ -165,6 +181,10 @@ export PVPN_AUTOCONNECT=1
 # deadline here — killing it mid-connect is what strands the kill switch and
 # takes all internet with it.
 #
+# Behind a captive portal pvpn raises a "Sign in to <network>" notification
+# and waits up to 15 minutes for you, then connects by itself and says how
+# it went in the same bubble.
+#
 # Exit 75 means a command typed at a terminal asked this one to step aside
 # (pvpn's lock preempts background connects). That command owns the tunnel
 # now; retrying behind it would only queue another connect it does not want.
@@ -174,7 +194,12 @@ for ((attempt = 1; attempt <= ATTEMPTS; attempt++)); do
     # (`pvpn reconnect to <server>`) when there is one, the ranked list
     # otherwise — the same thing `pvpn up` would do.
     "$pvpn_bin" reconnect && tunnel_up && exit 0
-    [[ $? -eq 75 ]] && exit 0
+    rc=$?
+    [[ $rc -eq 75 ]] && exit 0
+    # 77: the network has a sign-in page and nobody got through it in the
+    # quarter of an hour pvpn waited. It already said so in a notification;
+    # asking again would only nag.
+    [[ $rc -eq 77 ]] && exit 0
     [[ $attempt -lt $ATTEMPTS ]] && sleep $((attempt * 20))
 done
 exit 1

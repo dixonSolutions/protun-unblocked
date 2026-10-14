@@ -13,7 +13,9 @@ Type=oneshot
 # would relaunch pvpn while a previous connect was still finishing, and
 # overlapping connects are what strand the kill switch.
 ExecStart=%h/.local/bin/pvpn-autoconnect
-TimeoutStartSec=600
+# Past the 15 minutes a connect waits behind a captive portal for you to
+# sign in (PORTAL_PATIENCE_BACKGROUND), plus the connect after it.
+TimeoutStartSec=1200
 # `pvpn` traps SIGINT and only SIGINT: on it, it tears the half-built tunnel
 # down and puts normal routing back (`run_interruptible` -> `connect::restore`).
 # It does not trap SIGTERM, which is what systemd sends by default on a stop or

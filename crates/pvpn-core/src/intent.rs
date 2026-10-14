@@ -38,6 +38,12 @@ pub fn is_down_by_user(data_dir: &Path) -> bool {
     down_marker(data_dir).exists()
 }
 
+/// Does that `pvpn down` keep the tunnel down through a resume? Only in
+/// `reconnect_mode = "previous"`; `"always"` reconnects regardless.
+pub fn is_holding(mode: crate::config::ReconnectMode, data_dir: &Path) -> bool {
+    mode == crate::config::ReconnectMode::Previous && is_down_by_user(data_dir)
+}
+
 /// The file whose presence means "never rebuild the tunnel for me".
 ///
 /// Written by `pvpn-autoconnect --off`, and a stronger statement than

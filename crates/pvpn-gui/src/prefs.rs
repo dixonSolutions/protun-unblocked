@@ -13,7 +13,7 @@ use crate::services::{self, UNITS};
 use crate::settings::{self, GuiSettings};
 use adw::prelude::*;
 use gtk::{gio, glib};
-use pvpn_core::config::Config;
+use pvpn_core::config::{Config, ReconnectMode};
 use pvpn_core::intent;
 use pvpn_core::scope::{AutoconnectNetworks, Mode};
 use std::path::{Path, PathBuf};
@@ -565,10 +565,13 @@ fn autoconnect(app: &Rc<App>, dialog: &adw::PreferencesDialog) -> adw::Preferenc
             },
         ));
     }
+    let mode = Config::load(&Config::default_path()).unwrap_or_default().reconnect_mode;
     let hold = adw::ActionRow::builder()
         .title("Hold after disconnect")
-        .subtitle(if intent::is_down_by_user(&Config::data_dir()) {
+        .subtitle(if intent::is_holding(mode, &Config::data_dir()) {
             "Holding: you disconnected, so a resume leaves the tunnel down until you connect again."
+        } else if mode == ReconnectMode::Always {
+            "Never holding: reconnect_mode = \"always\" reconnects after a resume even if you disconnected."
         } else {
             "Not holding."
         })
